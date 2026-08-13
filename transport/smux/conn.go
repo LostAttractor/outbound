@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 
@@ -22,20 +23,21 @@ type Conn struct {
 	onceWrite bool
 }
 
-func ReadResponse(conn net.Conn) error {
+func ReadResponse(conn net.Conn) (err error) {
 	var status uint8
-	err := binary.Read(conn, binary.BigEndian, &status)
+	err = binary.Read(conn, binary.BigEndian, &status)
 	if err != nil {
-		return err
+		return
 	}
 	if status == statusError {
-		message, err := io.ReadAll(conn)
+		var message []byte
+		message, err = io.ReadAll(conn)
 		if err != nil {
-			return err
+			return
 		}
-		return errors.New("smux failed to read: " + string(message))
+		return errors.New(fmt.Sprintf("smux failed to read: %s", message))
 	}
-	return nil
+	return
 }
 
 func (c *Conn) Read(b []byte) (n int, err error) {
