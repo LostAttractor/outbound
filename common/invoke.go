@@ -5,17 +5,22 @@ import (
 )
 
 func Invoke[R any](ctx context.Context, fn func() (R, error), cb func()) (res R, err error) {
-	resChan := make(chan struct{})
+	type result struct {
+		value R
+		err   error
+	}
+	resultChan := make(chan result, 1)
 
 	go func() {
-		res, err = fn()
-		resChan <- struct{}{}
+		value, err := fn()
+		resultChan <- result{value, err}
 	}()
 
 	select {
 	case <-ctx.Done():
 		err = ctx.Err()
-	case <-resChan:
+	case result := <-resultChan:
+		res, err = result.value, result.err
 	}
 
 	if err != nil && cb != nil {
