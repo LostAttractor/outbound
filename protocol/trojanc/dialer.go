@@ -32,7 +32,7 @@ func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.D
 
 func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c net.Conn, err error) {
 	switch network {
-	case "tcp", "udp":
+	case "tcp":
 		// Parse address using shadowsocks implementation
 		addressInfo, err := socks5.AddressFromString(addr)
 		if err != nil {
@@ -46,15 +46,16 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		}
 
 		// Create Trojan connection
-		tcpConn := NewConn(conn, addressInfo, network, d.password)
-
-		if network == "udp" {
-			return &netproxy.BindPacketConn{
-				PacketConn: &PacketConn{Conn: tcpConn},
-				Address:    netproxy.NewAddr("udp", addr),
-			}, nil
+		return NewConn(conn, addressInfo, network, d.password), nil
+	case "udp":
+		packetConn, err := d.ListenPacket(ctx, addr)
+		if err != nil {
+			return nil, err
 		}
-		return tcpConn, nil
+		return &netproxy.BindPacketConn{
+			PacketConn: packetConn,
+			Address:    netproxy.NewAddr("udp", addr),
+		}, nil
 	default:
 		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
 	}
