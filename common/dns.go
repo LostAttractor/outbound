@@ -12,6 +12,7 @@ import (
 	"strconv"
 )
 
+// TODO: Fallback DNS
 func ResolveIPAddrWithResolver(resolver *net.Resolver, address string) (*net.IPAddr, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
