@@ -1,9 +1,14 @@
 package shadowsocks
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/binary"
 	"net"
 	"testing"
 
+	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/pool"
 )
 
@@ -45,5 +50,45 @@ func TestTCPConnCloseReleasesBufferedPayload(t *testing.T) {
 	}
 	if conn.readBuf != nil || conn.readOffset != 0 {
 		t.Fatal("Close retained its payload")
+	}
+}
+
+func TestTCPConnSealWritesValidChunks(t *testing.T) {
+	block, err := aes.NewCipher(make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &TCPConn{
+		cipherWrite: aead,
+		nonceWrite:  make([]byte, aead.NonceSize()),
+	}
+	payload := bytes.Repeat([]byte("x"), TCPChunkMaxLen+17)
+	var sealed bytes.Buffer
+	conn.seal(&sealed, payload)
+
+	nonce := make([]byte, aead.NonceSize())
+	var plaintext []byte
+	for sealed.Len() > 0 {
+		lengthCiphertext := sealed.Next(2 + aead.Overhead())
+		lengthBytes, err := aead.Open(nil, nonce, lengthCiphertext, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		common.BytesIncLittleEndian(nonce)
+		chunkLength := int(binary.BigEndian.Uint16(lengthBytes))
+		chunkCiphertext := sealed.Next(chunkLength + aead.Overhead())
+		chunk, err := aead.Open(nil, nonce, chunkCiphertext, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		common.BytesIncLittleEndian(nonce)
+		plaintext = append(plaintext, chunk...)
+	}
+	if !bytes.Equal(plaintext, payload) {
+		t.Fatal("decrypted chunks do not match payload")
 	}
 }

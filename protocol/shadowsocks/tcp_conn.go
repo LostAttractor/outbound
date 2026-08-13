@@ -193,15 +193,16 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *TCPConn) seal(buf *bytes.Buffer, payload []byte) {
-	chunkLengthBuf := pool.GetBuffer(2)
-	defer pool.PutBuffer(chunkLengthBuf)
+	chunks := (len(payload) + TCPChunkMaxLen - 1) / TCPChunkMaxLen
+	buf.Grow(len(payload) + chunks*(2+2*c.cipherWrite.Overhead()))
+	var chunkLengthBuf [2]byte
 	for i := 0; i < len(payload); i += TCPChunkMaxLen {
 		// write chunk
 		var chunkLength = common.Min(TCPChunkMaxLen, len(payload)-i)
-		binary.BigEndian.PutUint16(chunkLengthBuf, uint16(chunkLength))
-		buf.Write(c.cipherWrite.Seal(nil, c.nonceWrite, chunkLengthBuf, nil))
+		binary.BigEndian.PutUint16(chunkLengthBuf[:], uint16(chunkLength))
+		buf.Write(c.cipherWrite.Seal(buf.AvailableBuffer(), c.nonceWrite, chunkLengthBuf[:], nil))
 		common.BytesIncLittleEndian(c.nonceWrite)
-		buf.Write(c.cipherWrite.Seal(nil, c.nonceWrite, payload[i:i+chunkLength], nil))
+		buf.Write(c.cipherWrite.Seal(buf.AvailableBuffer(), c.nonceWrite, payload[i:i+chunkLength], nil))
 		common.BytesIncLittleEndian(c.nonceWrite)
 	}
 }
