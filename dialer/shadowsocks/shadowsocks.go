@@ -20,8 +20,8 @@ import (
 )
 
 func init() {
-	dialer.FromLinkRegister("shadowsocks", NewShadowsocksFromLink)
-	dialer.FromLinkRegister("ss", NewShadowsocksFromLink)
+	dialer.FromLinkRegister("shadowsocks", NewShadowsocks)
+	dialer.FromLinkRegister("ss", NewShadowsocks)
 }
 
 type Shadowsocks struct {
@@ -35,7 +35,7 @@ type Shadowsocks struct {
 	Multiplex bool   `json:"multiplex"`
 }
 
-func NewShadowsocksFromLink(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewShadowsocks(link string) (dialer.Dialer, *dialer.Property, error) {
 	s, err := ParseSSURL(link)
 	if err != nil {
 		return nil, nil, err
