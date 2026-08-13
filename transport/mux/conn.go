@@ -125,10 +125,7 @@ func (m *Conn) Write(b []byte) (int, error) {
 }
 
 func (m *Conn) Close() error {
-	_, err := m.Conn.Write([]byte{0x0, 0x4, m.id[0], m.id[1], SessionStatusEnd, OptionNone})
-	if err != nil {
-		return err
-	}
+	// Each mux connection owns its underlay, so Close must interrupt its I/O.
 	return m.Conn.Close()
 }
 

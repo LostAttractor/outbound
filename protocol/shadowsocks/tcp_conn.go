@@ -36,6 +36,7 @@ type TCPConn struct {
 	onceWrite   bool
 	nonceRead   []byte
 	nonceWrite  []byte
+	writeErr    error // Sticky after an incomplete ciphertext write.
 
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
@@ -162,6 +163,9 @@ func (c *TCPConn) Close() error {
 func (c *TCPConn) Write(b []byte) (n int, err error) {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
 	buf := pool.GetBytesBuffer()
 	payload := pool.GetBytesBuffer()
 	defer pool.PutBytesBuffer(buf)
@@ -188,8 +192,15 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 	}
 	payload.Write(b)
 	c.seal(buf, payload.Bytes())
-	_, err = c.Conn.Write(buf.Bytes())
-	return len(b), err
+	written, err := c.Conn.Write(buf.Bytes())
+	if written == buf.Len() {
+		return len(b), err
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	c.writeErr = err
+	return 0, err
 }
 
 func (c *TCPConn) seal(buf *bytes.Buffer, payload []byte) {
