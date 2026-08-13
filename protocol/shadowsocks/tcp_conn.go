@@ -40,7 +40,8 @@ type TCPConn struct {
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
 
-	bufReader io.Reader
+	readBuf    []byte
+	readOffset int
 
 	bloom *disk_bloom.FilterGroup
 }
@@ -71,13 +72,13 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 	c.readMutex.Lock()
 	defer c.readMutex.Unlock()
 
-	if c.bufReader != nil {
-		n, err = c.bufReader.Read(b)
-		if err != nil {
-			c.bufReader = nil
-			if err != io.EOF {
-				return 0, err
-			}
+	if c.readBuf != nil {
+		n = copy(b, c.readBuf[c.readOffset:])
+		c.readOffset += n
+		if c.readOffset == len(c.readBuf) {
+			pool.PutBuffer(c.readBuf)
+			c.readBuf = nil
+			c.readOffset = 0
 		}
 		return n, nil
 	}
@@ -112,7 +113,10 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 	}
 	n = copy(b, payload)
 	if len(payload) > n {
-		c.bufReader = bytes.NewReader(payload[n:])
+		c.readBuf = payload
+		c.readOffset = n
+	} else {
+		pool.PutBuffer(payload)
 	}
 	return n, nil
 }
@@ -129,16 +133,30 @@ func (c *TCPConn) readChunk() ([]byte, error) {
 	}
 	common.BytesIncLittleEndian(c.nonceRead)
 	l := binary.BigEndian.Uint16(payloadLength)
-	payload := pool.GetBuffer(int(l) + c.cipherConf.TagLen) // delay putting back
+	payload := pool.GetBuffer(int(l) + c.cipherConf.TagLen)
 	if _, err = io.ReadFull(c.Conn, payload); err != nil {
+		pool.PutBuffer(payload)
 		return nil, err
 	}
-	payload, err = c.cipherRead.Open(payload[:0], c.nonceRead, payload, nil)
+	plaintext, err := c.cipherRead.Open(payload[:0], c.nonceRead, payload, nil)
 	if err != nil {
+		pool.PutBuffer(payload)
 		return nil, protocol.ErrFailAuth
 	}
 	common.BytesIncLittleEndian(c.nonceRead)
-	return payload, nil
+	return plaintext, nil
+}
+
+func (c *TCPConn) Close() error {
+	err := c.Conn.Close()
+	c.readMutex.Lock()
+	if c.readBuf != nil {
+		pool.PutBuffer(c.readBuf)
+		c.readBuf = nil
+		c.readOffset = 0
+	}
+	c.readMutex.Unlock()
+	return err
 }
 
 func (c *TCPConn) Write(b []byte) (n int, err error) {
