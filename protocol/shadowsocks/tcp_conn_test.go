@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
 type interruptingCloseConn struct {
@@ -76,6 +78,17 @@ func (c *fullWriteErrorConn) Write(b []byte) (int, error) {
 	c.err = nil
 	return len(b), err
 }
+
+type fixedSaltGenerator struct {
+	salt []byte
+}
+
+func (g *fixedSaltGenerator) Get() []byte {
+	salt := pool.GetBuffer(len(g.salt))
+	copy(salt, g.salt)
+	return salt
+}
+func (g *fixedSaltGenerator) Close() error { return nil }
 
 func TestTCPConnReleasesBufferedPayload(t *testing.T) {
 	client, server := net.Pipe()
@@ -208,6 +221,28 @@ func TestTCPConnWriteKeepsAlignedStreamUsableAfterFullWriteError(t *testing.T) {
 	}
 	if underlay.writes != 2 {
 		t.Fatalf("underlay writes = %d, want 2", underlay.writes)
+	}
+}
+
+func TestTCPConnWriteRejectsInvalidAddressBeforeWriting(t *testing.T) {
+	underlay := &shortWriteConn{}
+	conn := &TCPConn{
+		Conn:       underlay,
+		addr:       &socks5.AddressInfo{Type: socks5.AddressTypeDomain, Hostname: strings.Repeat("x", 256)},
+		cipherConf: ciphers.AeadCiphersConf["aes-128-gcm"],
+		masterKey:  make([]byte, 16),
+		sg:         &fixedSaltGenerator{salt: make([]byte, 16)},
+		nonceWrite: make([]byte, 12),
+	}
+
+	if n, err := conn.Write([]byte("payload")); n != 0 || err == nil {
+		t.Fatalf("Write() = %d, %v; want address error", n, err)
+	}
+	if underlay.writes != 0 {
+		t.Fatalf("underlay writes = %d, want 0", underlay.writes)
+	}
+	if conn.onceWrite {
+		t.Fatal("failed address encoding marked the first write complete")
 	}
 }
 

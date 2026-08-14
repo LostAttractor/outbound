@@ -183,7 +183,9 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 
 		// Create address metadata for the first write
 		// For client connections, encode the target address
-		socks5.WriteAddrInfo(c.addr, payload)
+		if err = socks5.WriteAddrInfo(c.addr, payload); err != nil {
+			return 0, err
+		}
 
 		c.onceWrite = true
 	}
