@@ -6,15 +6,17 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol"
 )
 
 type Dialer struct {
-	nextDialer netproxy.Dialer
+	protocol.StatelessDialer
 	tlsConfig  *tls.Config
 	addr       string
 	host       string
@@ -36,9 +38,11 @@ func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 	}
 
 	t := &Dialer{
-		nextDialer: d,
-		addr:       u.Host,
-		path:       path,
+		StatelessDialer: protocol.StatelessDialer{
+			ParentDialer: d,
+		},
+		addr: u.Host,
+		path: path,
 	}
 
 	if query.Get("allowInsecure") == "true" || query.Get("allowInsecure") == "1" ||
@@ -66,20 +70,16 @@ func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 	return t, nil
 }
 
-func (t *Dialer) DialContext(ctx context.Context, network, addr string) (c netproxy.Conn, err error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
-	if err != nil {
-		return nil, err
-	}
-	switch magicNetwork.Network {
+func (t *Dialer) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {
+	switch network {
 	case "tcp":
-		conn, err := t.nextDialer.DialContext(ctx, network, addr)
+		conn, err := t.ParentDialer.DialContext(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
 
 		if t.tlsConfig != nil {
-			conn = tls.Client(&netproxy.FakeNetConn{Conn: conn}, t.tlsConfig)
+			conn = tls.Client(conn, t.tlsConfig)
 		}
 
 		req, err := http.NewRequest("GET", t.path, nil)
@@ -113,4 +113,8 @@ func (t *Dialer) DialContext(ctx context.Context, network, addr string) (c netpr
 	default:
 		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
 	}
+}
+
+func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
+	return nil, fmt.Errorf("%w: httpupgrade+udp", netproxy.UnsupportedTunnelTypeError)
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/daeuniverse/outbound/pkg/cert"
 	proto "github.com/daeuniverse/outbound/pkg/gun_proto"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
@@ -99,7 +100,7 @@ func (c *ClientConn) Read(p []byte) (n int, err error) {
 		n = copy(p, c.buf[c.offset:])
 		c.offset += n
 		if c.offset == len(c.buf) {
-			pool.Put(c.buf)
+			pool.PutBuffer(c.buf)
 			c.buf = nil
 		}
 		return n, nil
@@ -131,7 +132,7 @@ func (c *ClientConn) Read(p []byte) (n int, err error) {
 			return 0, err
 		}
 		n = copy(p, recvResp.hunk.Data)
-		c.buf = pool.Get(len(recvResp.hunk.Data) - n)
+		c.buf = pool.GetBuffer(len(recvResp.hunk.Data) - n)
 		copy(c.buf, recvResp.hunk.Data[n:])
 		c.offset = 0
 		return n, nil
@@ -306,41 +307,56 @@ func (c *ClientConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+func (c *ClientConn) LocalAddr() net.Addr {
+	return nil
+}
+
+func (c *ClientConn) RemoteAddr() net.Addr {
+	return nil
+}
+
 type Dialer struct {
-	NextDialer    netproxy.Dialer
+	protocol.StatelessDialer
 	ServiceName   string
 	ServerName    string
 	AllowInsecure bool
 }
 
-func (d *Dialer) DialContext(ctx context.Context, network string, address string) (netproxy.Conn, error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
-	if err != nil {
-		return nil, err
-	}
-	meta, cancel, err := getGrpcClientConn(ctx, d.NextDialer, d.ServerName, address, d.AllowInsecure, magicNetwork.Mark, magicNetwork.Mptcp)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	client := proto.NewGunServiceClient(meta.cc)
+func (d *Dialer) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {
+	switch network {
+	case "tcp":
+		meta, cancel, err := getGrpcClientConn(ctx, d.ParentDialer, d.ServerName, address, d.AllowInsecure)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		client := proto.NewGunServiceClient(meta.cc)
 
-	clientX := client.(proto.GunServiceClientX)
-	serviceName := d.ServiceName
-	if serviceName == "" {
-		serviceName = "GunService"
+		clientX := client.(proto.GunServiceClientX)
+		serviceName := d.ServiceName
+		if serviceName == "" {
+			serviceName = "GunService"
+		}
+		// ctx is the lifetime of the tun
+		ctxStream, streamCloser := context.WithCancel(context.Background())
+		tun, err := clientX.TunCustomName(ctxStream, serviceName)
+		if err != nil {
+			streamCloser()
+			return nil, err
+		}
+		return NewClientConn(tun, streamCloser), nil
+	case "udp":
+		return nil, fmt.Errorf("%w: grpc+udp", netproxy.UnsupportedTunnelTypeError)
+	default:
+		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
 	}
-	// ctx is the lifetime of the tun
-	ctxStream, streamCloser := context.WithCancel(context.Background())
-	tun, err := clientX.TunCustomName(ctxStream, serviceName)
-	if err != nil {
-		streamCloser()
-		return nil, err
-	}
-	return NewClientConn(tun, streamCloser), nil
 }
 
-func getGrpcClientConn(ctx context.Context, tcpDialer netproxy.Dialer, serverName string, address string, allowInsecure bool, somark uint32, mptcp bool) (*clientConnMeta, ccCanceller, error) {
+func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
+	return nil, fmt.Errorf("%w: grpc+udp", netproxy.UnsupportedTunnelTypeError)
+}
+
+func getGrpcClientConn(ctx context.Context, dialer netproxy.Dialer, serverName string, address string, allowInsecure bool) (*clientConnMeta, ccCanceller, error) {
 	// allowInsecure?
 	roots, err := cert.GetSystemCertPool()
 	if err != nil {
@@ -374,20 +390,7 @@ func getGrpcClientConn(ctx context.Context, tcpDialer netproxy.Dialer, serverNam
 	meta.cc, err = grpc.DialContext(ctx, address,
 		certOption,
 		grpc.WithContextDialer(func(ctxGrpc context.Context, s string) (net.Conn, error) {
-			tcpNetwork := netproxy.MagicNetwork{
-				Network: "tcp",
-				Mark:    somark,
-				Mptcp:   mptcp,
-			}.Encode()
-			c, err := tcpDialer.DialContext(ctxGrpc, tcpNetwork, s)
-			if err != nil {
-				return nil, err
-			}
-			return &netproxy.FakeNetConn{
-				Conn:  c,
-				LAddr: nil,
-				RAddr: nil,
-			}, nil
+			return dialer.DialContext(ctxGrpc, "tcp", s)
 		}), grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
 				BaseDelay:  500 * time.Millisecond,

@@ -7,18 +7,18 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 
-	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
 )
 
 // HTTPObfs is shadowsocks http simple-obfs implementation
 type HTTPObfs struct {
-	netproxy.Conn
+	net.Conn
 	host          string
 	port          string
 	path          string
@@ -37,22 +37,22 @@ func (ho *HTTPObfs) Read(b []byte) (int, error) {
 		n := copy(b, ho.buf[ho.offset:])
 		ho.offset += n
 		if ho.offset == len(ho.buf) {
-			pool.Put(ho.buf)
+			pool.PutBuffer(ho.buf)
 			ho.buf = nil
 		}
 		return n, nil
 	}
 
 	if ho.firstResponse {
-		buf := pool.Get(1 << 15)
+		buf := pool.GetBuffer(1 << 15)
 		n, err := ho.Conn.Read(buf)
 		if err != nil {
-			pool.Put(buf)
+			pool.PutBuffer(buf)
 			return 0, err
 		}
 		idx := bytes.Index(buf[:n], []byte("\r\n\r\n"))
 		if idx == -1 {
-			pool.Put(buf)
+			pool.PutBuffer(buf)
 			return 0, io.EOF
 		}
 		ho.firstResponse = false
@@ -62,7 +62,7 @@ func (ho *HTTPObfs) Read(b []byte) (int, error) {
 			ho.buf = buf[:idx+4+length]
 			ho.offset = idx + 4 + n
 		} else {
-			pool.Put(buf)
+			pool.PutBuffer(buf)
 		}
 		return n, nil
 	}
@@ -93,7 +93,7 @@ func (ho *HTTPObfs) Write(b []byte) (int, error) {
 }
 
 // NewHTTPObfs return a HTTPObfs
-func NewHTTPObfs(conn netproxy.Conn, host string, port string, path string) netproxy.Conn {
+func NewHTTPObfs(conn net.Conn, host string, port string, path string) net.Conn {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
