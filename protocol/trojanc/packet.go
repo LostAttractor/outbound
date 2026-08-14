@@ -1,80 +1,81 @@
 package trojanc
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
-	"net/netip"
-	"strconv"
-	"sync"
 
 	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
 type PacketConn struct {
 	*Conn
-	domainIpMapping sync.Map
 }
 
-func (c *PacketConn) Write(b []byte) (int, error) {
-	return c.WriteTo(b, net.JoinHostPort(c.Conn.metadata.Hostname, strconv.Itoa(int(c.Conn.metadata.Port))))
-}
-
-func (c *PacketConn) Read(b []byte) (n int, err error) {
-	n, _, err = c.ReadFrom(b)
-	return n, err
-}
-
-func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
-	m := Metadata{}
-	if _, err = m.Unpack(c.Conn); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	if addr, err = m.DomainIpMapping(&c.domainIpMapping); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-
-	buf := pool.Get(2)
-	defer buf.Put()
-	if _, err = io.ReadFull(c.Conn, buf[:2]); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	length := binary.BigEndian.Uint16(buf)
-	buf = pool.Get(2 + int(length))
-	defer buf.Put()
-	if _, err = io.ReadFull(c.Conn, buf); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	n = copy(p, buf[2:])
-	return n, addr, nil
-}
-
-func (c *PacketConn) WriteTo(p []byte, addr string) (n int, err error) {
-	_metadata, err := protocol.ParseMetadata(addr)
+// ReadFrom reads a UDP packet according to Trojan UDP format:
+// +------+----------+----------+--------+---------+----------+
+// | ATYP | DST.ADDR | DST.PORT | Length |  CRLF   | Payload  |
+// +------+----------+----------+--------+---------+----------+
+// |  1   | Variable |    2     |   2    | X'0D0A' | Variable |
+// +------+----------+----------+--------+---------+----------+
+func (c *PacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	// Decode address using shadowsocks implementation
+	addr, err = socks5.ReadAddr(c.Conn)
 	if err != nil {
-		return 0, err
+		return 0, nil, fmt.Errorf("failed to read address: %w", err)
 	}
-	metadata := Metadata{
-		Metadata: _metadata,
-		Network:  "udp",
+
+	// Read payload length (2 bytes)
+	var payloadLen uint16
+	if err := binary.Read(c.Conn, binary.BigEndian, &payloadLen); err != nil {
+		return 0, nil, fmt.Errorf("failed to read payload length: %w", err)
 	}
-	buf := pool.Get(metadata.Len() + 4 + len(p))
-	defer pool.Put(buf)
-	SealUDP(metadata, buf, p)
-	_, err = c.Conn.Write(buf)
-	if err != nil {
-		return 0, err
+
+	// Read CRLF
+	buf := pool.GetBuffer(int(payloadLen) + 2)
+	defer pool.PutBuffer(buf)
+
+	if _, err := io.ReadFull(c.Conn, buf); err != nil {
+		return 0, nil, fmt.Errorf("failed to read payload: %w", err)
 	}
-	return len(p), nil
+
+	if !bytes.Equal(CRLF, buf[:2]) {
+		return 0, nil, fmt.Errorf("invalid CRLF in UDP packet")
+	}
+
+	n = copy(b, buf[2:])
+	return
 }
 
-func SealUDP(metadata Metadata, dst []byte, data []byte) []byte {
-	n := metadata.Len()
-	// copy first to allow overlap
-	copy(dst[n+4:], data)
-	metadata.PackTo(dst)
-	binary.BigEndian.PutUint16(dst[n:], uint16(len(data)))
-	copy(dst[n+2:], CRLF)
-	return dst[:n+4+len(data)]
+// WriteTo writes a UDP packet according to Trojan UDP format
+func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+
+	// Build UDP packet using bytes.Buffer
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+
+	// Encode address
+	err = socks5.WriteAddr(addr.String(), buf)
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode address: %w", err)
+	}
+
+	// Write payload length
+	binary.Write(buf, binary.BigEndian, uint16(len(b)))
+
+	// Write CRLF
+	buf.Write(CRLF)
+
+	// Write payload
+	buf.Write(b)
+
+	// Send the complete packet
+	if _, err := c.Conn.Write(buf.Bytes()); err != nil {
+		return 0, fmt.Errorf("failed to write UDP packet: %w", err)
+	}
+
+	return len(b), nil
 }

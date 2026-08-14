@@ -3,9 +3,11 @@ package trojanc
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
 func init() {
@@ -13,74 +15,74 @@ func init() {
 }
 
 type Dialer struct {
+	protocol.StatelessDialer
 	proxyAddress string
-	nextDialer   netproxy.Dialer
-	metadata     protocol.Metadata
 	password     string
 }
 
-func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
-	metadata := protocol.Metadata{
-		IsClient: header.IsClient,
-	}
-	//log.Trace("trojanc.NewDialer: metadata: %v, password: %v", metadata, password)
+func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
 	return &Dialer{
+		StatelessDialer: protocol.StatelessDialer{
+			ParentDialer: parentDialer,
+		},
 		proxyAddress: header.ProxyAddress,
-		nextDialer:   nextDialer,
-		metadata:     metadata,
 		password:     header.Password,
 	}, nil
 }
 
-func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
-	return d.DialContext(ctx, "tcp", addr)
-}
-
-func (d *Dialer) DialUdp(ctx context.Context, addr string) (c netproxy.PacketConn, err error) {
-	pktConn, err := d.DialContext(ctx, "udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return pktConn.(netproxy.PacketConn), nil
-}
-
-func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c netproxy.Conn, err error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
-	if err != nil {
-		return nil, err
-	}
-	switch magicNetwork.Network {
+func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c net.Conn, err error) {
+	switch network {
 	case "tcp", "udp":
-		mdata, err := protocol.ParseMetadata(addr)
+		// Parse address using shadowsocks implementation
+		addressInfo, err := socks5.AddressFromString(addr)
 		if err != nil {
-			return nil, err
-		}
-		mdata.IsClient = d.metadata.IsClient
-
-		tcpNetwork := netproxy.MagicNetwork{
-			Network: "tcp",
-			Mark:    magicNetwork.Mark,
-			Mptcp:   magicNetwork.Mptcp,
-		}.Encode()
-		conn, err := d.nextDialer.DialContext(ctx, tcpNetwork, d.proxyAddress)
-		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to parse address: %w", err)
 		}
 
-		tcpConn, err := NewConn(conn, Metadata{
-			Metadata: mdata,
-			Network:  magicNetwork.Network,
-		}, d.password)
+		// Connect to proxy server
+		conn, err := d.ParentDialer.DialContext(ctx, "tcp", d.proxyAddress)
 		if err != nil {
-			return nil, err
-		}
-		if magicNetwork.Network == "tcp" {
-			return tcpConn, nil
-		} else {
-			return &PacketConn{Conn: tcpConn}, nil
+			return nil, fmt.Errorf("failed to connect to proxy: %w", err)
 		}
 
+		// Create Trojan connection
+		tcpConn, err := NewConn(conn, addressInfo, network, d.password)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create Trojan connection: %w", err)
+		}
+
+		if network == "udp" {
+			return &netproxy.BindPacketConn{
+				PacketConn: &PacketConn{Conn: tcpConn},
+				Address:    netproxy.NewAddr("udp", addr),
+			}, nil
+		}
+		return tcpConn, nil
 	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, magicNetwork.Network)
+		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
 	}
+}
+
+func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
+	// Parse address using shadowsocks implementation
+	addressInfo, err := socks5.AddressFromString(addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse address: %w", err)
+	}
+
+	// Connect to proxy server
+	conn, err := d.ParentDialer.DialContext(ctx, "tcp", d.proxyAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to proxy: %w", err)
+	}
+
+	// Create Trojan connection for UDP
+	tcpConn, err := NewConn(conn, addressInfo, "udp", d.password)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create Trojan UDP connection: %w", err)
+	}
+
+	return &PacketConn{Conn: tcpConn}, nil
 }

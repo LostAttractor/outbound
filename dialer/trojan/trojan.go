@@ -38,53 +38,58 @@ type Trojan struct {
 	Protocol      string `json:"protocol"`
 }
 
-func NewTrojan(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
+func NewTrojan(link string) (dialer.Dialer, *dialer.Property, error) {
 	s, err := ParseTrojanURL(link)
 	if err != nil {
 		return nil, nil, err
 	}
-	return s.Dialer(option, nextDialer)
+	return s, &dialer.Property{
+		Name:     s.Name,
+		Address:  net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+		Protocol: s.Protocol,
+		Link:     s.ExportToURL(),
+	}, nil
 }
 
-func (s *Trojan) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
-	d := nextDialer
+func (s *Trojan) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
 	var err error
-	if s.Type != "grpc" {
-		// grpc contains tls
-		u := url.URL{
-			Scheme: option.TlsImplementation,
-			Host:   net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-			RawQuery: url.Values{
-				"sni":           []string{s.Sni},
-				"allowInsecure": []string{common.BoolToString(s.AllowInsecure || option.AllowInsecure)},
-				"utlsImitate":   []string{option.UtlsImitate},
-			}.Encode(),
+	if s.Type != "grpc" { // grpc contains tls
+		tlsConfig := tls.TLSConfig{
+			Host:          net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+			Sni:           s.Sni,
+			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
-		if d, _, err = tls.NewTls(option, d, u.String()); err != nil {
-			return nil, nil, err
+		if parentDialer, err = tlsConfig.Dialer(option, parentDialer); err != nil {
+			return nil, err
 		}
 	}
 	// "tls,ws,ss,trojanc"
 	switch s.Type {
 	case "ws":
-		u := url.URL{
-			Scheme: "ws",
-			Host:   net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-			Path:   s.Path,
-			RawQuery: url.Values{
-				"host": []string{s.Host},
-			}.Encode(),
+		host := s.Host
+		if host == "" {
+			host = s.Server
 		}
-		if d, _, err = ws.NewWs(option, d, u.String()); err != nil {
-			return nil, nil, err
+		ws := &ws.WsConfig{
+			Scheme:        "ws",
+			Host:          net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+			Path:          s.Path,
+			Hostname:      host,
+			Sni:           s.Sni,
+			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
+		}
+		if parentDialer, err = ws.Dialer(option, parentDialer); err != nil {
+			return nil, err
 		}
 	case "grpc":
 		serviceName := s.ServiceName
 		if serviceName == "" {
 			serviceName = "GunService"
 		}
-		d = &grpc.Dialer{
-			NextDialer:    d,
+		parentDialer = &grpc.Dialer{
+			StatelessDialer: protocol.StatelessDialer{
+				ParentDialer: parentDialer,
+			},
 			ServiceName:   serviceName,
 			ServerName:    s.Sni,
 			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
@@ -99,34 +104,24 @@ func (s *Trojan) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) 
 			}.Encode(),
 		}
 
-		if d, err = httpupgrade.NewDialer(u.String(), d); err != nil {
-			return nil, nil, err
+		if parentDialer, err = httpupgrade.NewDialer(u.String(), parentDialer); err != nil {
+			return nil, err
 		}
 	}
 	if strings.HasPrefix(s.Encryption, "ss;") {
 		fields := strings.SplitN(s.Encryption, ";", 3)
-		if d, err = protocol.NewDialer("shadowsocks", d, protocol.Header{
+		if parentDialer, err = protocol.NewDialer("shadowsocks", parentDialer, protocol.Header{
 			ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			Cipher:       fields[1],
 			Password:     fields[2],
-			IsClient:     false,
 		}); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
-	if d, err = protocol.NewDialer("trojanc", d, protocol.Header{
+	return protocol.NewDialer("trojanc", parentDialer, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Password:     s.Password,
-		IsClient:     true,
-	}); err != nil {
-		return nil, nil, err
-	}
-	return d, &dialer.Property{
-		Name:     s.Name,
-		Address:  net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-		Protocol: s.Protocol,
-		Link:     s.ExportToURL(),
-	}, nil
+	})
 }
 
 func ParseTrojanURL(u string) (data *Trojan, err error) {
