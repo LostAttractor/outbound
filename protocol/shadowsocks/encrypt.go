@@ -32,5 +32,6 @@ func CreateCipher(masterKey []byte, salt []byte, cipherConf *ciphers.CipherConf)
 		pool.PutBuffer(subKey)
 		return nil, err
 	}
+	defer pool.PutBuffer(subKey)
 	return cipherConf.NewCipher(subKey)
 }
