@@ -1,151 +1,97 @@
 package shadowsocks
 
 import (
+	"bytes"
 	"fmt"
 	"net"
-	"net/netip"
-	"strconv"
 
 	"github.com/daeuniverse/outbound/ciphers"
-	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 	disk_bloom "github.com/mzz2017/disk-bloom"
 )
 
 type UdpConn struct {
-	netproxy.PacketConn
+	net.Conn
 
-	proxyAddress string
-
-	metadata   protocol.Metadata
 	cipherConf *ciphers.CipherConf
 	masterKey  []byte
-	bloom      *disk_bloom.FilterGroup
 	sg         SaltGenerator
-
-	tgtAddr string
+	bloom      *disk_bloom.FilterGroup
 }
 
-func NewUdpConn(conn netproxy.PacketConn, proxyAddress string, metadata protocol.Metadata, masterKey []byte, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
-	conf := ciphers.AeadCiphersConf[metadata.Cipher]
-	if conf.NewCipher == nil {
-		return nil, fmt.Errorf("invalid CipherConf")
-	}
-	key := make([]byte, len(masterKey))
-	copy(key, masterKey)
-	sg, err := GetSaltGenerator(masterKey, conf.SaltLen)
-	if err != nil {
-		return nil, err
-	}
-	c := &UdpConn{
-		PacketConn:   conn,
-		proxyAddress: proxyAddress,
-		metadata:     metadata,
-		cipherConf:   conf,
-		masterKey:    key,
-		bloom:        bloom,
-		sg:           sg,
-		tgtAddr:      net.JoinHostPort(metadata.Hostname, strconv.Itoa(int(metadata.Port))),
-	}
-	return c, nil
+func NewUdpConn(conn net.Conn, conf *ciphers.CipherConf, masterKey []byte, sg SaltGenerator, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
+	return &UdpConn{
+		Conn:       conn,
+		cipherConf: conf,
+		masterKey:  masterKey,
+		sg:         sg,
+		bloom:      bloom,
+	}, nil
 }
 
-func (c *UdpConn) Close() error {
-	return c.PacketConn.Close()
-}
+func (c *UdpConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	buf := pool.GetBytesBuffer()
+	payload := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	defer pool.PutBytesBuffer(payload)
 
-func (c *UdpConn) Read(b []byte) (n int, err error) {
-	n, _, err = c.ReadFrom(b)
-	return
-}
-
-func (c *UdpConn) Write(b []byte) (n int, err error) {
+	// Combine address and data
+	err := socks5.WriteAddr(addr.String(), payload)
 	if err != nil {
 		return 0, err
 	}
-	return c.WriteTo(b, c.tgtAddr)
-}
+	payload.Write(b)
 
-func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
-	metadata := Metadata{
-		Metadata: c.metadata,
-	}
-	mdata, err := protocol.ParseMetadata(addr)
-	if err != nil {
-		return 0, err
-	}
-	metadata.Hostname = mdata.Hostname
-	metadata.Port = mdata.Port
-	metadata.Type = mdata.Type
-	prefix, err := metadata.BytesFromPool()
-	if err != nil {
-		return 0, err
-	}
-	defer pool.Put(prefix)
-	chunk := pool.Get(len(prefix) + len(b))
-	defer pool.Put(chunk)
-	copy(chunk, prefix)
-	copy(chunk[len(prefix):], b)
+	// Encrypt and send
 	salt := c.sg.Get()
-	toWrite, err := EncryptUDPFromPool(&Key{
-		CipherConf: c.cipherConf,
-		MasterKey:  c.masterKey,
-	}, chunk, salt, ciphers.ShadowsocksReusedInfo)
-	pool.Put(salt)
+	defer pool.PutBuffer(salt)
+	buf.Write(salt)
+	cipher, err := CreateCipher(c.masterKey, salt, c.cipherConf)
 	if err != nil {
 		return 0, err
 	}
-	defer pool.Put(toWrite)
-	if c.bloom != nil {
-		c.bloom.ExistOrAdd(toWrite[:c.cipherConf.SaltLen])
-	}
-	return c.PacketConn.WriteTo(toWrite, c.proxyAddress)
+	buf.Write(cipher.Seal(nil, ciphers.ZeroNonce[:c.cipherConf.NonceLen], payload.Bytes(), nil))
+
+	_, err = c.Conn.Write(buf.Bytes())
+	return len(b), err
 }
 
-func (c *UdpConn) ReadFrom(b []byte) (n int, addr netip.AddrPort, err error) {
-	enc := pool.Get(len(b) + c.cipherConf.SaltLen)
-	defer pool.Put(enc)
-	n, addr, err = c.PacketConn.ReadFrom(enc)
+func (c *UdpConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	buf := pool.GetBuffer(len(b) + c.cipherConf.SaltLen + c.cipherConf.TagLen)
+	defer pool.PutBuffer(buf)
+	n, err = c.Conn.Read(buf)
 	if err != nil {
-		return 0, netip.AddrPort{}, err
+		return 0, nil, err
 	}
-
-	n, err = DecryptUDP(b, &Key{
-		CipherConf: c.cipherConf,
-		MasterKey:  c.masterKey,
-	}, enc[:n], ciphers.ShadowsocksReusedInfo)
-	if err != nil {
-		return 0, netip.AddrPort{}, err
+	if len(buf) < c.cipherConf.SaltLen {
+		return 0, nil, fmt.Errorf("short length to decrypt")
 	}
-
+	salt := buf[:c.cipherConf.SaltLen]
 	if c.bloom != nil {
-		if exist := c.bloom.ExistOrAdd(enc[:c.cipherConf.SaltLen]); exist {
-			err = protocol.ErrReplayAttack
-			return
+		if c.bloom.ExistOrAdd(salt) {
+			return 0, nil, protocol.ErrReplayAttack
 		}
 	}
-	// parse sAddr from metadata
-	sizeMetadata, err := BytesSizeForMetadata(b)
+	payload := buf[c.cipherConf.SaltLen:n]
+	ciph, err := CreateCipher(c.masterKey, salt, c.cipherConf)
 	if err != nil {
-		return 0, netip.AddrPort{}, err
+		return 0, nil, err
 	}
-	mdata, err := NewMetadata(b)
+	payload, err = ciph.Open(payload[:0], ciphers.ZeroNonce[:c.cipherConf.NonceLen], payload, nil)
 	if err != nil {
-		return 0, netip.AddrPort{}, err
+		return 0, nil, err
 	}
-	var typ protocol.MetadataType
-	switch typ {
-	case protocol.MetadataTypeIPv4, protocol.MetadataTypeIPv6:
-		ip, err := netip.ParseAddr(mdata.Hostname)
-		if err != nil {
-			return 0, netip.AddrPort{}, err
-		}
-		addr = netip.AddrPortFrom(ip, mdata.Port)
-	default:
-		return 0, netip.AddrPort{}, fmt.Errorf("bad metadata type: %v; should be ip", typ)
+
+	reader := bytes.NewReader(payload)
+
+	// Parse address from decrypted data
+	addr, err = socks5.ReadAddr(reader)
+	if err != nil {
+		return 0, nil, err
 	}
-	copy(b, b[sizeMetadata:])
-	n -= sizeMetadata
-	return n, addr, nil
+
+	n, err = reader.Read(b)
+	return
 }
