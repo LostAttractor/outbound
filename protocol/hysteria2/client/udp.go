@@ -1,18 +1,22 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
+	"github.com/daeuniverse/outbound/pool"
+	"github.com/samber/oops"
 
 	"github.com/daeuniverse/quic-go"
 
-	"github.com/daeuniverse/outbound/netproxy"
-	coreErrs "github.com/daeuniverse/outbound/protocol/hysteria2/errors"
+	P "github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/frag"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
 )
@@ -21,72 +25,68 @@ const (
 	udpMessageChanSize = 1024
 )
 
-type udpIO interface {
-	ReceiveMessage() (*protocol.UDPMessage, error)
-	SendMessage([]byte, *protocol.UDPMessage) error
-}
-
 type udpConn struct {
 	ID        uint32
 	D         *frag.Defragger
 	ReceiveCh chan *protocol.UDPMessage
-	SendBuf   []byte
-	SendFunc  func([]byte, *protocol.UDPMessage) error
-	CloseFunc func()
-	Closed    bool
 
-	muTimer sync.Mutex
-	timer   *time.Timer
-	target  string
+	conn quic.Connection
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	closeCallback func()
+
+	readDeadline P.Deadline
 }
 
-func (u *udpConn) Read(b []byte) (n int, err error) {
-	msg, _, err := u.ReadFrom(b)
-	return msg, err
-}
-
-func (u *udpConn) Write(b []byte) (n int, err error) {
-	return u.WriteTo(b, u.target)
-}
-
-func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
+func (u *udpConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	for {
-		msg := <-u.ReceiveCh
-		if msg == nil {
-			// Closed
-			return 0, netip.AddrPort{}, io.EOF
+		select {
+		case <-u.ctx.Done():
+			return 0, nil, io.ErrClosedPipe
+		case <-u.readDeadline.Wait():
+			return 0, nil, os.ErrDeadlineExceeded
+		case msg, ok := <-u.ReceiveCh:
+			if !ok {
+				return 0, nil, io.EOF
+			}
+			dfMsg := u.D.Feed(msg)
+			if dfMsg == nil {
+				// Incomplete message, wait for more
+				continue
+			}
+			// TODO: 避免copy
+			return copy(p, dfMsg.Data), net.UDPAddrFromAddrPort(netip.MustParseAddrPort(dfMsg.Addr)), nil
 		}
-		dfMsg := u.D.Feed(msg)
-		if dfMsg == nil {
-			// Incomplete message, wait for more
-			continue
-		}
-		netipAddr, err := netip.ParseAddrPort(dfMsg.Addr)
-		if err != nil {
-			return 0, netipAddr, err
-		}
-		return copy(p, dfMsg.Data), netipAddr, nil
 	}
 }
 
-func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
+func (u *udpConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+	select {
+	case <-u.ctx.Done():
+		return 0, io.ErrClosedPipe
+	default:
+	}
 	// Try no frag first
 	msg := &protocol.UDPMessage{
 		SessionID: u.ID,
 		PacketID:  0,
 		FragID:    0,
 		FragCount: 1,
-		Addr:      addr,
+		Addr:      addr.String(),
 		Data:      b,
 	}
-	err = u.SendFunc(u.SendBuf, msg)
+	buf := pool.GetBuffer(protocol.MaxUDPSize)
+	defer pool.PutBuffer(buf)
+	err = u.WritePacket(buf, msg)
 	var errTooLarge *quic.DatagramTooLargeError
 	if errors.As(err, &errTooLarge) {
 		// Message too large, try fragmentation
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
 		fMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDataLen))
 		for _, fMsg := range fMsgs {
-			err := u.SendFunc(u.SendBuf, &fMsg)
+			err := u.WritePacket(buf, &fMsg)
 			if err != nil {
 				return 0, err
 			}
@@ -97,91 +97,95 @@ func (u *udpConn) WriteTo(b []byte, addr string) (n int, err error) {
 	}
 }
 
+func (u *udpConn) WritePacket(buf []byte, msg *protocol.UDPMessage) error {
+	msgN := msg.Serialize(buf)
+	if msgN < 0 {
+		// Message larger than buffer, silent drop
+		return nil
+	}
+	err := u.conn.SendDatagram(buf[:msgN])
+	return oops.Wrapf(err, "failed to SendDatagram")
+}
+
 func (u *udpConn) Close() error {
-	u.CloseFunc()
+	u.cancel()
+	u.closeCallback()
 	return nil
 }
 
 func (u *udpConn) SetDeadline(t time.Time) error {
-	u.muTimer.Lock()
-	defer u.muTimer.Unlock()
-	dur := time.Until(t)
-	if u.timer != nil {
-		u.timer.Reset(dur)
-	} else {
-		u.timer = time.AfterFunc(dur, func() {
-			u.muTimer.Lock()
-			defer u.muTimer.Unlock()
-			u.Close()
-			u.timer = nil
-		})
-	}
-	return nil
+	return oops.Join(u.SetReadDeadline(t), u.SetWriteDeadline(t))
 }
 
 func (u *udpConn) SetReadDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return u.SetDeadline(t)
+	u.readDeadline.Set(t)
+	return nil
 }
 
+// QUIC raw datagram will not block on write.
 func (u *udpConn) SetWriteDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return u.SetDeadline(t)
+	return nil
+}
+
+func (u *udpConn) LocalAddr() net.Addr {
+	return u.conn.LocalAddr()
 }
 
 type udpSessionManager struct {
-	io udpIO
+	conn quic.Connection
 
-	mutex  sync.RWMutex
-	m      map[uint32]*udpConn
-	nextID uint32
+	connMap sync.Map // map[uint32]*udpConn
+	nextID  uint32
 
-	closed bool
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func newUDPSessionManager(io udpIO) *udpSessionManager {
+func newUDPSessionManager(conn quic.Connection) *udpSessionManager {
+	ctx, cancel := context.WithCancel(context.Background())
 	m := &udpSessionManager{
-		io:     io,
-		m:      make(map[uint32]*udpConn),
+		conn:   conn,
 		nextID: 1,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	go m.run()
 	return m
 }
 
 func (m *udpSessionManager) run() error {
-	defer m.closeCleanup()
 	for {
-		msg, err := m.io.ReceiveMessage()
+		datagram, err := m.conn.ReceiveDatagram(m.ctx)
 		if err != nil {
+			m.Close()
 			return err
+		}
+		msg, err := protocol.ParseUDPMessage(datagram)
+		if err != nil {
+			// Invalid message, this is fine - just wait for the next
+			continue
 		}
 		m.feed(msg)
 	}
 }
 
-func (m *udpSessionManager) closeCleanup() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+func (m *udpSessionManager) Close() {
+	m.cancel()
+}
 
-	for _, conn := range m.m {
-		m.close(conn)
-	}
-	m.closed = true
+func (m *udpSessionManager) IsClosed() bool {
+	return m.ctx.Err() != nil
 }
 
 func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	conn, ok := m.m[msg.SessionID]
+	conn, ok := m.connMap.Load(msg.SessionID)
 	if !ok {
 		// Ignore message from unknown session
 		return
 	}
 
 	select {
-	case conn.ReceiveCh <- msg:
+	case conn.(*udpConn).ReceiveCh <- msg:
 		// OK
 	default:
 		// Channel full, drop the message
@@ -189,47 +193,24 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 }
 
 // NewUDP creates a new UDP session.
-func (m *udpSessionManager) NewUDP(addr string) (netproxy.Conn, error) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if m.closed {
-		return nil, coreErrs.ClosedError{}
-	}
-
+func (m *udpSessionManager) NewUDP() (net.PacketConn, error) {
 	id := m.nextID
 	m.nextID++
 
+	ctx, cancel := context.WithCancel(m.ctx)
 	conn := &udpConn{
-		ID:        id,
-		D:         &frag.Defragger{},
-		ReceiveCh: make(chan *protocol.UDPMessage, udpMessageChanSize),
-		SendBuf:   make([]byte, protocol.MaxUDPSize),
-		SendFunc:  m.io.SendMessage,
-
-		muTimer: sync.Mutex{},
-		target:  addr,
+		ID:           id,
+		D:            &frag.Defragger{},
+		ReceiveCh:    make(chan *protocol.UDPMessage, udpMessageChanSize),
+		conn:         m.conn,
+		ctx:          ctx,
+		cancel:       cancel,
+		readDeadline: P.MakeDeadline(),
 	}
-	conn.CloseFunc = func() {
-		m.mutex.Lock()
-		defer m.mutex.Unlock()
-		m.close(conn)
+	conn.closeCallback = func() {
+		m.connMap.Delete(conn.ID)
 	}
-	m.m[id] = conn
+	m.connMap.Store(id, conn)
 
 	return conn, nil
-}
-
-func (m *udpSessionManager) close(conn *udpConn) {
-	if !conn.Closed {
-		conn.Closed = true
-		close(conn.ReceiveCh)
-		delete(m.m, conn.ID)
-	}
-}
-
-func (m *udpSessionManager) Count() int {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	return len(m.m)
 }
