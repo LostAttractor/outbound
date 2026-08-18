@@ -18,6 +18,11 @@ import (
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
 )
 
+const (
+	replyCommandNotSupported     = 7
+	replyAddressTypeNotSupported = 8
+)
+
 // NewSocks5Dialer returns a socks5 proxy netproxy.
 func NewSocks5Dialer(s string, d netproxy.Dialer) (netproxy.Dialer, error) {
 	return NewSocks5(s, d)
@@ -165,7 +170,11 @@ func (s *Socks5) connect(conn net.Conn, target string, cmd byte) (addr socks.Add
 	}
 
 	if len(failure) > 0 {
-		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " failed to connect: " + failure)
+		err := errors.New("proxy: SOCKS5 proxy at " + s.addr + " failed to connect: " + failure)
+		if buf[1] == replyCommandNotSupported || buf[1] == replyAddressTypeNotSupported {
+			return addr, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, err)
+		}
+		return addr, err
 	}
 
 	return socks.ReadAddr(conn)
