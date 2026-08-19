@@ -91,7 +91,7 @@ func (c *Client) DialConn(stream *utils.QStream, addr string) (net.Conn, error) 
 
 func (c *Client) ListenPacket(_ context.Context, _ string) (net.PacketConn, error) {
 	if c.udpSM == nil {
-		return nil, oops.In("Hysteria2").New("UDP not enabled")
+		return nil, oops.In("Hysteria2").Errorf("%w: UDP not enabled", netproxy.UnsupportedTunnelTypeError)
 	}
 	return c.udpSM.NewUDP()
 }
