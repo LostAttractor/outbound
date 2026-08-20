@@ -33,10 +33,9 @@ type HandshakeInfo struct {
 type Client struct {
 	config *Config
 
-	pktConn     net.PacketConn
-	conn        quic.Connection
-	udpSM       *udpSessionManager
-	udpDisabled bool
+	pktConn net.PacketConn
+	conn    quic.Connection
+	udpSM   *udpSessionManager
 }
 
 func NewClient(config *Config) (*Client, error) {
@@ -92,9 +91,6 @@ func (c *Client) DialConn(stream *utils.QStream, addr string) (net.Conn, error) 
 
 func (c *Client) ListenPacket(_ context.Context, _ string) (net.PacketConn, error) {
 	if c.udpSM == nil {
-		if !c.udpDisabled {
-			return nil, oops.In("Hysteria2").New("UDP is not ready")
-		}
 		return nil, oops.In("Hysteria2").Errorf("%w: UDP not enabled", netproxy.UnsupportedTunnelTypeError)
 	}
 	return c.udpSM.NewUDP()
@@ -145,7 +141,7 @@ func (c *Client) Alive() bool {
 }
 
 func (c *Client) Connect() (err error) {
-	c.udpDisabled = false
+	c.close()
 	ctx, cancel := netproxy.NewDialTimeoutContext()
 	defer func() {
 		cancel()
@@ -235,8 +231,6 @@ func (c *Client) Connect() (err error) {
 
 	if authResp.UDPEnabled {
 		c.udpSM = newUDPSessionManager(c.conn)
-	} else {
-		c.udpDisabled = true
 	}
 
 	return nil
@@ -245,11 +239,14 @@ func (c *Client) Connect() (err error) {
 func (c *Client) close() {
 	if c.pktConn != nil {
 		c.pktConn.Close()
+		c.pktConn = nil
 	}
 	if c.conn != nil {
 		c.conn.CloseWithError(closeErrCodeProtocolError, "")
+		c.conn = nil
 	}
 	if c.udpSM != nil {
 		c.udpSM.Close()
+		c.udpSM = nil
 	}
 }

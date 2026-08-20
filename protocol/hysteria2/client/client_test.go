@@ -9,15 +9,23 @@ import (
 )
 
 func TestListenPacketClassifiesDisabledUDP(t *testing.T) {
-	_, err := (&Client{udpDisabled: true}).ListenPacket(context.Background(), "")
+	_, err := new(Client).ListenPacket(context.Background(), "")
 	if !errors.Is(err, netproxy.UnsupportedTunnelTypeError) {
 		t.Fatalf("ListenPacket error = %v, want UnsupportedTunnelTypeError", err)
 	}
 }
 
-func TestListenPacketDoesNotClassifyUnconnectedClient(t *testing.T) {
-	_, err := new(Client).ListenPacket(context.Background(), "")
-	if errors.Is(err, netproxy.UnsupportedTunnelTypeError) {
-		t.Fatalf("unconnected ListenPacket error = %v, want transient error", err)
+func TestCloseClearsUDPManager(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Client{udpSM: &udpSessionManager{ctx: ctx, cancel: cancel}}
+
+	c.close()
+	if c.udpSM != nil {
+		t.Fatal("close retained stale UDP manager")
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("close did not stop UDP manager")
 	}
 }
