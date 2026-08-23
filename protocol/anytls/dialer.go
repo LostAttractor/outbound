@@ -159,7 +159,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		if err != nil {
 			return nil, err
 		}
-		return openContext(ctx, &d.workers,
+		return d.openContext(ctx,
 			func() (net.Conn, error) { return s.newStream(addr) },
 			func() { _ = s.Close() })
 	case "udp":
@@ -194,22 +194,22 @@ func (d *Dialer) listenPacket(ctx context.Context, addr string) (net.PacketConn,
 	if err != nil {
 		return nil, err
 	}
-	return openContext(ctx, &d.workers,
+	return d.openContext(ctx,
 		func() (net.PacketConn, error) {
 			return s.newPacketStream(net.JoinHostPort("sp.v2.udp-over-tcp.arpa", port), addr)
 		},
 		func() { _ = s.Close() })
 }
 
-func openContext[T interface{ Close() error }](ctx context.Context, workers *sync.WaitGroup, open func() (T, error), abort func()) (T, error) {
+func (d *Dialer) openContext[T interface{ Close() error }](ctx context.Context, open func() (T, error), abort func()) (T, error) {
 	type result struct {
 		value T
 		err   error
 	}
 	results := make(chan result)
-	workers.Add(1)
+	d.workers.Add(1)
 	go func() {
-		defer workers.Done()
+		defer d.workers.Done()
 		value, err := open()
 		select {
 		case results <- result{value: value, err: err}:

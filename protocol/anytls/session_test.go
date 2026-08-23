@@ -138,7 +138,7 @@ func TestDialerCloseWaitsForStreamWorker(t *testing.T) {
 	go func() {
 		defer close(operationDone)
 		defer finish()
-		_, _ = openContext(ctx, &d.workers, func() (net.Conn, error) {
+		_, _ = d.openContext(ctx, func() (net.Conn, error) {
 			close(opened)
 			<-release
 			return nil, errors.New("open failed")
