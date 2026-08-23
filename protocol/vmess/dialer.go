@@ -63,6 +63,16 @@ func NewDialerFactory(proto protocol.Protocol) func(nextDialer netproxy.Dialer, 
 		}
 		dd := d.(*Dialer)
 		dd.protocol = proto
+		if proto == protocol.ProtocolVMessTlsGrpc {
+			transport := &grpc.Dialer{
+				StatelessDialer: protocol.StatelessDialer{ParentDialer: nextDialer},
+				ServiceName:     dd.grpcServiceName,
+				ServerName:      dd.proxySNI,
+				Address:         dd.proxyAddress,
+			}
+			dd.nextDialer = transport
+			return netproxy.ComposeDialer(dd, transport), nil
+		}
 		return dd, nil
 	}
 }
@@ -97,13 +107,6 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			mdata.Type = protocol.MetadataTypeDomain
 		}
 
-		if d.protocol == protocol.ProtocolVMessTlsGrpc {
-			d.nextDialer = &grpc.Dialer{
-				NextDialer:  d,
-				ServiceName: d.grpcServiceName,
-				ServerName:  d.proxySNI,
-			}
-		}
 		tcpNetwork := netproxy.MagicNetwork{
 			Network: "tcp",
 			Mark:    magicNetwork.Mark,

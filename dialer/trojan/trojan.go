@@ -92,6 +92,7 @@ func (s *Trojan) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer
 			},
 			ServiceName:   serviceName,
 			ServerName:    s.Sni,
+			Address:       net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
 	case "httpupgrade":
@@ -110,18 +111,24 @@ func (s *Trojan) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer
 	}
 	if strings.HasPrefix(s.Encryption, "ss;") {
 		fields := strings.SplitN(s.Encryption, ";", 3)
-		if parentDialer, err = protocol.NewDialer("shadowsocks", parentDialer, protocol.Header{
+		transport := parentDialer
+		if parentDialer, err = protocol.NewDialer("shadowsocks", transport, protocol.Header{
 			ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			Cipher:       fields[1],
 			Password:     fields[2],
 		}); err != nil {
 			return nil, err
 		}
+		parentDialer = netproxy.ComposeDialer(parentDialer, transport)
 	}
-	return protocol.NewDialer("trojanc", parentDialer, protocol.Header{
+	d, err := protocol.NewDialer("trojanc", parentDialer, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Password:     s.Password,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return netproxy.ComposeDialer(d, parentDialer), nil
 }
 
 func ParseTrojanURL(u string) (data *Trojan, err error) {

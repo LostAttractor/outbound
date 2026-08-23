@@ -25,6 +25,7 @@ type HttpProxy struct {
 	HaveAuth  bool
 	Username  string
 	Password  string
+	pool      *h2ConnsPool
 }
 
 func NewHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
@@ -75,10 +76,17 @@ func NewHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netproxy.
 			return nil, err
 		}
 	}
+	s.pool = newH2ConnsPool(s.ParentDialer, s.Addr)
 	return s, nil
 }
 
 func (s *HttpProxy) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.pool.ctx.Err() != nil {
+		return nil, net.ErrClosed
+	}
 	switch network {
 	case "tcp":
 		return NewConn(s.ParentDialer, s, addr, network), nil
@@ -89,4 +97,8 @@ func (s *HttpProxy) DialContext(ctx context.Context, network, addr string) (net.
 
 func (s *HttpProxy) ListenPacket(ctx context.Context, network string) (net.PacketConn, error) {
 	return nil, oops.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
+}
+
+func (s *HttpProxy) Close() error {
+	return s.pool.Close()
 }

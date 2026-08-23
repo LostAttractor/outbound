@@ -1,13 +1,6 @@
 package meek
 
-import (
-	"context"
-	"io"
-)
-
-type Session interface {
-	io.ReadWriteCloser
-}
+import "context"
 
 type Request struct {
 	Data          []byte

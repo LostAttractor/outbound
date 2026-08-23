@@ -28,53 +28,71 @@ type session struct {
 	pktCounter  atomic.Uint32
 	peerVersion byte
 
-	seq             uint64
-	sid             atomic.Uint32
-	closed          atomic.Bool
-	closeStreamChan chan uint32
+	sid       atomic.Uint32
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
+	onIdle    func(*session)
 }
 
-func newSession(conn net.Conn, seq uint64) *session {
+func newSession(conn net.Conn, onIdle func(*session)) *session {
 	s := &session{
-		conn:            conn,
-		streams:         map[uint32]*stream{},
-		seq:             seq,
-		closeStreamChan: make(chan uint32, 2),
-		sendPadding:     true,
+		conn:        conn,
+		streams:     map[uint32]*stream{},
+		onIdle:      onIdle,
+		sendPadding: true,
 	}
 	s.padding.Store(DefaultPaddingFactory.Load())
 	return s
 }
 
 func (s *session) newStream(addr string) (*stream, error) {
-	s.sid.Add(1)
-	sid := s.sid.Load()
+	tgtAddr, err := socks.ParseAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	sid := s.sid.Add(1)
+	stream := newStream(s, sid)
+	s.streamLock.Lock()
+	if s.closed.Load() {
+		s.streamLock.Unlock()
+		stream.sessionClose()
+		return nil, net.ErrClosed
+	}
+	s.streams[sid] = stream
+	s.streamLock.Unlock()
+	cleanup := func() {
+		s.streamLock.Lock()
+		if s.streams[sid] == stream {
+			delete(s.streams, sid)
+		}
+		s.streamLock.Unlock()
+		stream.sessionClose()
+	}
 
 	frame := newFrame(cmdSettings, sid)
 	frame.data = settingsBytes(s.GetPadding())
 	if _, err := writeFrame(s, frame); err != nil {
+		cleanup()
 		return nil, err
 	}
 
 	frame = newFrame(cmdSYN, sid)
 	if _, err := writeFrame(s, frame); err != nil {
+		cleanup()
 		return nil, err
 	}
 
-	tgtAddr, err := socks.ParseAddr(addr)
-	if err != nil {
-		return nil, err
-	}
 	frame = newFrame(cmdPSH, sid)
 	frame.data = tgtAddr
 	if _, err := writeFrame(s, frame); err != nil {
+		cleanup()
 		return nil, err
 	}
-
-	stream := newStream(s, sid)
-	s.streamLock.Lock()
-	s.streams[sid] = stream
-	s.streamLock.Unlock()
+	if s.closed.Load() || stream.closed.Load() {
+		cleanup()
+		return nil, net.ErrClosed
+	}
 
 	return stream, nil
 }
@@ -92,22 +110,25 @@ func (s *session) newPacketStream(addr, packetAddr string) (*packetStream, error
 
 func (s *session) removeStream(sid uint32) {
 	s.streamLock.Lock()
-	s.closeStreamChan <- sid
 	delete(s.streams, sid)
 	s.streamLock.Unlock()
+	if s.onIdle != nil {
+		s.onIdle(s)
+	}
 }
 
-func (s *session) run() error {
+func (s *session) run() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("[Panic]", slog.String("stack", string(debug.Stack())))
+			err = fmt.Errorf("anytls session panic: %v", r)
 		}
 	}()
 	defer s.Close()
 
 	var header rawHeader
 	for {
-		if s.Closed() {
+		if s.closed.Load() {
 			return net.ErrClosed
 		}
 		if _, err := io.ReadFull(s.conn, header[:]); err != nil {
@@ -204,20 +225,21 @@ func (s *session) run() error {
 }
 
 func (s *session) Close() error {
-	if s.closed.CompareAndSwap(false, true) {
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		s.streamLock.Lock()
-		defer s.streamLock.Unlock()
-		for i := range s.streams {
-			s.streams[i].Close()
+		streams := make([]*stream, 0, len(s.streams))
+		for _, stream := range s.streams {
+			streams = append(streams, stream)
 		}
 		s.streams = make(map[uint32]*stream)
-		return s.conn.Close()
-	}
-	return nil
-}
-
-func (s *session) Closed() bool {
-	return s.closed.Load()
+		s.streamLock.Unlock()
+		for _, stream := range streams {
+			stream.sessionClose()
+		}
+		s.closeErr = s.conn.Close()
+	})
+	return s.closeErr
 }
 
 func (s *session) SetPadding(padding *paddingFactory) {

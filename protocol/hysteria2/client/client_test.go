@@ -3,29 +3,47 @@ package client
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-func TestListenPacketClassifiesDisabledUDP(t *testing.T) {
-	_, err := new(Client).ListenPacket(context.Background(), "")
-	if !errors.Is(err, netproxy.UnsupportedTunnelTypeError) {
-		t.Fatalf("ListenPacket error = %v, want UnsupportedTunnelTypeError", err)
+type failingPacketDialer struct{ err error }
+
+func (d failingPacketDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, d.err
+}
+
+func (d failingPacketDialer) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	return nil, d.err
+}
+
+func TestEstablishFailureDoesNotPanic(t *testing.T) {
+	wantErr := errors.New("packet setup failed")
+	c := &Client{config: &Config{
+		Addr:       &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443},
+		NextDialer: failingPacketDialer{err: wantErr},
+	}}
+	if _, err := c.establish(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("establish error = %v, want %v", err, wantErr)
 	}
 }
 
-func TestCloseClearsUDPManager(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	c := &Client{udpSM: &udpSessionManager{ctx: ctx, cancel: cancel}}
-
-	c.close()
-	if c.udpSM != nil {
-		t.Fatal("close retained stale UDP manager")
+func TestListenPacketClassifiesDisabledUDP(t *testing.T) {
+	resource := new(clientResource)
+	c := &Client{}
+	c.lifecycle = netproxy.NewSingleSession(netproxy.SingleSessionConfig[*clientResource]{
+		Establish: func(context.Context) (*clientResource, error) { return resource, nil },
+	})
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	select {
-	case <-ctx.Done():
-	default:
-		t.Fatal("close did not stop UDP manager")
+	_, err := c.ListenPacket(context.Background(), "")
+	if !errors.Is(err, netproxy.UnsupportedTunnelTypeError) {
+		t.Fatalf("ListenPacket error = %v, want UnsupportedTunnelTypeError", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

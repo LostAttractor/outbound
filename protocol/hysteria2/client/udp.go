@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
@@ -135,20 +136,20 @@ type udpSessionManager struct {
 	conn quic.Connection
 
 	connMap sync.Map // map[uint32]*udpConn
-	nextID  uint32
+	nextID  atomic.Uint32
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-func newUDPSessionManager(conn quic.Connection) *udpSessionManager {
-	ctx, cancel := context.WithCancel(context.Background())
+func newUDPSessionManager(parent context.Context, conn quic.Connection) *udpSessionManager {
+	ctx, cancel := context.WithCancel(parent)
 	m := &udpSessionManager{
 		conn:   conn,
-		nextID: 1,
 		ctx:    ctx,
 		cancel: cancel,
 	}
+	m.nextID.Store(1)
 	go m.run()
 	return m
 }
@@ -157,7 +158,7 @@ func (m *udpSessionManager) run() error {
 	for {
 		datagram, err := m.conn.ReceiveDatagram(m.ctx)
 		if err != nil {
-			m.Close()
+			m.cancel()
 			return err
 		}
 		msg, err := protocol.ParseUDPMessage(datagram)
@@ -167,14 +168,6 @@ func (m *udpSessionManager) run() error {
 		}
 		m.feed(msg)
 	}
-}
-
-func (m *udpSessionManager) Close() {
-	m.cancel()
-}
-
-func (m *udpSessionManager) IsClosed() bool {
-	return m.ctx.Err() != nil
 }
 
 func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
@@ -194,8 +187,10 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 
 // NewUDP creates a new UDP session.
 func (m *udpSessionManager) NewUDP() (net.PacketConn, error) {
-	id := m.nextID
-	m.nextID++
+	if m.ctx.Err() != nil {
+		return nil, net.ErrClosed
+	}
+	id := m.nextID.Add(1) - 1
 
 	ctx, cancel := context.WithCancel(m.ctx)
 	conn := &udpConn{
@@ -211,6 +206,10 @@ func (m *udpSessionManager) NewUDP() (net.PacketConn, error) {
 		m.connMap.Delete(conn.ID)
 	}
 	m.connMap.Store(id, conn)
+	if m.ctx.Err() != nil {
+		conn.Close()
+		return nil, net.ErrClosed
+	}
 
 	return conn, nil
 }

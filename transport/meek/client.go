@@ -5,25 +5,14 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"net"
+	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-type assemblerClient struct {
-	tripper Tripper
-
-	config *config
-}
-
-func newAssemblerClient(tripper Tripper, config *config) *assemblerClient {
-	return &assemblerClient{
-		tripper: tripper,
-		config:  config,
-	}
-}
-
-func (c *assemblerClient) NewSession(ctx context.Context) (Session, error) {
+func newClientSession(ctx context.Context, tripper Tripper, config *config, workers *sync.WaitGroup) (*assemblerClientSession, error) {
 	sessionID := make([]byte, 16)
 	_, err := io.ReadFull(rand.Reader, sessionID)
 	if err != nil {
@@ -33,17 +22,28 @@ func (c *assemblerClient) NewSession(ctx context.Context) (Session, error) {
 	sessionContext, finish := context.WithCancel(ctx)
 
 	session := &assemblerClientSession{
-		sessionID:  sessionID,
-		ctx:        sessionContext,
-		tripper:    c.tripper,
-		finish:     finish,
-		readBuffer: bytes.NewBuffer(nil),
-		writerChan: make(chan []byte),
-		readerChan: make(chan []byte, 16),
-		assembler:  c,
+		sessionID:        sessionID,
+		currentWriteWait: int(config.InitialPollingIntervalMs),
+		ctx:              sessionContext,
+		tripper:          tripper,
+		config:           config,
+		finish:           finish,
+		readBuffer:       bytes.NewBuffer(nil),
+		writerChan:       make(chan []byte),
+		readerChan:       make(chan []byte, 16),
+		done:             make(chan struct{}),
 	}
 
-	go session.keepRunning()
+	if workers != nil {
+		workers.Add(1)
+	}
+	go func() {
+		defer close(session.done)
+		if workers != nil {
+			defer workers.Done()
+		}
+		session.keepRunning()
+	}()
 
 	return session, nil
 }
@@ -52,14 +52,17 @@ type assemblerClientSession struct {
 	sessionID        []byte
 	currentWriteWait int
 
-	assembler  *assemblerClient
 	tripper    Tripper
+	config     *config
 	readBuffer *bytes.Buffer
 	writerChan chan []byte
 	readerChan chan []byte
 	ctx        context.Context
 	finish     func()
+	done       chan struct{}
 }
+
+var _ net.Conn = (*assemblerClientSession)(nil)
 
 func (s *assemblerClientSession) SetDeadline(t time.Time) error {
 	return nil
@@ -74,7 +77,6 @@ func (s *assemblerClientSession) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *assemblerClientSession) keepRunning() {
-	s.currentWriteWait = int(s.assembler.config.InitialPollingIntervalMs)
 	for s.ctx.Err() == nil {
 		s.runOnce()
 	}
@@ -92,12 +94,12 @@ func (s *assemblerClientSession) runOnce() {
 				return
 			case data := <-s.writerChan:
 				sendBuffer.Write(data)
-				if sendBuffer.Len() >= int(s.assembler.config.MaxWriteSize) {
+				if sendBuffer.Len() >= int(s.config.MaxWriteSize) {
 					break copyFromWriterLoop
 				}
 				if waitForFirstWrite {
 					waitForFirstWrite = false
-					waitTimer.Reset(time.Millisecond * time.Duration(s.assembler.config.WaitSubsequentWriteMs))
+					waitTimer.Reset(time.Millisecond * time.Duration(s.config.WaitSubsequentWriteMs))
 				}
 			case <-waitTimer.C:
 				break copyFromWriterLoop
@@ -111,8 +113,8 @@ func (s *assemblerClientSession) runOnce() {
 	for sendBuffer.Len() != 0 || firstRound {
 		firstRound = false
 		sendAmount := sendBuffer.Len()
-		if sendAmount > int(s.assembler.config.MaxWriteSize) {
-			sendAmount = int(s.assembler.config.MaxWriteSize)
+		if sendAmount > int(s.config.MaxWriteSize) {
+			sendAmount = int(s.config.MaxWriteSize)
 		}
 		data := sendBuffer.Next(sendAmount)
 		if len(data) != 0 {
@@ -120,34 +122,43 @@ func (s *assemblerClientSession) runOnce() {
 		}
 		for {
 			ctx, cancel := netproxy.NewDialTimeoutContextFrom(s.ctx)
-			defer cancel()
 			resp, err := s.tripper.RoundTrip(ctx, Request{Data: data, ConnectionTag: s.sessionID})
+			ctxErr := ctx.Err()
+			cancel()
 			if err != nil {
-				if ctx.Err() != nil {
+				if ctxErr != nil {
 					return
 				}
-				time.Sleep(time.Millisecond * time.Duration(s.assembler.config.FailedRetryIntervalMs))
+				retry := time.NewTimer(time.Millisecond * time.Duration(s.config.FailedRetryIntervalMs))
+				select {
+				case <-s.ctx.Done():
+					retry.Stop()
+					return
+				case <-retry.C:
+				}
 				continue
 			}
 			if len(resp.Data) != 0 {
-				s.readerChan <- resp.Data
-			}
-			if len(resp.Data) != 0 {
 				pollConnection = false
+				select {
+				case s.readerChan <- resp.Data:
+				case <-s.ctx.Done():
+					return
+				}
 			}
 			break
 		}
 	}
 	if pollConnection {
-		s.currentWriteWait = int(s.assembler.config.BackoffFactor * float32(s.currentWriteWait))
-		if s.currentWriteWait > int(s.assembler.config.MaxPollingIntervalMs) {
-			s.currentWriteWait = int(s.assembler.config.MaxPollingIntervalMs)
+		s.currentWriteWait = int(s.config.BackoffFactor * float32(s.currentWriteWait))
+		if s.currentWriteWait > int(s.config.MaxPollingIntervalMs) {
+			s.currentWriteWait = int(s.config.MaxPollingIntervalMs)
 		}
-		if s.currentWriteWait < int(s.assembler.config.MinPollingIntervalMs) {
-			s.currentWriteWait = int(s.assembler.config.MinPollingIntervalMs)
+		if s.currentWriteWait < int(s.config.MinPollingIntervalMs) {
+			s.currentWriteWait = int(s.config.MinPollingIntervalMs)
 		}
 	} else {
-		s.currentWriteWait = int(0)
+		s.currentWriteWait = 0
 	}
 }
 
@@ -181,5 +192,9 @@ func (s *assemblerClientSession) Write(p []byte) (n int, err error) {
 
 func (s *assemblerClientSession) Close() error {
 	s.finish()
+	<-s.done
 	return nil
 }
+
+func (s *assemblerClientSession) LocalAddr() net.Addr  { return nil }
+func (s *assemblerClientSession) RemoteAddr() net.Addr { return nil }

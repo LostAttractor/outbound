@@ -162,10 +162,11 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 			serviceName = "GunService"
 		}
 		d = &grpc.Dialer{
-			NextDialer:    d,
-			ServiceName:   serviceName,
-			ServerName:    sni,
-			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
+			StatelessDialer: protocol.StatelessDialer{ParentDialer: d},
+			ServiceName:     serviceName,
+			ServerName:      sni,
+			Address:         net.JoinHostPort(s.Add, s.Port),
+			AllowInsecure:   s.AllowInsecure || option.AllowInsecure,
 		}
 	case "http", "http2", "h2":
 		sni := s.SNI
@@ -237,7 +238,8 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 		return nil, nil, fmt.Errorf("%w: network: %v", dialer.UnexpectedFieldErr, s.Net)
 	}
 
-	if d, err = protocol.NewDialer(s.Protocol, d, protocol.Header{
+	transport := d
+	if d, err = protocol.NewDialer(s.Protocol, transport, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Add, s.Port),
 		Cipher:       getAutoCipher(),
 		Password:     s.ID,
@@ -247,6 +249,7 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 	}); err != nil {
 		return nil, nil, err
 	}
+	d = netproxy.ComposeDialer(d, transport)
 	return d, &dialer.Property{
 		Name:     s.Ps,
 		Address:  net.JoinHostPort(s.Add, s.Port),

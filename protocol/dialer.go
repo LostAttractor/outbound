@@ -26,11 +26,3 @@ func NewDialer(name string, parentDialer netproxy.Dialer, header Header) (netpro
 type StatelessDialer struct {
 	ParentDialer netproxy.Dialer
 }
-
-func (d *StatelessDialer) Connect() (err error) {
-	return d.ParentDialer.Connect()
-}
-
-func (d *StatelessDialer) Alive() bool {
-	return d.ParentDialer.Alive()
-}

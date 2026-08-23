@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/cert"
 	proto "github.com/daeuniverse/outbound/pkg/gun_proto"
@@ -23,24 +24,6 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
-
-// https://github.com/v2fly/v2ray-core/blob/v5.0.6/transport/internet/grpc/dial.go
-type clientConnMeta struct {
-	cc *grpc.ClientConn
-}
-
-var (
-	globalCCMap    map[string]*clientConnMeta
-	globalCCAccess sync.Mutex
-)
-
-func CleanGlobalClientConnectionCache() {
-	globalCCAccess.Lock()
-	defer globalCCAccess.Unlock()
-	globalCCMap = make(map[string]*clientConnMeta)
-}
-
-type ccCanceller func()
 
 type ClientConn struct {
 	tun       proto.GunService_TunClient
@@ -319,18 +302,131 @@ type Dialer struct {
 	protocol.StatelessDialer
 	ServiceName   string
 	ServerName    string
+	Address       string
 	AllowInsecure bool
+
+	initOnce  sync.Once
+	lifecycle *netproxy.SingleSession[*grpc.ClientConn]
+}
+
+var _ netproxy.StatefulDialer = (*Dialer)(nil)
+
+func (d *Dialer) session() *netproxy.SingleSession[*grpc.ClientConn] {
+	d.initOnce.Do(func() {
+		d.lifecycle = netproxy.NewSingleSession(netproxy.SingleSessionConfig[*grpc.ClientConn]{
+			Establish:   d.establish,
+			IsConnected: func(cc *grpc.ClientConn) bool { return cc.GetState() == connectivity.Ready },
+			Recover:     d.recover,
+			Observe:     d.observe,
+			Close:       (*grpc.ClientConn).Close,
+		})
+	})
+	return d.lifecycle
+}
+
+func (d *Dialer) Snapshot() netproxy.StateEvent {
+	return d.session().Snapshot()
+}
+
+func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
+	return d.session().WatchState(ctx)
+}
+
+func (d *Dialer) dialOptions() ([]grpc.DialOption, error) {
+	roots, err := cert.GetSystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get system certificate pool: %w", err)
+	}
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			ServerName:         d.ServerName,
+			RootCAs:            roots,
+			InsecureSkipVerify: d.AllowInsecure,
+		})),
+		grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
+			return d.ParentDialer.DialContext(ctx, "tcp", address)
+		}),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  500 * time.Millisecond,
+				Multiplier: 1.5,
+				Jitter:     0.2,
+				MaxDelay:   19 * time.Second,
+			},
+			MinConnectTimeout: 5 * time.Second,
+		}),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.WithBlock(),
+	}, nil
+}
+
+func (d *Dialer) Connect(ctx context.Context) error {
+	return d.session().Connect(ctx)
+}
+
+func (d *Dialer) establish(ctx context.Context) (*grpc.ClientConn, error) {
+	if d.Address == "" {
+		return nil, fmt.Errorf("grpc proxy address is empty")
+	}
+	options, err := d.dialOptions()
+	if err != nil {
+		return nil, err
+	}
+	return grpc.DialContext(ctx, d.Address, options...)
+}
+
+func (d *Dialer) recover(ctx context.Context, cc *grpc.ClientConn) (bool, error) {
+	cc.Connect()
+	for {
+		state := cc.GetState()
+		switch state {
+		case connectivity.Ready:
+			return false, nil
+		case connectivity.Shutdown:
+			return true, nil
+		}
+		if !cc.WaitForStateChange(ctx, state) {
+			return false, ctx.Err()
+		}
+	}
+}
+
+func (d *Dialer) observe(ctx context.Context, handle *netproxy.SingleSessionHandle[*grpc.ClientConn]) {
+	cc := handle.Resource()
+	for {
+		state := cc.GetState()
+		var current bool
+		switch state {
+		case connectivity.Ready:
+			current = handle.Transition(netproxy.SessionConnected, nil)
+		case connectivity.Idle, connectivity.Connecting:
+			current = handle.Transition(netproxy.SessionConnecting, nil)
+		case connectivity.TransientFailure:
+			current = handle.Transition(netproxy.SessionDisconnected, fmt.Errorf("grpc transport entered transient failure"))
+		case connectivity.Shutdown:
+			current = handle.Transition(netproxy.SessionDisconnected, net.ErrClosed)
+		}
+		if !current {
+			return
+		}
+		if state == connectivity.Shutdown || !cc.WaitForStateChange(ctx, state) {
+			return
+		}
+	}
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {
 	switch network {
 	case "tcp":
-		meta, cancel, err := getGrpcClientConn(ctx, d.ParentDialer, d.ServerName, address, d.AllowInsecure)
+		cc, err := d.session().Current()
 		if err != nil {
-			cancel()
 			return nil, err
 		}
-		client := proto.NewGunServiceClient(meta.cc)
+		client := proto.NewGunServiceClient(cc)
 
 		clientX := client.(proto.GunServiceClientX)
 		serviceName := d.ServiceName
@@ -339,9 +435,10 @@ func (d *Dialer) DialContext(ctx context.Context, network string, address string
 		}
 		// ctx is the lifetime of the tun
 		ctxStream, streamCloser := context.WithCancel(context.Background())
-		tun, err := clientX.TunCustomName(ctxStream, serviceName)
+		tun, err := common.Invoke(ctx, func() (proto.GunService_TunClient, error) {
+			return clientX.TunCustomName(ctxStream, serviceName)
+		}, streamCloser)
 		if err != nil {
-			streamCloser()
 			return nil, err
 		}
 		return NewClientConn(tun, streamCloser), nil
@@ -356,60 +453,6 @@ func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn,
 	return nil, fmt.Errorf("%w: grpc+udp", netproxy.UnsupportedTunnelTypeError)
 }
 
-func getGrpcClientConn(ctx context.Context, dialer netproxy.Dialer, serverName string, address string, allowInsecure bool) (*clientConnMeta, ccCanceller, error) {
-	// allowInsecure?
-	roots, err := cert.GetSystemCertPool()
-	if err != nil {
-		return nil, func() {}, fmt.Errorf("failed to get system certificate pool")
-	}
-	certOption := grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{ServerName: serverName, RootCAs: roots, InsecureSkipVerify: allowInsecure}))
-
-	globalCCAccess.Lock()
-	if globalCCMap == nil {
-		globalCCMap = make(map[string]*clientConnMeta)
-	}
-	globalCCAccess.Unlock()
-
-	canceller := func() {
-		globalCCAccess.Lock()
-		defer globalCCAccess.Unlock()
-		globalCCMap[address].cc.Close()
-		delete(globalCCMap, address)
-	}
-
-	// TODO Should support chain proxy to the same destination
-	globalCCAccess.Lock()
-	if meta, found := globalCCMap[address]; found && meta.cc.GetState() != connectivity.Shutdown {
-		globalCCAccess.Unlock()
-		return meta, canceller, nil
-	}
-	globalCCAccess.Unlock()
-	meta := &clientConnMeta{
-		cc: nil,
-	}
-	meta.cc, err = grpc.DialContext(ctx, address,
-		certOption,
-		grpc.WithContextDialer(func(ctxGrpc context.Context, s string) (net.Conn, error) {
-			return dialer.DialContext(ctxGrpc, "tcp", s)
-		}), grpc.WithConnectParams(grpc.ConnectParams{
-			Backoff: backoff.Config{
-				BaseDelay:  500 * time.Millisecond,
-				Multiplier: 1.5,
-				Jitter:     0.2,
-				MaxDelay:   19 * time.Second,
-			},
-			MinConnectTimeout: 5 * time.Second,
-		}), grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	)
-	if err != nil {
-		return nil, canceller, err
-	}
-	globalCCAccess.Lock()
-	globalCCMap[address] = meta
-	globalCCAccess.Unlock()
-	return meta, canceller, err
+func (d *Dialer) Close() error {
+	return d.session().Close()
 }

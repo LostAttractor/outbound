@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"net"
+
 	"github.com/daeuniverse/quic-go"
 )
 
@@ -15,6 +17,8 @@ import (
 // - https://github.com/quic-go/quic-go/issues/1599
 type QStream struct {
 	quic.Stream
+	LocalAddr  net.Addr
+	RemoteAddr net.Addr
 }
 
 func (s *QStream) Close() error {

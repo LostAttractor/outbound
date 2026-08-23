@@ -77,6 +77,13 @@ func (c *stream) Close() error {
 	return nil
 }
 
+func (c *stream) sessionClose() {
+	if c.closed.CompareAndSwap(false, true) {
+		_ = c.pw.Close()
+		_ = c.pr.Close()
+	}
+}
+
 func (c *stream) LocalAddr() net.Addr {
 	return c.session.conn.(net.Conn).LocalAddr()
 }

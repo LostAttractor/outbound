@@ -34,3 +34,13 @@ type Property struct {
 type Dialer interface {
 	Dialer(option *ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error)
 }
+
+// BuildRuntime adds one builder layer while preserving the parent's Session
+// and owned resources. On success, the returned Runtime owns parent.
+func BuildRuntime(builder Dialer, option *ExtraOption, parent *netproxy.Runtime) (*netproxy.Runtime, error) {
+	d, err := builder.Dialer(option, parent.Dialer)
+	if err != nil {
+		return nil, err
+	}
+	return netproxy.ComposeRuntime(d, parent), nil
+}
