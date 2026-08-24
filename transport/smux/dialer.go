@@ -234,6 +234,9 @@ func openStream(ctx context.Context, session *smux.Session) (*smux.Stream, error
 }
 
 func (s *Smux) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {
+	if network == "udp" && s.PassthroughUdp {
+		return s.Dialer.DialContext(ctx, network, addr)
+	}
 	session, err := s.currentSession()
 	if err != nil {
 		return nil, err
@@ -260,6 +263,9 @@ func (s *Smux) DialContext(ctx context.Context, network, addr string) (c net.Con
 }
 
 func (s *Smux) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
+	if s.PassthroughUdp {
+		return s.Dialer.ListenPacket(ctx, addr)
+	}
 	session, err := s.currentSession()
 	if err != nil {
 		return nil, err

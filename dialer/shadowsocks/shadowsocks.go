@@ -14,7 +14,6 @@ import (
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/transport/mux"
 	"github.com/daeuniverse/outbound/transport/simpleobfs"
-	"github.com/daeuniverse/outbound/transport/smux"
 	"github.com/daeuniverse/outbound/transport/tls"
 	"github.com/daeuniverse/outbound/transport/ws"
 )
@@ -25,14 +24,13 @@ func init() {
 }
 
 type Shadowsocks struct {
-	Name      string `json:"name"`
-	Server    string `json:"server"`
-	Port      int    `json:"port"`
-	Password  string `json:"password"`
-	Cipher    string `json:"cipher"`
-	Plugin    Sip003 `json:"plugin"`
-	UDP       bool   `json:"udp"`
-	Multiplex bool   `json:"multiplex"`
+	Name     string `json:"name"`
+	Server   string `json:"server"`
+	Port     int    `json:"port"`
+	Password string `json:"password"`
+	Cipher   string `json:"cipher"`
+	Plugin   Sip003 `json:"plugin"`
+	UDP      bool   `json:"udp"`
 }
 
 func NewShadowsocks(link string) (dialer.Dialer, *dialer.Property, error) {
@@ -69,9 +67,6 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.D
 			Host:     host,
 			Path:     s.Plugin.Opts.Path,
 		}
-		if err != nil {
-			return nil, err
-		}
 	case "v2ray-plugin":
 		// https://github.com/teddysun/v2ray-plugin
 		switch s.Plugin.Opts.Obfs {
@@ -107,7 +102,6 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.D
 		default:
 			return nil, fmt.Errorf("unsupported mode %v of plugin %v", s.Plugin.Opts.Obfs, s.Plugin.Name)
 		}
-	default:
 	}
 
 	var typeName string
@@ -121,22 +115,11 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.D
 	default:
 		return nil, fmt.Errorf("unsupported shadowsocks encryption method: %v", s.Cipher)
 	}
-	dialer, err := protocol.NewDialer(typeName, parentDialer, protocol.Header{
+	return protocol.NewDialer(typeName, parentDialer, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Cipher:       s.Cipher,
 		Password:     s.Password,
 	})
-	if err != nil {
-		return nil, err
-	}
-	if s.Multiplex {
-		return &smux.Smux{
-			Dialer:         dialer,
-			PassthroughUdp: true,
-		}, nil
-	} else {
-		return dialer, nil
-	}
 }
 
 func ParseSSURL(ssurl string) (data *Shadowsocks, err error) {
@@ -175,7 +158,6 @@ func ParseSSURL(ssurl string) (data *Shadowsocks, err error) {
 			Plugin:   sip003,
 			UDP:      sip003.Name == "",
 		}
-		ss.Multiplex, _ = strconv.ParseBool(u.Query().Get("multiplex"))
 		return &ss, true
 	}
 	var (

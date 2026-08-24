@@ -24,6 +24,47 @@ func (d *pipeDialer) ListenPacket(context.Context, string) (net.PacketConn, erro
 	return nil, errors.New("unexpected ListenPacket")
 }
 
+type udpPassthroughDialer struct {
+	dialNetwork   string
+	dialAddress   string
+	listenAddress string
+}
+
+var (
+	errDialUDP   = errors.New("dial UDP")
+	errListenUDP = errors.New("listen UDP")
+)
+
+func (d *udpPassthroughDialer) DialContext(_ context.Context, network, address string) (net.Conn, error) {
+	d.dialNetwork = network
+	d.dialAddress = address
+	return nil, errDialUDP
+}
+
+func (d *udpPassthroughDialer) ListenPacket(_ context.Context, address string) (net.PacketConn, error) {
+	d.listenAddress = address
+	return nil, errListenUDP
+}
+
+func TestUDPPassthroughUsesParentDialer(t *testing.T) {
+	parent := new(udpPassthroughDialer)
+	dialer := &Smux{Dialer: parent, PassthroughUdp: true}
+
+	if _, err := dialer.DialContext(context.Background(), "udp", "dns.example:53"); !errors.Is(err, errDialUDP) {
+		t.Fatalf("DialContext error = %v, want %v", err, errDialUDP)
+	}
+	if parent.dialNetwork != "udp" || parent.dialAddress != "dns.example:53" {
+		t.Fatalf("parent DialContext called with %q, %q", parent.dialNetwork, parent.dialAddress)
+	}
+
+	if _, err := dialer.ListenPacket(context.Background(), "0.0.0.0:0"); !errors.Is(err, errListenUDP) {
+		t.Fatalf("ListenPacket error = %v, want %v", err, errListenUDP)
+	}
+	if parent.listenAddress != "0.0.0.0:0" {
+		t.Fatalf("parent ListenPacket called with %q", parent.listenAddress)
+	}
+}
+
 func TestUnderlyingDisconnectPublishesState(t *testing.T) {
 	parent := &pipeDialer{server: make(chan net.Conn, 1)}
 	dialer := &Smux{Dialer: parent}
