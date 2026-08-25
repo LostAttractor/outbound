@@ -176,6 +176,12 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c net.
 		if err != nil {
 			return nil, fmt.Errorf("[REALITY]: dial to %s: %w", addr, err)
 		}
+		closeConn := true
+		defer func() {
+			if closeConn {
+				_ = c.Close()
+			}
+		}()
 		retry := 0
 	retryHandshake:
 		uConn := &RealityUConn{}
@@ -243,6 +249,7 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c net.
 		// }
 		// logrus.Println("11", uConn.Verified)
 		if !uConn.Verified {
+			closeConn = false
 			// Trigger spider.
 			go func() {
 				client := &http.Client{
@@ -329,6 +336,7 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c net.
 			time.Sleep(time.Duration(randBetween(x.spiderY[8], x.spiderY[9])) * time.Millisecond) // return
 			return nil, errors.New("REALITY: processed invalid connection")
 		}
+		closeConn = false
 		return uConn, nil
 
 	case "udp":
@@ -337,6 +345,10 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c net.
 		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
 	}
 
+}
+
+func (x *Reality) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	return nil, fmt.Errorf("%w: Reality+udp", netproxy.UnsupportedTunnelTypeError)
 }
 
 var (
