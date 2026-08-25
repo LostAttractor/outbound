@@ -8,8 +8,9 @@ package dialer
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/common/url"
@@ -19,11 +20,8 @@ type FromLinkCreator func(link string) (dialer Dialer, property *Property, err e
 
 var fromLinkCreators = make(map[string]FromLinkCreator)
 
-var (
-	// ErrLegacyShareLinkProxyChain reports the removed link1->link2 syntax.
-	ErrLegacyShareLinkProxyChain = errors.New("legacy share-link proxy chains are no longer supported")
-	legacyShareLinkProxyChain    = regexp.MustCompile(`(\s*)->(\s*)([A-Za-z][A-Za-z0-9+.-]*)://`)
-)
+// ErrLegacyShareLinkProxyChain reports the removed link1->link2 syntax.
+var ErrLegacyShareLinkProxyChain = errors.New("legacy share-link proxy chains are no longer supported")
 
 func isLegacyShareLinkProxyChain(link string) bool {
 	componentStart := strings.IndexAny(link, "?#")
@@ -42,16 +40,28 @@ func isLegacyShareLinkProxyChain(link string) bool {
 			authorityEnd = schemeEnd + 3 + i
 		}
 	}
-	for _, match := range legacyShareLinkProxyChain.FindAllStringSubmatchIndex(link, -1) {
-		arrowStart := match[3]
-		scheme := link[match[6]:match[7]]
-		if _, registered := fromLinkCreators[scheme]; registered {
+	for search := 0; search < len(link); {
+		i := strings.Index(link[search:], "->")
+		if i < 0 {
+			break
+		}
+		arrowStart := search + i
+		search = arrowStart + 2
+
+		afterArrow := link[search:]
+		nextLink := strings.TrimLeftFunc(afterArrow, unicode.IsSpace)
+		next, err := url.Parse(nextLink)
+		if err != nil || next.Scheme == "" || !strings.HasPrefix(nextLink[len(next.Scheme):], "://") {
+			continue
+		}
+		if _, registered := fromLinkCreators[strings.ToLower(next.Scheme)]; registered {
 			return true
 		}
 		if arrowStart >= chainEnd {
 			continue
 		}
-		spaced := match[2] != match[3] || match[4] != match[5]
+		left, _ := utf8.DecodeLastRuneInString(link[:arrowStart])
+		spaced := unicode.IsSpace(left) || len(nextLink) != len(afterArrow)
 		if spaced || (schemeEnd >= 0 && arrowStart < authorityEnd) {
 			return true
 		}
@@ -60,10 +70,10 @@ func isLegacyShareLinkProxyChain(link string) bool {
 }
 
 func FromLinkRegister(name string, creator FromLinkCreator) {
-	fromLinkCreators[name] = creator
+	fromLinkCreators[strings.ToLower(name)] = creator
 }
 
-func NewFromLink(link string) (dialers []Dialer, property *Property, err error) {
+func NewFromLink(link string) ([]Dialer, *Property, error) {
 	/// Get overwritten name.
 	overwrittenName, linklike := common.GetTagFromLinkLikePlaintext(link)
 	linklike = strings.TrimSpace(linklike)
@@ -74,7 +84,7 @@ func NewFromLink(link string) (dialers []Dialer, property *Property, err error) 
 	if err != nil {
 		return nil, nil, err
 	}
-	creator, ok := fromLinkCreators[u.Scheme]
+	creator, ok := fromLinkCreators[strings.ToLower(u.Scheme)]
 	if !ok {
 		return nil, nil, fmt.Errorf("unexpected link type: %v", u.Scheme)
 	}

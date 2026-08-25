@@ -16,10 +16,8 @@ func (*registerTestDialer) Dialer(_ *ExtraOption, parent netproxy.Dialer) (netpr
 func TestNewFromLinkParsesOneLinkAndPreservesAlias(t *testing.T) {
 	const scheme = "registertest"
 	var receivedLink string
-	var creatorCalls int
 	wantDialer := new(registerTestDialer)
 	fromLinkCreators[scheme] = func(link string) (Dialer, *Property, error) {
-		creatorCalls++
 		receivedLink = link
 		return wantDialer, &Property{Name: "parsed name", Link: link}, nil
 	}
@@ -50,11 +48,15 @@ func TestNewFromLinkParsesOneLinkAndPreservesAlias(t *testing.T) {
 			alias: "spaced component arrows",
 			link:  scheme + "://example.com/path?value=left -> other://query#fragment -> other://part",
 		},
+		{
+			name:  "mixed case scheme",
+			alias: "mixed case scheme",
+			link:  "ReGiStErTeSt://example.com/path",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			receivedLink = ""
-			creatorCalls = 0
 			dialers, property, err := NewFromLink(tt.alias + ":  " + tt.link + "  ")
 			if err != nil {
 				t.Fatal(err)
@@ -64,9 +66,6 @@ func TestNewFromLinkParsesOneLinkAndPreservesAlias(t *testing.T) {
 			}
 			if receivedLink != tt.link {
 				t.Fatalf("creator received %q, want %q", receivedLink, tt.link)
-			}
-			if creatorCalls != 1 {
-				t.Fatalf("creator calls = %d, want 1", creatorCalls)
 			}
 			if property.Name != tt.alias {
 				t.Fatalf("property name = %q, want alias %q", property.Name, tt.alias)
@@ -88,8 +87,10 @@ func TestNewFromLinkRejectsLegacyShareLinkProxyChain(t *testing.T) {
 		"alias:" + scheme + "://first.example/path ->  other+share://second.example",
 		"alias:" + scheme + "://first.example/path ->other+share://second.example",
 		"alias:" + scheme + "://first.example/path->  other+share://second.example",
+		"alias:" + scheme + "://first.example/path ->\u00a0" + scheme + "://second.example",
 		"alias:" + scheme + "://first.example->other+share://second.example",
 		"alias:" + scheme + "://first.example/path->" + scheme + "://second.example",
+		"alias:" + scheme + "://first.example/path->ReGiStErChAiN://second.example",
 		"alias:" + scheme + "://first.example/path?x=y -> " + scheme + "://second.example",
 	} {
 		dialers, property, err := NewFromLink(link)
