@@ -104,19 +104,17 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 		if sni == "" {
 			sni = s.Host
 		}
-		u := url.URL{
-			Scheme: scheme,
-			Host:   net.JoinHostPort(s.Add, s.Port),
-			Path:   s.Path,
-			RawQuery: url.Values{
-				"host":          []string{s.Host},
-				"sni":           []string{sni},
-				"allowInsecure": []string{common.BoolToString(s.AllowInsecure || option.AllowInsecure)},
-			}.Encode(),
+		host := s.Host
+		if host == "" {
+			host = s.Add
 		}
-		wsBuilder, _, err := ws.NewWs(u.String())
-		if err != nil {
-			return nil, err
+		wsBuilder := &ws.WsConfig{
+			Scheme:        scheme,
+			Host:          net.JoinHostPort(s.Add, s.Port),
+			Path:          s.Path,
+			Hostname:      host,
+			Sni:           sni,
+			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
 		d, err = wsBuilder.Dialer(option, d)
 		if err != nil {
