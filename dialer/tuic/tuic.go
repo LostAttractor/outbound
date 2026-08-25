@@ -47,13 +47,11 @@ func NewTuic(link string) (dialer.Dialer, *dialer.Property, error) {
 }
 
 func (s *Tuic) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
-	d := nextDialer
-	var err error
 	var flags protocol.Flags
 	if s.UdpRelayMode == "quic" {
 		flags |= protocol.Flags_Tuic_UdpRelayModeQuic
 	}
-	if d, err = protocol.NewDialer("tuic", d, protocol.Header{
+	return protocol.NewDialer("tuic", nextDialer, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Feature1:     s.CongestionControl,
 		TlsConfig: &tls.Config{
@@ -65,10 +63,7 @@ func (s *Tuic) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (n
 		User:     s.User,
 		Password: s.Password,
 		Flags:    flags,
-	}); err != nil {
-		return nil, err
-	}
-	return d, nil
+	})
 }
 
 func ParseTuicURL(u string) (data *Tuic, err error) {

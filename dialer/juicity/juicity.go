@@ -48,9 +48,6 @@ func NewJuicity(link string) (dialer.Dialer, *dialer.Property, error) {
 }
 
 func (s *Juicity) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
-	d := nextDialer
-	var err error
-	var flags protocol.Flags
 	tlsConfig := &tls.Config{
 		NextProtos:         []string{"h3"},
 		MinVersion:         tls.VersionTLS13,
@@ -76,17 +73,13 @@ func (s *Juicity) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer)
 			return nil
 		}
 	}
-	if d, err = protocol.NewDialer("juicity", d, protocol.Header{
+	return protocol.NewDialer("juicity", nextDialer, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Feature1:     s.CongestionControl,
 		TlsConfig:    tlsConfig,
 		User:         s.User,
 		Password:     s.Password,
-		Flags:        flags,
-	}); err != nil {
-		return nil, err
-	}
-	return d, nil
+	})
 }
 
 func ParseJuicityURL(u string) (data *Juicity, err error) {
