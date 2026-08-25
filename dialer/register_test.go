@@ -86,6 +86,8 @@ func TestNewFromLinkRejectsLegacyShareLinkProxyChain(t *testing.T) {
 
 	for _, link := range []string{
 		"alias:" + scheme + "://first.example/path ->  other+share://second.example",
+		"alias:" + scheme + "://first.example/path ->other+share://second.example",
+		"alias:" + scheme + "://first.example/path->  other+share://second.example",
 		"alias:" + scheme + "://first.example->other+share://second.example",
 		"alias:" + scheme + "://first.example/path->" + scheme + "://second.example",
 		"alias:" + scheme + "://first.example/path?x=y -> " + scheme + "://second.example",

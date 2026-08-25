@@ -22,44 +22,37 @@ var fromLinkCreators = make(map[string]FromLinkCreator)
 var (
 	// ErrLegacyShareLinkProxyChain reports the removed link1->link2 syntax.
 	ErrLegacyShareLinkProxyChain = errors.New("legacy share-link proxy chains are no longer supported")
-	legacyShareLinkProxyChain    = regexp.MustCompile(`\s+->\s+([A-Za-z][A-Za-z0-9+.-]*)://`)
-	compactLegacyShareLinkChain  = regexp.MustCompile(`->([A-Za-z][A-Za-z0-9+.-]*)://`)
+	legacyShareLinkProxyChain    = regexp.MustCompile(`(\s*)->(\s*)([A-Za-z][A-Za-z0-9+.-]*)://`)
 )
 
 func isLegacyShareLinkProxyChain(link string) bool {
-	chainCandidate := link
-	componentStart := strings.IndexAny(chainCandidate, "?#")
+	componentStart := strings.IndexAny(link, "?#")
+	chainEnd := len(link)
 	if componentStart >= 0 {
-		chainCandidate = chainCandidate[:componentStart]
-	}
-	for _, match := range legacyShareLinkProxyChain.FindAllStringSubmatchIndex(link, -1) {
-		if componentStart < 0 || match[0] < componentStart {
-			return true
-		}
-		if _, registered := fromLinkCreators[link[match[2]:match[3]]]; registered {
-			return true
-		}
+		chainEnd = componentStart
 	}
 
 	// A compact chain after the URL authority is indistinguishable from an
 	// ordinary path component. A registered next scheme disambiguates it;
 	// otherwise reject only the authority form.
-	schemeEnd := strings.Index(chainCandidate, "://")
-	if schemeEnd < 0 {
-		return false
-	}
-	authorityEnd := len(chainCandidate)
-	if i := strings.IndexByte(chainCandidate[schemeEnd+3:], '/'); i >= 0 {
-		authorityEnd = schemeEnd + 3 + i
-	}
-	for _, match := range compactLegacyShareLinkChain.FindAllStringSubmatchIndex(link, -1) {
-		if match[0] < schemeEnd+3 {
-			continue
+	schemeEnd := strings.Index(link[:chainEnd], "://")
+	authorityEnd := chainEnd
+	if schemeEnd >= 0 {
+		if i := strings.IndexByte(link[schemeEnd+3:chainEnd], '/'); i >= 0 {
+			authorityEnd = schemeEnd + 3 + i
 		}
-		if _, registered := fromLinkCreators[link[match[2]:match[3]]]; registered {
+	}
+	for _, match := range legacyShareLinkProxyChain.FindAllStringSubmatchIndex(link, -1) {
+		arrowStart := match[3]
+		scheme := link[match[6]:match[7]]
+		if _, registered := fromLinkCreators[scheme]; registered {
 			return true
 		}
-		if match[0] < authorityEnd {
+		if arrowStart >= chainEnd {
+			continue
+		}
+		spaced := match[2] != match[3] || match[4] != match[5]
+		if spaced || (schemeEnd >= 0 && arrowStart < authorityEnd) {
 			return true
 		}
 	}
