@@ -5,22 +5,23 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 )
 
-// Runtime owns one constructed outbound chain. Session is nil for stateless
-// chains; Close always releases every resource retained by the chain.
+// Runtime owns one fully constructed outbound chain. Retire rejects new work
+// and releases the chain after all operations and returned connections drain.
 type Runtime struct {
-	Dialer  Dialer
-	Session Session
-
-	owned  Dialer
-	closer io.Closer
+	owned   Dialer
+	dialer  Dialer
+	session Session
+	closer  io.Closer
 
 	mu        sync.Mutex
 	refs      int
-	closing   bool
-	ownedOnce sync.Once
-	err       error
+	retired   bool
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type runtimeSession struct {
@@ -40,16 +41,43 @@ type runtimePacketConn struct {
 	release func()
 }
 
-func (s *runtimeSession) Close() error { return s.runtime.Close() }
+type runtimeSyscallConn struct {
+	*runtimeConn
+	raw syscall.Conn
+}
+
+func (c *runtimeSyscallConn) SyscallConn() (syscall.RawConn, error) {
+	return c.raw.SyscallConn()
+}
+
+type runtimeCloseWriteSyscallConn struct {
+	*runtimeSyscallConn
+	closeWriter CloseWriter
+}
+
+func (c *runtimeCloseWriteSyscallConn) CloseWrite() error {
+	return c.closeWriter.CloseWrite()
+}
+
+type runtimeSyscallPacketConn struct {
+	*runtimePacketConn
+	raw syscall.Conn
+}
+
+func (c *runtimeSyscallPacketConn) SyscallConn() (syscall.RawConn, error) {
+	return c.raw.SyscallConn()
+}
 
 func (s *runtimeSession) Connect(ctx context.Context) error {
-	if !s.runtime.accepting() {
+	r := s.runtime
+	if !r.acquire() {
 		return net.ErrClosed
 	}
+	defer r.release()
 	if err := s.Session.Connect(ctx); err != nil {
 		return err
 	}
-	if !s.runtime.accepting() {
+	if !r.accepting() {
 		return net.ErrClosed
 	}
 	return nil
@@ -71,7 +99,16 @@ func (d *runtimeDialer) DialContext(ctx context.Context, network, address string
 		return nil, net.ErrClosed
 	}
 	tracked := &runtimeConn{Conn: conn, release: sync.OnceFunc(r.release)}
-	if closeWriter, ok := conn.(CloseWriter); ok {
+	closeWriter, hasCloseWriter := conn.(CloseWriter)
+	raw, hasSyscallConn := conn.(syscall.Conn)
+	if hasSyscallConn {
+		withSyscall := &runtimeSyscallConn{runtimeConn: tracked, raw: raw}
+		if hasCloseWriter {
+			return &runtimeCloseWriteSyscallConn{runtimeSyscallConn: withSyscall, closeWriter: closeWriter}, nil
+		}
+		return withSyscall, nil
+	}
+	if hasCloseWriter {
 		return &CloseWriteConn{Conn: tracked, CloseWriter: closeWriter}, nil
 	}
 	return tracked, nil
@@ -92,7 +129,11 @@ func (d *runtimeDialer) ListenPacket(ctx context.Context, address string) (net.P
 		r.release()
 		return nil, net.ErrClosed
 	}
-	return &runtimePacketConn{PacketConn: conn, release: sync.OnceFunc(r.release)}, nil
+	tracked := &runtimePacketConn{PacketConn: conn, release: sync.OnceFunc(r.release)}
+	if raw, ok := conn.(syscall.Conn); ok {
+		return &runtimeSyscallPacketConn{runtimePacketConn: tracked, raw: raw}, nil
+	}
+	return tracked, nil
 }
 
 func (c *runtimeConn) Close() error {
@@ -106,74 +147,99 @@ func (c *runtimePacketConn) Close() error {
 }
 
 func NewRuntime(owned Dialer) *Runtime {
-	runtime := &Runtime{owned: owned}
-	runtime.Dialer = &runtimeDialer{runtime: runtime}
+	runtime := &Runtime{owned: owned, done: make(chan struct{})}
+	runtime.dialer = &runtimeDialer{runtime: runtime}
 	runtime.closer, _ = owned.(io.Closer)
-	if session, ok := owned.(Session); ok {
-		runtime.Session = &runtimeSession{Session: session, runtime: runtime}
+	if session, ok := owned.(SessionOwner); ok {
+		runtime.session = &runtimeSession{Session: session, runtime: runtime}
 	}
 	return runtime
 }
 
-// ComposeRuntime adds a data-plane layer and transfers ownership of parent to
-// the returned Runtime. The data-plane Dialer remains independent from the
-// optional Session capability.
-func ComposeRuntime(dialer Dialer, parent *Runtime) *Runtime {
-	if parent == nil {
-		return NewRuntime(dialer)
-	}
-	return NewRuntime(ComposeDialer(dialer, parent.owned))
-}
+// Dialer returns the data-plane view. It does not expose Session or ownership.
+func (r *Runtime) Dialer() Dialer { return r.dialer }
+
+// Session returns the optional shared-connection controller. Runtime remains
+// the sole owner of its closure.
+func (r *Runtime) Session() (Session, bool) { return r.session, r.session != nil }
 
 func (r *Runtime) acquire() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closing {
+	if r.retired {
 		return false
 	}
-	if r.closer != nil {
-		r.refs++
-	}
+	r.refs++
 	return true
 }
 
 func (r *Runtime) accepting() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return !r.closing
+	return !r.retired
 }
 
 func (r *Runtime) release() {
-	if r.closer == nil {
-		return
-	}
 	r.mu.Lock()
 	r.refs--
-	closeOwned := r.closing && r.refs == 0
+	closeOwned := r.retired && r.refs == 0
 	r.mu.Unlock()
 	if closeOwned {
-		r.closeOwned()
+		r.startClose()
 	}
 }
 
-func (r *Runtime) closeOwned() {
-	r.ownedOnce.Do(func() {
-		err := r.closer.Close()
-		r.mu.Lock()
-		r.err = err
-		r.mu.Unlock()
+func (r *Runtime) startClose() {
+	r.closeOnce.Do(func() {
+		go r.closeOwned()
 	})
 }
 
-func (r *Runtime) Close() error {
-	r.mu.Lock()
-	r.closing = true
-	closeOwned := r.closer != nil && r.refs == 0
-	r.mu.Unlock()
-	if closeOwned {
-		r.closeOwned()
+func (r *Runtime) closeOwned() {
+	var err error
+	if r.closer != nil {
+		err = r.closer.Close()
 	}
 	r.mu.Lock()
+	r.closeErr = err
+	r.mu.Unlock()
+	close(r.done)
+}
+
+func (r *Runtime) waitErr() error {
+	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.err
+	return r.closeErr
+}
+
+// Retire rejects new operations. Resource cleanup runs after the last active
+// operation or returned connection releases its implicit lease.
+func (r *Runtime) Retire() {
+	r.mu.Lock()
+	r.retired = true
+	closeOwned := r.refs == 0
+	r.mu.Unlock()
+	if closeOwned {
+		r.startClose()
+	}
+}
+
+// Wait waits for a retired Runtime to finish releasing its owned chain.
+func (r *Runtime) Wait(ctx context.Context) error {
+	select {
+	case <-r.done:
+		return r.waitErr()
+	default:
+	}
+	select {
+	case <-r.done:
+		return r.waitErr()
+	case <-ctx.Done():
+		select {
+		case <-r.done:
+			return r.waitErr()
+		default:
+			return ctx.Err()
+		}
+	}
 }

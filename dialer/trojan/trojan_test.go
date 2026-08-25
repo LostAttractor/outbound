@@ -34,7 +34,7 @@ func TestGRPCShadowsocksPreservesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, ok := d.(netproxy.Session)
+	session, ok := d.(netproxy.SessionOwner)
 	if !ok {
 		t.Fatal("gRPC session was hidden by the Shadowsocks wrapper")
 	}

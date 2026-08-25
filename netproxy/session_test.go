@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -30,6 +31,13 @@ type orderedResourceDialer struct {
 	order *[]string
 }
 
+type blockingResourceDialer struct {
+	testDialer
+	started chan struct{}
+	release chan struct{}
+	err     error
+}
+
 type packetCapableTestConn struct{ net.Conn }
 
 func (c *packetCapableTestConn) ReadFrom([]byte) (int, net.Addr, error) {
@@ -38,6 +46,10 @@ func (c *packetCapableTestConn) ReadFrom([]byte) (int, net.Addr, error) {
 
 func (c *packetCapableTestConn) WriteTo([]byte, net.Addr) (int, error) {
 	return 0, errors.New("not implemented")
+}
+
+func (c *packetCapableTestConn) SyscallConn() (syscall.RawConn, error) {
+	return nil, nil
 }
 
 type streamTestDialer struct {
@@ -135,6 +147,20 @@ func (d *orderedResourceDialer) Close() error {
 	return nil
 }
 
+func (d *blockingResourceDialer) Close() error {
+	close(d.started)
+	<-d.release
+	return d.err
+}
+
+func retireRuntime(t *testing.T, runtime *Runtime) {
+	t.Helper()
+	runtime.Retire()
+	if err := runtime.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStateBroadcasterPublishesEveryTransitionToEveryWatcher(t *testing.T) {
 	b := NewStateBroadcaster(SessionDisconnected)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -215,17 +241,49 @@ func TestRuntimeClosesResourceThroughStatelessWrapper(t *testing.T) {
 	resource := new(testResourceDialer)
 	wrapped := ComposeDialer(testDialer{}, resource)
 	runtime := NewRuntime(wrapped)
-	if runtime.Session != nil {
+	if _, ok := runtime.Session(); ok {
 		t.Fatal("resource-only runtime exposed a session")
 	}
-	if err := runtime.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.Close(); err != nil {
-		t.Fatal(err)
-	}
+	retireRuntime(t, runtime)
 	if got := resource.closes.Load(); got != 1 {
 		t.Fatalf("resource closes = %d, want 1", got)
+	}
+}
+
+func TestRuntimeRetireDoesNotWaitForCleanup(t *testing.T) {
+	wantErr := errors.New("cleanup failed")
+	resource := &blockingResourceDialer{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		err:     wantErr,
+	}
+	runtime := NewRuntime(resource)
+	retired := make(chan struct{})
+	go func() {
+		runtime.Retire()
+		close(retired)
+	}()
+	select {
+	case <-retired:
+	case <-time.After(time.Second):
+		t.Fatal("Retire blocked on resource cleanup")
+	}
+	select {
+	case <-resource.started:
+	case <-time.After(time.Second):
+		t.Fatal("resource cleanup did not start")
+	}
+	waitCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runtime.Wait(waitCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait during cleanup error = %v, want context.Canceled", err)
+	}
+	close(resource.release)
+	if err := runtime.Wait(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("Wait error = %v, want %v", err, wantErr)
+	}
+	if err := runtime.Wait(waitCtx); !errors.Is(err, wantErr) {
+		t.Fatalf("completed Wait with canceled context = %v, want %v", err, wantErr)
 	}
 }
 
@@ -312,48 +370,68 @@ func TestSessionGroupConnectCannotSucceedAfterClose(t *testing.T) {
 	}
 }
 
-func TestComposeRuntimePreservesSeparateParentSession(t *testing.T) {
-	parentSession := newTestSession()
-	parent := NewRuntime(WithSession(testDialer{}, parentSession))
-	child := testDialer{}
-	runtime := ComposeRuntime(child, parent)
-	if runtime.Session == nil || runtime.Session.Snapshot() != parentSession.Snapshot() {
-		t.Fatal("composed runtime lost the parent session")
+func TestRuntimeRetireWaitsForConnect(t *testing.T) {
+	owner := &blockingConnectSession{
+		testSession: newTestSession(),
+		started:     make(chan struct{}),
+		release:     make(chan struct{}),
 	}
-	if _, ok := runtime.Dialer.(Session); ok {
-		t.Fatal("stateless child dialer acquired session methods")
+	runtime := NewRuntime(WithSession(testDialer{}, owner))
+	session, ok := runtime.Session()
+	if !ok {
+		t.Fatal("Runtime lost Session")
 	}
-	if err := runtime.Close(); err != nil {
+	connected := make(chan error, 1)
+	go func() { connected <- session.Connect(context.Background()) }()
+	<-owner.started
+	runtime.Retire()
+	if state := owner.Snapshot().State; state == SessionClosed {
+		t.Fatal("Runtime closed its Session during Connect")
+	}
+	close(owner.release)
+	if err := <-connected; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Connect error = %v, want net.ErrClosed", err)
+	}
+	if err := runtime.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if state := owner.Snapshot().State; state != SessionClosed {
+		t.Fatalf("Session state after drain = %s, want closed", state)
+	}
+}
+
+func TestRuntimePreservesComposedParentSession(t *testing.T) {
+	parentSession := newTestSession()
+	parent := WithSession(testDialer{}, parentSession)
+	child := testDialer{}
+	runtime := NewRuntime(ComposeDialer(child, parent))
+	session, ok := runtime.Session()
+	if !ok || session.Snapshot() != parentSession.Snapshot() {
+		t.Fatal("composed runtime lost the parent session")
+	}
+	if _, ok := runtime.Dialer().(Session); ok {
+		t.Fatal("stateless child dialer acquired session methods")
+	}
+	retireRuntime(t, runtime)
 	if state := parentSession.Snapshot().State; state != SessionClosed {
 		t.Fatalf("parent session state after Close = %s", state)
 	}
 }
 
-func TestComposeRuntimeClosesOutsideIn(t *testing.T) {
-	var order []string
-	parent := NewRuntime(&orderedResourceDialer{name: "parent", order: &order})
-	runtime := ComposeRuntime(&orderedResourceDialer{name: "child", order: &order}, parent)
-	if err := runtime.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if len(order) != 2 || order[0] != "child" || order[1] != "parent" {
-		t.Fatalf("close order = %v, want [child parent]", order)
-	}
-}
-
 func TestRuntimeDialerHidesOwnedLifecycle(t *testing.T) {
 	runtime := NewRuntime(WithSession(testDialer{}, newTestSession()))
-	if _, ok := runtime.Dialer.(Session); ok {
+	if _, ok := runtime.Dialer().(Session); ok {
 		t.Fatal("Runtime.Dialer exposed Session")
 	}
-	if _, ok := runtime.Dialer.(io.Closer); ok {
+	if _, ok := runtime.Dialer().(io.Closer); ok {
 		t.Fatal("Runtime.Dialer exposed Close")
 	}
-	if err := runtime.Close(); err != nil {
-		t.Fatal(err)
+	if session, ok := runtime.Session(); !ok {
+		t.Fatal("Runtime lost Session")
+	} else if _, ok := session.(io.Closer); ok {
+		t.Fatal("Runtime.Session exposed Close")
 	}
+	retireRuntime(t, runtime)
 }
 
 func newPacketCapableTestConn(t *testing.T) *packetCapableTestConn {
@@ -367,77 +445,56 @@ func newPacketCapableTestConn(t *testing.T) *packetCapableTestConn {
 }
 
 func TestRuntimeDialContextHidesPacketPlane(t *testing.T) {
-	for _, tracked := range []bool{false, true} {
-		name := "stateless"
-		if tracked {
-			name = "tracked"
-		}
-		t.Run(name, func(t *testing.T) {
-			var owned Dialer = &streamTestDialer{conn: newPacketCapableTestConn(t)}
-			if tracked {
-				owned = &ownedTestDialer{Dialer: owned}
-			}
-			runtime := NewRuntime(owned)
-			conn, err := runtime.Dialer.DialContext(context.Background(), "udp", "example.com:53")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, ok := conn.(net.PacketConn); ok {
-				t.Fatal("DialContext exposed packet-plane methods")
-			}
-			if err := conn.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := runtime.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	runtime := NewRuntime(&streamTestDialer{conn: newPacketCapableTestConn(t)})
+	conn, err := runtime.Dialer().DialContext(context.Background(), "udp", "example.com:53")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, ok := conn.(net.PacketConn); ok {
+		t.Fatal("DialContext exposed packet-plane methods")
+	}
+	if _, ok := conn.(syscall.Conn); !ok {
+		t.Fatal("DialContext hid syscall.Conn")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	retireRuntime(t, runtime)
 }
 
 func TestRuntimeListenPacketHidesStreamPlane(t *testing.T) {
-	for _, tracked := range []bool{false, true} {
-		name := "stateless"
-		if tracked {
-			name = "tracked"
-		}
-		t.Run(name, func(t *testing.T) {
-			var owned Dialer = &packetTestDialer{conn: newPacketCapableTestConn(t)}
-			if tracked {
-				owned = &ownedTestDialer{Dialer: owned}
-			}
-			runtime := NewRuntime(owned)
-			conn, err := runtime.Dialer.ListenPacket(context.Background(), "example.com:53")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, ok := conn.(net.Conn); ok {
-				t.Fatal("ListenPacket exposed stream-plane methods")
-			}
-			if err := conn.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := runtime.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
+	runtime := NewRuntime(&packetTestDialer{conn: newPacketCapableTestConn(t)})
+	conn, err := runtime.Dialer().ListenPacket(context.Background(), "example.com:53")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, ok := conn.(net.Conn); ok {
+		t.Fatal("ListenPacket exposed stream-plane methods")
+	}
+	if _, ok := conn.(syscall.Conn); !ok {
+		t.Fatal("ListenPacket hid syscall.Conn")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	retireRuntime(t, runtime)
 }
 
 func TestRuntimeDefersCloseForStreamLease(t *testing.T) {
 	resource := &ownedTestDialer{Dialer: &streamTestDialer{conn: newPacketCapableTestConn(t)}}
 	runtime := NewRuntime(resource)
-	conn, err := runtime.Dialer.DialContext(context.Background(), "tcp", "example.com:443")
+	conn, err := runtime.Dialer().DialContext(context.Background(), "tcp", "example.com:443")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Close(); err != nil {
-		t.Fatal(err)
-	}
+	runtime.Retire()
 	if got := resource.closes.Load(); got != 0 {
 		t.Fatalf("resource closed with active stream lease: %d", got)
 	}
 	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := resource.closes.Load(); got != 1 {
@@ -448,17 +505,18 @@ func TestRuntimeDefersCloseForStreamLease(t *testing.T) {
 func TestRuntimeDefersCloseForPacketLease(t *testing.T) {
 	resource := &ownedTestDialer{Dialer: &packetTestDialer{conn: newPacketCapableTestConn(t)}}
 	runtime := NewRuntime(resource)
-	conn, err := runtime.Dialer.ListenPacket(context.Background(), "example.com:53")
+	conn, err := runtime.Dialer().ListenPacket(context.Background(), "example.com:53")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.Close(); err != nil {
-		t.Fatal(err)
-	}
+	runtime.Retire()
 	if got := resource.closes.Load(); got != 0 {
 		t.Fatalf("resource closed with active packet lease: %d", got)
 	}
 	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := resource.closes.Load(); got != 1 {
@@ -466,38 +524,56 @@ func TestRuntimeDefersCloseForPacketLease(t *testing.T) {
 	}
 }
 
-func TestComposeDialerClosesOuterResourceBeforeParentSession(t *testing.T) {
-	var order []string
-	parentSession := &orderedSession{testSession: newTestSession(), name: "parent", order: &order}
-	parent := WithSession(testDialer{}, parentSession)
-	child := &orderedResourceDialer{name: "child", order: &order}
-	composed := ComposeDialer(child, parent)
-	session, ok := composed.(Session)
-	if !ok {
-		t.Fatal("composed dialer lost parent session")
+func TestComposeDialerClosesOutsideIn(t *testing.T) {
+	tests := []struct {
+		name        string
+		build       func(*[]string) Dialer
+		wantSession bool
+	}{
+		{
+			name: "resources",
+			build: func(order *[]string) Dialer {
+				return ComposeDialer(
+					&orderedResourceDialer{name: "child", order: order},
+					&orderedResourceDialer{name: "parent", order: order},
+				)
+			},
+		},
+		{
+			name:        "resource then session",
+			wantSession: true,
+			build: func(order *[]string) Dialer {
+				parent := WithSession(testDialer{}, &orderedSession{testSession: newTestSession(), name: "parent", order: order})
+				return ComposeDialer(&orderedResourceDialer{name: "child", order: order}, parent)
+			},
+		},
+		{
+			name:        "session then resource",
+			wantSession: true,
+			build: func(order *[]string) Dialer {
+				child := WithSession(testDialer{}, &orderedSession{testSession: newTestSession(), name: "child", order: order})
+				return ComposeDialer(child, &orderedResourceDialer{name: "parent", order: order})
+			},
+		},
 	}
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if len(order) != 2 || order[0] != "child" || order[1] != "parent" {
-		t.Fatalf("close order = %v, want [child parent]", order)
-	}
-}
 
-func TestComposeDialerClosesChildSessionBeforeParentResource(t *testing.T) {
-	var order []string
-	childSession := &orderedSession{testSession: newTestSession(), name: "child", order: &order}
-	child := WithSession(testDialer{}, childSession)
-	parent := &orderedResourceDialer{name: "parent", order: &order}
-	composed := ComposeDialer(child, parent)
-	session, ok := composed.(Session)
-	if !ok {
-		t.Fatal("composed dialer lost child session")
-	}
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if len(order) != 2 || order[0] != "child" || order[1] != "parent" {
-		t.Fatalf("close order = %v, want [child parent]", order)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var order []string
+			composed := tt.build(&order)
+			if _, ok := composed.(SessionOwner); ok != tt.wantSession {
+				t.Fatalf("SessionOwner = %t, want %t", ok, tt.wantSession)
+			}
+			closer, ok := composed.(io.Closer)
+			if !ok {
+				t.Fatal("composed dialer lost resource ownership")
+			}
+			if err := closer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if len(order) != 2 || order[0] != "child" || order[1] != "parent" {
+				t.Fatalf("close order = %v, want [child parent]", order)
+			}
+		})
 	}
 }

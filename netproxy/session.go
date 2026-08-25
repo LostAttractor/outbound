@@ -47,12 +47,18 @@ type Session interface {
 	Connect(context.Context) error
 	Snapshot() StateEvent
 	WatchState(context.Context) <-chan StateEvent
-	Close() error
+}
+
+// SessionOwner combines shared-connection control with resource ownership.
+// Runtime exposes only Session and remains the sole public close boundary.
+type SessionOwner interface {
+	Session
+	io.Closer
 }
 
 type StatefulDialer interface {
 	Dialer
-	Session
+	SessionOwner
 }
 
 type stateWatcher struct {
@@ -198,7 +204,7 @@ func (b *StateBroadcaster) publishLocked(state SessionState, cause error) bool {
 
 type sessionDialer struct {
 	Dialer
-	Session
+	SessionOwner
 }
 
 type closerGroup struct {
@@ -229,18 +235,18 @@ type resourceDialer struct {
 }
 
 // WithSession attaches a real session capability to a data-plane dialer.
-func WithSession(dialer Dialer, session Session) StatefulDialer {
-	return &sessionDialer{Dialer: dialer, Session: session}
+func WithSession(dialer Dialer, session SessionOwner) StatefulDialer {
+	return &sessionDialer{Dialer: dialer, SessionOwner: session}
 }
 
 // ComposeDialer preserves a parent's session and owned resources through a
 // stateless wrapper. The returned dialer owns both inputs and closes them from
 // the outside in.
 func ComposeDialer(dialer, parent Dialer) Dialer {
-	childSession, childStateful := dialer.(Session)
-	parentSession, parentStateful := parent.(Session)
+	childSession, childStateful := dialer.(SessionOwner)
+	parentSession, parentStateful := parent.(SessionOwner)
 
-	var session Session
+	var session SessionOwner
 	switch {
 	case childStateful && parentStateful:
 		session = NewSessionGroup(parentSession, childSession)
@@ -271,7 +277,7 @@ func ComposeDialer(dialer, parent Dialer) Dialer {
 }
 
 type SessionGroup struct {
-	children  []Session
+	children  []SessionOwner
 	state     *StateBroadcaster
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -282,7 +288,7 @@ type SessionGroup struct {
 	closeErr  error
 }
 
-func NewSessionGroup(children ...Session) *SessionGroup {
+func NewSessionGroup(children ...SessionOwner) *SessionGroup {
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &SessionGroup{
 		children: children,
