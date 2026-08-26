@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"net"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/daeuniverse/outbound/pool"
@@ -244,16 +243,6 @@ func (u *udpHopPacketConn) SetWriteBuffer(bytes int) error {
 		_ = trySetWriteBuffer(u.prevConn, bytes)
 	}
 	return trySetWriteBuffer(u.currentConn, bytes)
-}
-
-func (u *udpHopPacketConn) SyscallConn() (syscall.RawConn, error) {
-	u.connMutex.RLock()
-	defer u.connMutex.RUnlock()
-	sc, ok := u.currentConn.(syscall.Conn)
-	if !ok {
-		return nil, errors.New("not supported")
-	}
-	return sc.SyscallConn()
 }
 
 func trySetReadBuffer(pc net.Conn, bytes int) error {
