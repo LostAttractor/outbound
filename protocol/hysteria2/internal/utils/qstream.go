@@ -6,8 +6,8 @@ import (
 	"github.com/daeuniverse/quic-go"
 )
 
-// QStream is a wrapper of quic.Stream that handles Close() in a way that
-// makes more sense to us. By default, quic.Stream's Close() only closes
+// QStream is a wrapper of *quic.Stream that handles Close() in a way that
+// makes more sense to us. By default, *quic.Stream's Close() only closes
 // the write side of the stream, not the read side. And if there is unread
 // data, the stream is not really considered closed until either the data
 // is drained or CancelRead() is called.
@@ -16,7 +16,7 @@ import (
 // - https://github.com/quic-go/quic-go/issues/3558
 // - https://github.com/quic-go/quic-go/issues/1599
 type QStream struct {
-	quic.Stream
+	*quic.Stream
 	LocalAddr  net.Addr
 	RemoteAddr net.Addr
 }

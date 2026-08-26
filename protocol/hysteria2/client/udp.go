@@ -31,7 +31,7 @@ type udpConn struct {
 	D         *frag.Defragger
 	ReceiveCh chan *protocol.UDPMessage
 
-	conn quic.Connection
+	conn *quic.Conn
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -85,7 +85,7 @@ func (u *udpConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	if errors.As(err, &errTooLarge) {
 		// Message too large, try fragmentation
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
-		fMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDataLen))
+		fMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
 		for _, fMsg := range fMsgs {
 			err := u.WritePacket(buf, &fMsg)
 			if err != nil {
@@ -133,7 +133,7 @@ func (u *udpConn) LocalAddr() net.Addr {
 }
 
 type udpSessionManager struct {
-	conn quic.Connection
+	conn *quic.Conn
 
 	connMap sync.Map // map[uint32]*udpConn
 	nextID  atomic.Uint32
@@ -142,7 +142,7 @@ type udpSessionManager struct {
 	cancel context.CancelFunc
 }
 
-func newUDPSessionManager(parent context.Context, conn quic.Connection) *udpSessionManager {
+func newUDPSessionManager(parent context.Context, conn *quic.Conn) *udpSessionManager {
 	ctx, cancel := context.WithCancel(parent)
 	m := &udpSessionManager{
 		conn:   conn,

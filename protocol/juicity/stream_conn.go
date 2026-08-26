@@ -13,7 +13,7 @@ import (
 )
 
 type Conn struct {
-	quic.Stream
+	*quic.Stream
 	Metadata *trojanc.Metadata
 
 	writeMutex sync.Mutex
@@ -119,7 +119,7 @@ func (c *Conn) close() error {
 
 var _ netproxy.Conn = &Conn{}
 
-func NewConn(stream quic.Stream, mdata *trojanc.Metadata, closeDeferFn func()) *Conn {
+func NewConn(stream *quic.Stream, mdata *trojanc.Metadata, closeDeferFn func()) *Conn {
 	if mdata == nil {
 		mdata = &trojanc.Metadata{}
 	}

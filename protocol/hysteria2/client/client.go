@@ -36,7 +36,7 @@ type Client struct {
 
 type clientResource struct {
 	pktConn net.PacketConn
-	conn    quic.Connection
+	conn    *quic.Conn
 	udpSM   *udpSessionManager
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -229,7 +229,7 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 	rt := &http3.Transport{
 		TLSClientConfig: &c.config.TLSConfig,
 		QUICConfig:      &c.config.QUICConfig,
-		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 			qc, err := quic.DialEarly(ctx, resource.pktConn, c.config.Addr, tlsCfg, cfg)
 			if err != nil {
 				return nil, err

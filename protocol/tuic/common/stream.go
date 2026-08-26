@@ -9,7 +9,7 @@ import (
 )
 
 type safeStreamConn struct {
-	quic.Stream
+	*quic.Stream
 	lock  sync.Mutex
 	lAddr net.Addr
 	rAddr net.Addr
@@ -71,6 +71,6 @@ func (q *safeStreamConn) RemoteAddr() net.Addr {
 	return q.rAddr
 }
 
-func NewSafeStreamConn(stream quic.Stream, lAddr, rAddr net.Addr, closeDeferFn func()) *safeStreamConn {
+func NewSafeStreamConn(stream *quic.Stream, lAddr, rAddr net.Addr, closeDeferFn func()) *safeStreamConn {
 	return &safeStreamConn{Stream: stream, lAddr: lAddr, rAddr: rAddr, closeDeferFn: closeDeferFn}
 }

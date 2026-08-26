@@ -12,7 +12,7 @@ const (
 	MaxConnectionReceiveWindow     = 64 * 1024 * 1024 // 64 MB
 )
 
-func SetCongestionController(quicConn quic.Connection, cc string, cwnd int) {
+func SetCongestionController(quicConn *quic.Conn, cc string, cwnd int) {
 	switch cc {
 	default:
 		fallthrough

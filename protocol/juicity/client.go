@@ -82,14 +82,14 @@ type ClientOption struct {
 type clientImpl struct {
 	*ClientOption
 
-	quicConn  quic.Connection
+	quicConn  *quic.Conn
 	underConn net.PacketConn
 	connMutex sync.Mutex
 
 	detachCallback func()
 }
 
-func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (quic.Connection, error) {
+func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (*quic.Conn, error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
 	if t.quicConn != nil {
@@ -119,7 +119,7 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 	return quicConn, nil
 }
 
-func (t *clientImpl) sendAuthentication(quicConn quic.Connection) (err error) {
+func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 	uniStream, err := quicConn.OpenUniStream()
 	if err != nil {
 		return err
