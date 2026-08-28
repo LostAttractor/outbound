@@ -3,9 +3,7 @@ package smux
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -41,12 +39,18 @@ const (
 	smuxUpdatePayloadSize = 8
 )
 
+const (
+	DefaultMaxConnections = 4
+	MaxConnectionsLimit   = 16
+)
+
 type Smux struct {
 	Dialer         netproxy.Dialer
 	PassthroughUdp bool
+	MaxConnections int
 
 	initOnce  sync.Once
-	lifecycle *netproxy.SingleSession[*smuxResource]
+	lifecycle *smuxPool
 }
 
 type smuxResource struct {
@@ -126,45 +130,44 @@ var _ netproxy.StatefulDialer = (*Smux)(nil)
 
 type SmuxConfig struct {
 	PassThroughUDP bool
+	MaxConnections int
 }
 
 func (s *SmuxConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
+	if s.MaxConnections < 0 || s.MaxConnections > MaxConnectionsLimit {
+		return nil, fmt.Errorf("smux max connections must be between 1 and %d", MaxConnectionsLimit)
+	}
 	return &Smux{
 		Dialer:         nextDialer,
 		PassthroughUdp: s.PassThroughUDP,
+		MaxConnections: s.MaxConnections,
 	}, nil
 }
 
-func (s *Smux) session() *netproxy.SingleSession[*smuxResource] {
+func (s *Smux) pool() *smuxPool {
 	s.initOnce.Do(func() {
-		s.lifecycle = netproxy.NewSingleSession(netproxy.SingleSessionConfig[*smuxResource]{
-			Establish: s.establish,
-			IsConnected: func(resource *smuxResource) bool {
-				return !resource.monitor.broken.Load() && !resource.session.IsClosed()
-			},
-			Observe: s.observe,
-			Close: func(resource *smuxResource) error {
-				err := resource.session.Close()
-				if errors.Is(err, io.ErrClosedPipe) {
-					return nil
-				}
-				return err
-			},
-		})
+		maxConnections := s.MaxConnections
+		if maxConnections == 0 {
+			maxConnections = DefaultMaxConnections
+		}
+		if maxConnections < 1 || maxConnections > MaxConnectionsLimit {
+			panic(fmt.Sprintf("smux max connections must be between 1 and %d", MaxConnectionsLimit))
+		}
+		s.lifecycle = newSmuxPool(s, maxConnections)
 	})
 	return s.lifecycle
 }
 
 func (s *Smux) Snapshot() netproxy.StateEvent {
-	return s.session().Snapshot()
+	return s.pool().Snapshot()
 }
 
 func (s *Smux) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
-	return s.session().WatchState(ctx)
+	return s.pool().WatchState(ctx)
 }
 
 func (s *Smux) Connect(ctx context.Context) error {
-	return s.session().Connect(ctx)
+	return s.pool().Connect(ctx)
 }
 
 func (s *Smux) establish(ctx context.Context) (*smuxResource, error) {
@@ -195,15 +198,7 @@ func (s *Smux) establish(ctx context.Context) (*smuxResource, error) {
 	return &smuxResource{session: session, monitor: monitored}, nil
 }
 
-func (s *Smux) currentSession() (*smux.Session, error) {
-	resource, err := s.session().Current()
-	if err != nil {
-		return nil, err
-	}
-	return resource.session, nil
-}
-
-func openStream(ctx context.Context, session *smux.Session) (*smux.Stream, error) {
+func openStream(ctx context.Context, session *smux.Session, done func()) (*smux.Stream, error) {
 	type result struct {
 		stream *smux.Stream
 		err    error
@@ -211,6 +206,7 @@ func openStream(ctx context.Context, session *smux.Session) (*smux.Stream, error
 	results := make(chan result)
 	go func() {
 		stream, err := session.OpenStream()
+		done()
 		select {
 		case results <- result{stream: stream, err: err}:
 		case <-ctx.Done():
@@ -237,13 +233,9 @@ func (s *Smux) DialContext(ctx context.Context, network, addr string) (c net.Con
 	if network == "udp" && s.PassthroughUdp {
 		return s.Dialer.DialContext(ctx, network, addr)
 	}
-	session, err := s.currentSession()
-	if err != nil {
-		return nil, err
-	}
 	switch network {
 	case "tcp":
-		stream, err := openStream(ctx, session)
+		stream, err := s.pool().OpenStream(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -266,11 +258,7 @@ func (s *Smux) ListenPacket(ctx context.Context, addr string) (net.PacketConn, e
 	if s.PassthroughUdp {
 		return s.Dialer.ListenPacket(ctx, addr)
 	}
-	session, err := s.currentSession()
-	if err != nil {
-		return nil, err
-	}
-	stream, err := openStream(ctx, session)
+	stream, err := s.pool().OpenStream(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -291,5 +279,5 @@ func (s *Smux) observe(ctx context.Context, handle *netproxy.SingleSessionHandle
 }
 
 func (s *Smux) Close() error {
-	return s.session().Close()
+	return s.pool().Close()
 }
