@@ -24,7 +24,7 @@ func (c *tcpConn) Read(b []byte) (n int, err error) {
 			return 0, err
 		}
 		if !ok {
-			return 0, oops.Wrapf(err, "dial error: %s", msg)
+			return 0, oops.Errorf("dial error: %s", msg)
 		}
 		c.Established = true
 	}
@@ -37,6 +37,11 @@ func (c *tcpConn) Write(b []byte) (n int, err error) {
 
 func (c *tcpConn) Close() error {
 	return c.Orig.Close()
+}
+
+// CloseWrite sends a QUIC FIN while leaving the receive side open.
+func (c *tcpConn) CloseWrite() error {
+	return c.Orig.Stream.Close()
 }
 
 func (c *tcpConn) LocalAddr() net.Addr {
