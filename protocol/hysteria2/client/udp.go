@@ -24,11 +24,11 @@ import (
 
 const (
 	udpMessageChanSize = 1024
+	defraggerTimeout   = 5 * time.Second
 )
 
 type udpConn struct {
 	ID        uint32
-	D         *frag.Defragger
 	ReceiveCh chan *protocol.UDPMessage
 
 	conn *quic.Conn
@@ -38,7 +38,16 @@ type udpConn struct {
 
 	closeCallback func()
 
+	receiveMu  sync.Mutex
+	defraggers map[uint16]*defragEntry
+	lastSweep  time.Time
+
 	readDeadline P.Deadline
+}
+
+type defragEntry struct {
+	defragger *frag.Defragger
+	expiresAt time.Time
 }
 
 func (u *udpConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -52,7 +61,7 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			if !ok {
 				return 0, nil, io.EOF
 			}
-			dfMsg := u.D.Feed(msg)
+			dfMsg := u.feedDefrag(msg)
 			if dfMsg == nil {
 				// Incomplete message, wait for more
 				continue
@@ -61,6 +70,41 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			return copy(p, dfMsg.Data), net.UDPAddrFromAddrPort(netip.MustParseAddrPort(dfMsg.Addr)), nil
 		}
 	}
+}
+
+func (u *udpConn) feedDefrag(msg *protocol.UDPMessage) *protocol.UDPMessage {
+	now := time.Now()
+	u.receiveMu.Lock()
+	defer u.receiveMu.Unlock()
+
+	if now.Sub(u.lastSweep) >= defraggerTimeout {
+		u.lastSweep = now
+		for packetID, entry := range u.defraggers {
+			if !now.Before(entry.expiresAt) {
+				delete(u.defraggers, packetID)
+			}
+		}
+	}
+	if msg.FragCount <= 1 {
+		return msg
+	}
+
+	entry := u.defraggers[msg.PacketID]
+	if entry == nil || !now.Before(entry.expiresAt) {
+		if u.defraggers == nil {
+			u.defraggers = make(map[uint16]*defragEntry, 2)
+		}
+		entry = &defragEntry{
+			defragger: &frag.Defragger{},
+			expiresAt: now.Add(defraggerTimeout),
+		}
+		u.defraggers[msg.PacketID] = entry
+	}
+	dfMsg := entry.defragger.Feed(msg)
+	if dfMsg != nil {
+		delete(u.defraggers, msg.PacketID)
+	}
+	return dfMsg
 }
 
 func (u *udpConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
@@ -195,7 +239,6 @@ func (m *udpSessionManager) NewUDP() (net.PacketConn, error) {
 	ctx, cancel := context.WithCancel(m.ctx)
 	conn := &udpConn{
 		ID:           id,
-		D:            &frag.Defragger{},
 		ReceiveCh:    make(chan *protocol.UDPMessage, udpMessageChanSize),
 		conn:         m.conn,
 		ctx:          ctx,
