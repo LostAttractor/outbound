@@ -134,7 +134,7 @@ func (c *Client) dialConn(stream *utils.QStream, addr string) (net.Conn, error) 
 		return nil, err
 	}
 	if !ok {
-		return nil, oops.In("Hysteria2").Wrapf(err, "from remote: %v", msg)
+		return nil, oops.In("Hysteria2").Errorf("from remote: %v", msg)
 	}
 	return &tcpConn{
 		Orig:             stream,
@@ -305,7 +305,7 @@ func (c *Client) observe(ctx context.Context, handle *netproxy.SingleSessionHand
 	case <-resource.conn.Context().Done():
 	case <-udpDone:
 	}
-	cause := resource.conn.Context().Err()
+	cause := context.Cause(resource.conn.Context())
 	if cause == nil {
 		cause = net.ErrClosed
 	}
