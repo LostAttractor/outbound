@@ -39,10 +39,10 @@ type TLSConfig struct {
 }
 
 // NewTls returns a Tls infra.
-func (s *TLSConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *TLSConfig) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	t := &Tls{
 		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: nextDialer,
+			ParentDialer: upstream,
 		},
 		addr:            s.Host,
 		tlsImplentation: option.TlsImplementation,
@@ -52,7 +52,7 @@ func (s *TLSConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Diale
 	if s.Sni == "" {
 		host, _, err := net.SplitHostPort(s.Host)
 		if err != nil {
-			return nil, err
+			return netproxy.Layer{}, err
 		}
 		s.Sni = host
 	}
@@ -68,19 +68,19 @@ func (s *TLSConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Diale
 		t.fragmentation = true
 		minLen, maxLen, err := parseRange(option.TlsFragmentLength)
 		if err != nil {
-			return nil, err
+			return netproxy.Layer{}, err
 		}
 		t.fragmentMinLength = minLen
 		t.fragmentMaxLength = maxLen
 		minInterval, maxInterval, err := parseRange(option.TlsFragmentInterval)
 		if err != nil {
-			return nil, err
+			return netproxy.Layer{}, err
 		}
 		t.fragmentMinInterval = minInterval
 		t.fragmentMaxInterval = maxInterval
 	}
 
-	return t, nil
+	return netproxy.Layer{Data: t}, nil
 }
 
 func (s *Tls) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {

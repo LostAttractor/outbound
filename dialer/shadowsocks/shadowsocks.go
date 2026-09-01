@@ -2,6 +2,7 @@ package shadowsocks
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -33,7 +34,7 @@ type Shadowsocks struct {
 	UDP      bool   `json:"udp"`
 }
 
-func NewShadowsocks(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewShadowsocks(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseSSURL(link)
 	if err != nil {
 		return nil, nil, err
@@ -46,21 +47,29 @@ func NewShadowsocks(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
-	var err error
+func (s *Shadowsocks) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (layer netproxy.Layer, err error) {
+	layer.Data = upstream
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, layer.Close())
+			layer = netproxy.Layer{}
+		}
+	}()
+
 	switch s.Plugin.Name {
 	case "simple-obfs":
-		obfsType, err := simpleobfs.NewObfsType(s.Plugin.Opts.Obfs)
-		if err != nil {
-			return nil, err
+		obfsType, obfsErr := simpleobfs.NewObfsType(s.Plugin.Opts.Obfs)
+		if obfsErr != nil {
+			err = obfsErr
+			return
 		}
 		host := s.Plugin.Opts.Host
 		if host == "" {
 			host = "cloudflare.com"
 		}
-		parentDialer = &simpleobfs.SimpleObfs{
+		layer.Data = &simpleobfs.SimpleObfs{
 			StatelessDialer: protocol.StatelessDialer{
-				ParentDialer: parentDialer,
+				ParentDialer: layer.Data,
 			},
 			Addr:     net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			ObfsType: obfsType,
@@ -78,8 +87,8 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.D
 					AllowInsecure:  option.AllowInsecure,
 					PassthroughUdp: true,
 				}
-				if parentDialer, err = tlsConfig.Dialer(option, parentDialer); err != nil {
-					return nil, err
+				if err = layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
+					return
 				}
 			}
 			wsConfig := ws.WsConfig{
@@ -89,18 +98,19 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.D
 				Hostname:       s.Plugin.Opts.Host,
 				PassthroughUdp: true,
 			}
-			if parentDialer, err = wsConfig.Dialer(option, parentDialer); err != nil {
-				return nil, err
+			if err = layer.AppendResult(wsConfig.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
+				return
 			}
-			parentDialer = &mux.Mux{
+			layer.Data = &mux.Mux{
 				StatelessDialer: protocol.StatelessDialer{
-					ParentDialer: parentDialer,
+					ParentDialer: layer.Data,
 				},
 				Addr:           net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 				PassthroughUdp: true,
 			}
 		default:
-			return nil, fmt.Errorf("unsupported mode %v of plugin %v", s.Plugin.Opts.Obfs, s.Plugin.Name)
+			err = fmt.Errorf("unsupported mode %v of plugin %v", s.Plugin.Opts.Obfs, s.Plugin.Name)
+			return
 		}
 	}
 
@@ -113,13 +123,18 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.D
 	case "aes-128-cfb", "aes-192-cfb", "aes-256-cfb", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "aes-128-ofb", "aes-192-ofb", "aes-256-ofb", "des-cfb", "bf-cfb", "cast5-cfb", "rc4-md5", "rc4-md5-6", "chacha20", "chacha20-ietf", "salsa20", "camellia-128-cfb", "camellia-192-cfb", "camellia-256-cfb", "idea-cfb", "rc2-cfb", "seed-cfb", "rc4", "none", "plain":
 		typeName = "shadowsocks_stream"
 	default:
-		return nil, fmt.Errorf("unsupported shadowsocks encryption method: %v", s.Cipher)
+		err = fmt.Errorf("unsupported shadowsocks encryption method: %v", s.Cipher)
+		return
 	}
-	return protocol.NewDialer(typeName, parentDialer, protocol.Header{
+	err = layer.AppendResult(protocol.Build(typeName, layer.Data, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Cipher:       s.Cipher,
 		Password:     s.Password,
-	})
+	}))
+	if err != nil {
+		return
+	}
+	return layer, nil
 }
 
 func ParseSSURL(ssurl string) (data *Shadowsocks, err error) {

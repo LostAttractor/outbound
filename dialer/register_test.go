@@ -9,15 +9,15 @@ import (
 
 type registerTestDialer struct{}
 
-func (*registerTestDialer) Dialer(_ *ExtraOption, parent netproxy.Dialer) (netproxy.Dialer, error) {
-	return parent, nil
+func (*registerTestDialer) Build(_ *ExtraOption, upstream Upstream) (netproxy.Layer, error) {
+	return netproxy.Layer{Data: upstream}, nil
 }
 
 func TestNewFromLinkParsesOneLinkAndPreservesAlias(t *testing.T) {
 	const scheme = "registertest"
 	var receivedLink string
 	wantDialer := new(registerTestDialer)
-	fromLinkCreators[scheme] = func(link string) (Dialer, *Property, error) {
+	fromLinkCreators[scheme] = func(link string) (Builder, *Property, error) {
 		receivedLink = link
 		return wantDialer, &Property{Name: "parsed name", Link: link}, nil
 	}
@@ -77,7 +77,7 @@ func TestNewFromLinkParsesOneLinkAndPreservesAlias(t *testing.T) {
 func TestNewFromLinkRejectsLegacyShareLinkProxyChain(t *testing.T) {
 	const scheme = "registerchain"
 	creatorCalled := false
-	fromLinkCreators[scheme] = func(string) (Dialer, *Property, error) {
+	fromLinkCreators[scheme] = func(string) (Builder, *Property, error) {
 		creatorCalled = true
 		return new(registerTestDialer), new(Property), nil
 	}

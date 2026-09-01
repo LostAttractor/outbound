@@ -42,7 +42,7 @@ func (testProtocolDialer) ListenPacket(context.Context, string) (net.PacketConn,
 	return nil, errors.New("not implemented")
 }
 
-func setProtocolCreator(t *testing.T, name string, creator protocol.Creator) {
+func setProtocolCreator(t *testing.T, name string, creator protocol.LayerCreator) {
 	t.Helper()
 	previous, existed := protocol.Mapper[name]
 	protocol.Mapper[name] = creator
@@ -58,9 +58,9 @@ func setProtocolCreator(t *testing.T, name string, creator protocol.Creator) {
 func TestV2RayTransportBuildersPreserveParent(t *testing.T) {
 	parent := new(testParentDialer)
 	var transport netproxy.Dialer
-	setProtocolCreator(t, "vless", func(next netproxy.Dialer, _ protocol.Header) (netproxy.Dialer, error) {
+	setProtocolCreator(t, "vless", func(next netproxy.Dialer, _ protocol.Header) (netproxy.Layer, error) {
 		transport = next
-		return testProtocolDialer{}, nil
+		return netproxy.Layer{Data: testProtocolDialer{}}, nil
 	})
 
 	const websocketLink = "vless://00000000-0000-0000-0000-000000000000@proxy.example:443?type=ws&security=tls&host=cdn.example&sni=tls.example&path=%2Fws#node"
@@ -74,7 +74,7 @@ func TestV2RayTransportBuildersPreserveParent(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		builder dialer.Dialer
+		builder dialer.Builder
 		check   func(*testing.T, netproxy.Dialer)
 	}{
 		{
@@ -83,9 +83,10 @@ func TestV2RayTransportBuildersPreserveParent(t *testing.T) {
 			check: func(t *testing.T, transport netproxy.Dialer) {
 				t.Helper()
 				got, ok := transport.(*ws.Ws)
-				if !ok || got.ParentDialer != parent {
-					t.Fatalf("transport = %#v, want websocket with supplied parent", transport)
+				if !ok {
+					t.Fatalf("transport = %#v, want websocket", transport)
 				}
+				assertLifecycleHidden(t, got.ParentDialer)
 			},
 		},
 		{
@@ -96,9 +97,10 @@ func TestV2RayTransportBuildersPreserveParent(t *testing.T) {
 			check: func(t *testing.T, transport netproxy.Dialer) {
 				t.Helper()
 				got, ok := transport.(*transporttls.Tls)
-				if !ok || got.ParentDialer != parent {
-					t.Fatalf("transport = %#v, want TLS with supplied parent", transport)
+				if !ok {
+					t.Fatalf("transport = %#v, want TLS", transport)
 				}
+				assertLifecycleHidden(t, got.ParentDialer)
 			},
 		},
 		{
@@ -109,9 +111,10 @@ func TestV2RayTransportBuildersPreserveParent(t *testing.T) {
 			check: func(t *testing.T, transport netproxy.Dialer) {
 				t.Helper()
 				got, ok := transport.(*protocolhttp.HttpProxy)
-				if !ok || got.ParentDialer != parent {
-					t.Fatalf("transport = %#v, want HTTP with supplied parent", transport)
+				if !ok {
+					t.Fatalf("transport = %#v, want HTTP", transport)
 				}
+				assertLifecycleHidden(t, got.ParentDialer)
 			},
 		},
 	}
@@ -119,15 +122,13 @@ func TestV2RayTransportBuildersPreserveParent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			transport = nil
-			built, err := tt.builder.Dialer(&dialer.ExtraOption{TlsImplementation: "tls"}, parent)
+			built, err := tt.builder.Build(&dialer.ExtraOption{TlsImplementation: "tls"}, dialer.NewUpstream(parent))
 			if err != nil {
 				t.Fatal(err)
 			}
 			tt.check(t, transport)
-			if closer, ok := built.(io.Closer); ok {
-				if err := closer.Close(); err != nil {
-					t.Fatal(err)
-				}
+			if err := built.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -137,21 +138,31 @@ func TestV2RayClosesConstructedHTTPTransportOnProtocolError(t *testing.T) {
 	wantErr := errors.New("protocol construction failed")
 	parent := new(testParentDialer)
 	var transport *protocolhttp.HttpProxy
-	setProtocolCreator(t, "vless", func(next netproxy.Dialer, _ protocol.Header) (netproxy.Dialer, error) {
+	setProtocolCreator(t, "vless", func(next netproxy.Dialer, _ protocol.Header) (netproxy.Layer, error) {
 		transport = next.(*protocolhttp.HttpProxy)
-		return nil, wantErr
+		return netproxy.Layer{}, wantErr
 	})
 
 	config := V2Ray{
 		Add: "proxy.example", Port: "80", ID: "id", Net: "h2", Path: "/tunnel", Protocol: "vless",
 	}
-	if built, err := config.Dialer(new(dialer.ExtraOption), parent); !errors.Is(err, wantErr) || built != nil {
-		t.Fatalf("Dialer() = %#v, %v; want nil, %v", built, err, wantErr)
+	if built, err := config.Build(new(dialer.ExtraOption), dialer.NewUpstream(parent)); !errors.Is(err, wantErr) || built.Data != nil {
+		t.Fatalf("Build() = %#v, %v; want empty layer, %v", built, err, wantErr)
 	}
 	if _, err := transport.DialContext(context.Background(), "tcp", "target.example:80"); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("HTTP transport after failed build returned %v, want net.ErrClosed", err)
 	}
 	if parent.closeCalls != 0 {
 		t.Fatalf("parent close calls = %d, want 0", parent.closeCalls)
+	}
+}
+
+func assertLifecycleHidden(t *testing.T, upstream netproxy.Dialer) {
+	t.Helper()
+	if _, ok := upstream.(dialer.Upstream); !ok {
+		t.Fatalf("parent = %T, want dialer.Upstream", upstream)
+	}
+	if _, ok := upstream.(io.Closer); ok {
+		t.Fatal("transport received parent ownership")
 	}
 }

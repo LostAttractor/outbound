@@ -8,7 +8,7 @@ import (
 )
 
 type PacketConn struct {
-	net.PacketConn
+	*net.UDPConn
 	resolver *net.Resolver
 }
 
@@ -23,5 +23,5 @@ func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			return
 		}
 	}
-	return c.PacketConn.WriteTo(p, addr)
+	return c.UDPConn.WriteTo(p, addr)
 }

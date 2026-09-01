@@ -64,7 +64,7 @@ type WsConfig struct {
 }
 
 // NewWs returns a Ws infra.
-func NewWs(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewWs(link string) (dialer.Builder, *dialer.Property, error) {
 	u, err := url.Parse(link)
 	if err != nil {
 		return nil, nil, fmt.Errorf("NewWs: %w", err)
@@ -107,7 +107,7 @@ func NewWs(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *WsConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *WsConfig) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	wsUrl := url.URL{
 		Scheme: s.Scheme,
 		Host:   s.Host,
@@ -115,7 +115,7 @@ func (s *WsConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer
 	}
 	ws := &Ws{
 		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: nextDialer,
+			ParentDialer: upstream,
 		},
 		wsAddr:         wsUrl.String(),
 		passthroughUdp: s.PassthroughUdp,
@@ -133,18 +133,18 @@ func (s *WsConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer
 		ws.tlsFragmentation = true
 		minLen, maxLen, err := parseRange(option.TlsFragmentLength)
 		if err != nil {
-			return nil, err
+			return netproxy.Layer{}, err
 		}
 		ws.fragmentMinLength = minLen
 		ws.fragmentMaxLength = maxLen
 		minInterval, maxInterval, err := parseRange(option.TlsFragmentInterval)
 		if err != nil {
-			return nil, err
+			return netproxy.Layer{}, err
 		}
 		ws.fragmentMinInterval = minInterval
 		ws.fragmentMaxInterval = maxInterval
 	}
-	return ws, nil
+	return netproxy.Layer{Data: ws}, nil
 }
 
 func (s *Ws) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {

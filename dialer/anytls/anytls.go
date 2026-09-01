@@ -22,7 +22,7 @@ type Anytls struct {
 	Insecure bool
 }
 
-func NewAnytls(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewAnytls(link string) (dialer.Builder, *dialer.Property, error) {
 	switch {
 	case strings.HasPrefix(link, "anytls://"):
 		s, err := parseAnytlsURL(link)
@@ -56,7 +56,7 @@ func parseAnytlsURL(link string) (*Anytls, error) {
 	return antls, nil
 }
 
-func (s *Anytls) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *Anytls) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	tlsConfig := &tls.Config{
 		ServerName:         s.Sni,
 		InsecureSkipVerify: s.Insecure,
@@ -65,7 +65,7 @@ func (s *Anytls) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer
 		// disable the SNI
 		tlsConfig.ServerName = "127.0.0.1"
 	}
-	return protocol.NewDialer("anytls", parentDialer, protocol.Header{
+	return protocol.Build("anytls", upstream, protocol.Header{
 		ProxyAddress: s.Host,
 		Password:     s.Auth,
 		TlsConfig:    tlsConfig,

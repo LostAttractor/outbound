@@ -14,11 +14,12 @@ func TestNonSIP002MultiplexQueryIsIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	built, err := server.Dialer(new(dialer.ExtraOption), direct.NewDirectDialer(direct.Option{}))
+	built, err := server.Build(new(dialer.ExtraOption), dialer.NewUpstream(direct.NewDirectDialer(direct.Option{})))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := built.(*smux.Smux); ok {
+	defer built.Close()
+	if _, ok := built.Data.(*smux.Smux); ok {
 		t.Fatal("non-SIP002 multiplex query enabled smux")
 	}
 }

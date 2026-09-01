@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -126,21 +127,24 @@ func (c *monitoredConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
-var _ netproxy.StatefulDialer = (*Smux)(nil)
-
 type SmuxConfig struct {
 	PassThroughUDP bool
 	MaxConnections int
 }
 
-func (s *SmuxConfig) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *SmuxConfig) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	if s.MaxConnections < 0 || s.MaxConnections > MaxConnectionsLimit {
-		return nil, fmt.Errorf("smux max connections must be between 1 and %d", MaxConnectionsLimit)
+		return netproxy.Layer{}, fmt.Errorf("smux max connections must be between 1 and %d", MaxConnectionsLimit)
 	}
-	return &Smux{
-		Dialer:         nextDialer,
+	smux := &Smux{
+		Dialer:         upstream,
 		PassthroughUdp: s.PassThroughUDP,
 		MaxConnections: s.MaxConnections,
+	}
+	return netproxy.Layer{
+		Data:      smux,
+		Sessions:  []netproxy.Session{smux},
+		Resources: []io.Closer{smux},
 	}, nil
 }
 

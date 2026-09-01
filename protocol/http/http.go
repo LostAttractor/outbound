@@ -28,10 +28,11 @@ type HttpProxy struct {
 	pool      *h2ConnsPool
 }
 
-func NewHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func BuildHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Layer, error) {
+	layer := netproxy.Layer{Data: parentDialer}
 	s := &HttpProxy{
 		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: parentDialer,
+			ParentDialer: layer.Data,
 		},
 		Addr: u.Host,
 		Path: u.Path,
@@ -71,13 +72,15 @@ func NewHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netproxy.
 			Sni:           u.Query().Get("sni"),
 			AllowInsecure: allowInsecure,
 		}
-		var err error
-		if s.ParentDialer, err = tlsConfig.Dialer(option, s.ParentDialer); err != nil {
-			return nil, err
+		if err := layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
+			return netproxy.Layer{}, err
 		}
+		s.ParentDialer = layer.Data
 	}
 	s.pool = newH2ConnsPool(s.ParentDialer, s.Addr)
-	return s, nil
+	layer.Data = s
+	layer.Resources = append(layer.Resources, s)
+	return layer, nil
 }
 
 func (s *HttpProxy) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {

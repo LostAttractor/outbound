@@ -3,6 +3,7 @@ package vmess
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -12,8 +13,8 @@ import (
 )
 
 func init() {
-	protocol.Register("vmess", NewDialerFactory(protocol.ProtocolVMessTCP))
-	protocol.Register("vmess+tls+grpc", NewDialerFactory(protocol.ProtocolVMessTlsGrpc))
+	protocol.RegisterLayer("vmess", NewDialerFactory(protocol.ProtocolVMessTCP))
+	protocol.RegisterLayer("vmess+tls+grpc", NewDialerFactory(protocol.ProtocolVMessTlsGrpc))
 }
 
 type Dialer struct {
@@ -27,7 +28,7 @@ type Dialer struct {
 	featurePacketAddr bool
 }
 
-func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, error) {
 	metadata := protocol.Metadata{
 		IsClient: header.IsClient,
 	}
@@ -55,25 +56,28 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}, nil
 }
 
-func NewDialerFactory(proto protocol.Protocol) func(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
-	return func(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+func NewDialerFactory(proto protocol.Protocol) protocol.LayerCreator {
+	return func(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Layer, error) {
 		d, err := NewDialer(nextDialer, header)
 		if err != nil {
-			return nil, err
+			return netproxy.Layer{}, err
 		}
-		dd := d.(*Dialer)
-		dd.protocol = proto
+		d.protocol = proto
 		if proto == protocol.ProtocolVMessTlsGrpc {
 			transport := &grpc.Dialer{
 				StatelessDialer: protocol.StatelessDialer{ParentDialer: nextDialer},
-				ServiceName:     dd.grpcServiceName,
-				ServerName:      dd.proxySNI,
-				Address:         dd.proxyAddress,
+				ServiceName:     d.grpcServiceName,
+				ServerName:      d.proxySNI,
+				Address:         d.proxyAddress,
 			}
-			dd.nextDialer = transport
-			return netproxy.ComposeDialer(dd, transport), nil
+			d.nextDialer = transport
+			return netproxy.Layer{
+				Data:      d,
+				Sessions:  []netproxy.Session{transport},
+				Resources: []io.Closer{transport},
+			}, nil
 		}
-		return dd, nil
+		return netproxy.Layer{Data: d}, nil
 	}
 }
 

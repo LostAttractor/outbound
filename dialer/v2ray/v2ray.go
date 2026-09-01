@@ -2,8 +2,8 @@ package v2ray
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"regexp"
@@ -50,7 +50,7 @@ type V2Ray struct {
 	Protocol      string `json:"protocol"`
 }
 
-func NewV2Ray(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewV2Ray(link string) (dialer.Builder, *dialer.Property, error) {
 	var (
 		s   *V2Ray
 		err error
@@ -80,18 +80,25 @@ func NewV2Ray(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
-	d := parentDialer
-	ownsTransport := false
-	var err error
+func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (layer netproxy.Layer, err error) {
+	layer.Data = upstream
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, layer.Close())
+			layer = netproxy.Layer{}
+		}
+	}()
+
 	switch s.Protocol {
 	case "vmess", "vless":
 	default:
-		return nil, fmt.Errorf("V2Ray.Dialer: unexpected protocol: %v", s.Protocol)
+		err = fmt.Errorf("V2Ray.Build: unexpected protocol: %v", s.Protocol)
+		return
 	}
 
 	if s.TLS == "reality" && s.Protocol != "vless" {
-		return nil, fmt.Errorf("only VLESS supports reality")
+		err = fmt.Errorf("only VLESS supports reality")
+		return
 	}
 
 	switch strings.ToLower(s.Net) {
@@ -116,14 +123,13 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 			Sni:           sni,
 			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
-		d, err = wsBuilder.Dialer(option, d)
-		if err != nil {
-			return nil, err
+		if err = layer.AppendResult(wsBuilder.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
+			return
 		}
-		ownsTransport = true
 	case "tcp":
 		if s.Type != "none" && s.Type != "" {
-			return nil, fmt.Errorf("%w: type: %v", dialer.UnexpectedFieldErr, s.Type)
+			err = fmt.Errorf("%w: type: %v", dialer.UnexpectedFieldErr, s.Type)
+			return
 		}
 		if s.TLS == "tls" || s.TLS == "reality" {
 			sni := s.SNI
@@ -142,19 +148,18 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 						"spx": []string{s.SpiderX},
 					}.Encode(),
 				}
-				d, err = tls.NewReality(u.String(), d)
+				layer.Data, err = tls.NewReality(u.String(), layer.Data)
 			} else {
 				tlsConfig := tls.TLSConfig{
 					Host:          net.JoinHostPort(s.Add, s.Port),
 					Sni:           sni,
 					AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 				}
-				d, err = tlsConfig.Dialer(option, d)
+				err = layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data)))
 			}
 			if err != nil {
-				return nil, err
+				return
 			}
-			ownsTransport = true
 		}
 	case "grpc":
 		sni := s.SNI
@@ -165,14 +170,16 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 		if serviceName == "" {
 			serviceName = "GunService"
 		}
-		d = &grpc.Dialer{
-			StatelessDialer: protocol.StatelessDialer{ParentDialer: d},
+		transport := &grpc.Dialer{
+			StatelessDialer: protocol.StatelessDialer{ParentDialer: layer.Data},
 			ServiceName:     serviceName,
 			ServerName:      sni,
 			Address:         net.JoinHostPort(s.Add, s.Port),
 			AllowInsecure:   s.AllowInsecure || option.AllowInsecure,
 		}
-		ownsTransport = true
+		layer.Data = transport
+		layer.Sessions = append(layer.Sessions, transport)
+		layer.Resources = append(layer.Resources, transport)
 	case "http", "http2", "h2":
 		sni := s.SNI
 		if sni == "" {
@@ -196,14 +203,13 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 				"transport":         []string{"1"},
 			}.Encode(),
 		}
-		d, err = http.NewHTTPProxy(&u, option, d)
-		if err != nil {
-			return nil, err
+		if err = layer.AppendResult(http.BuildHTTPProxy(&u, option, layer.Data)); err != nil {
+			return
 		}
-		ownsTransport = true
 	case "meek":
 		if strings.HasPrefix(s.Path, "https://") && s.TLS != "tls" && s.TLS != "utls" {
-			return nil, fmt.Errorf("%w: meek: tls should be enabled", dialer.InvalidParameterErr)
+			err = fmt.Errorf("%w: meek: tls should be enabled", dialer.InvalidParameterErr)
+			return
 		}
 
 		u := url.URL{
@@ -217,11 +223,13 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 			}.Encode(),
 		}
 
-		d, err = meek.NewDialer(u.String(), d)
+		transport, buildErr := meek.NewDialer(u.String(), layer.Data)
+		err = buildErr
 		if err != nil {
-			return nil, err
+			return
 		}
-		ownsTransport = true
+		layer.Data = transport
+		layer.Resources = append(layer.Resources, transport)
 	case "httpupgrade":
 		scheme := "http"
 		if s.TLS == "tls" {
@@ -237,32 +245,26 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 				"serverName":    []string{s.SNI},
 			}.Encode(),
 		}
-		d, err = httpupgrade.NewDialer(u.String(), d)
+		layer.Data, err = httpupgrade.NewDialer(u.String(), layer.Data)
 		if err != nil {
-			return nil, err
+			return
 		}
-		ownsTransport = true
 	default:
-		return nil, fmt.Errorf("%w: network: %v", dialer.UnexpectedFieldErr, s.Net)
+		err = fmt.Errorf("%w: network: %v", dialer.UnexpectedFieldErr, s.Net)
+		return
 	}
 
-	transport := d
-	protocolDialer, err := protocol.NewDialer(s.Protocol, transport, protocol.Header{
+	err = layer.AppendResult(protocol.Build(s.Protocol, layer.Data, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Add, s.Port),
 		Cipher:       getAutoCipher(),
 		Password:     s.ID,
 		Feature1:     s.Flow,
 		//Flags:        protocol.Flags_VMess_UsePacketAddr,
-	})
+	}))
 	if err != nil {
-		if ownsTransport {
-			if closer, ok := transport.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
-		return nil, err
+		return
 	}
-	return netproxy.ComposeDialer(protocolDialer, transport), nil
+	return layer, nil
 }
 
 func ParseVlessURL(vless string) (data *V2Ray, err error) {

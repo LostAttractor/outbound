@@ -28,7 +28,7 @@ type Socks struct {
 	Protocol string `json:"protocol"`
 }
 
-func NewSocks(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewSocks(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseSocksURL(link)
 	if err != nil {
 		return nil, nil, err
@@ -41,15 +41,15 @@ func NewSocks(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *Socks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *Socks) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	link := s.ExportToURL()
 	switch s.Protocol {
 	case "", "socks", "socks5":
-		d, err := socks5.NewSocks5Dialer(link, parentDialer) // Socks5 Proxy supports full-cone.
+		d, err := socks5.NewSocks5Dialer(link, upstream) // Socks5 Proxy supports full-cone.
 		if err != nil {
-			return nil, err
+			return netproxy.Layer{}, err
 		}
-		return d, nil
+		return netproxy.Layer{Data: d}, nil
 	//case "socks4", "socks4a":
 	//	d, err := socks4.NewSocks4Dialer(link, &proxy.Direct{})
 	//	if err != nil {
@@ -57,7 +57,7 @@ func (s *Socks) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer)
 	//	}
 	//	return dialer.NewDialer(d, false, s.Name, s.Protocol, link), nil
 	default:
-		return nil, fmt.Errorf("unexpected protocol: %v", s.Protocol)
+		return netproxy.Layer{}, fmt.Errorf("unexpected protocol: %v", s.Protocol)
 	}
 }
 

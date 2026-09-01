@@ -2,6 +2,7 @@ package hysteria2
 
 import (
 	"crypto/tls"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -14,7 +15,17 @@ import (
 )
 
 func init() {
-	protocol.Register("hysteria2", NewDialer)
+	protocol.RegisterLayer("hysteria2", func(parent netproxy.Dialer, header protocol.Header) (netproxy.Layer, error) {
+		dialer, err := NewDialer(parent, header)
+		if err != nil {
+			return netproxy.Layer{}, err
+		}
+		return netproxy.Layer{
+			Data:      dialer,
+			Sessions:  []netproxy.Session{dialer},
+			Resources: []io.Closer{dialer},
+		}, nil
+	})
 }
 
 // Why Metadata?
@@ -27,7 +38,7 @@ type Feature1 struct {
 	UDPHopInterval  time.Duration
 }
 
-func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, error) {
 	host, port := parseServerAddrString(header.ProxyAddress)
 	config := &client.Config{
 		TLSConfig: tls.Config{

@@ -33,7 +33,7 @@ type Tuic struct {
 	UdpRelayMode      string
 }
 
-func NewTuic(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewTuic(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseTuicURL(link)
 	if err != nil {
 		return nil, nil, err
@@ -46,12 +46,12 @@ func NewTuic(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *Tuic) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *Tuic) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	var flags protocol.Flags
 	if s.UdpRelayMode == "quic" {
 		flags |= protocol.Flags_Tuic_UdpRelayModeQuic
 	}
-	return protocol.NewDialer("tuic", nextDialer, protocol.Header{
+	return protocol.Build("tuic", upstream, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Feature1:     s.CongestionControl,
 		TlsConfig: &tls.Config{

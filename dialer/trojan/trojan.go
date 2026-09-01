@@ -1,6 +1,7 @@
 package trojan
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -38,7 +39,7 @@ type Trojan struct {
 	Protocol      string `json:"protocol"`
 }
 
-func NewTrojan(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewTrojan(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseTrojanURL(link)
 	if err != nil {
 		return nil, nil, err
@@ -51,16 +52,23 @@ func NewTrojan(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *Trojan) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
-	var err error
+func (s *Trojan) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (layer netproxy.Layer, err error) {
+	layer.Data = upstream
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, layer.Close())
+			layer = netproxy.Layer{}
+		}
+	}()
+
 	if s.Type != "grpc" { // grpc contains tls
 		tlsConfig := tls.TLSConfig{
 			Host:          net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			Sni:           s.Sni,
 			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
-		if parentDialer, err = tlsConfig.Dialer(option, parentDialer); err != nil {
-			return nil, err
+		if err = layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
+			return
 		}
 	}
 	// "tls,ws,ss,trojanc"
@@ -78,23 +86,26 @@ func (s *Trojan) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer
 			Sni:           s.Sni,
 			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
-		if parentDialer, err = ws.Dialer(option, parentDialer); err != nil {
-			return nil, err
+		if err = layer.AppendResult(ws.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
+			return
 		}
 	case "grpc":
 		serviceName := s.ServiceName
 		if serviceName == "" {
 			serviceName = "GunService"
 		}
-		parentDialer = &grpc.Dialer{
+		transport := &grpc.Dialer{
 			StatelessDialer: protocol.StatelessDialer{
-				ParentDialer: parentDialer,
+				ParentDialer: layer.Data,
 			},
 			ServiceName:   serviceName,
 			ServerName:    s.Sni,
 			Address:       net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
+		layer.Data = transport
+		layer.Sessions = append(layer.Sessions, transport)
+		layer.Resources = append(layer.Resources, transport)
 	case "httpupgrade":
 		u := url.URL{
 			Scheme: "http",
@@ -105,30 +116,30 @@ func (s *Trojan) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer
 			}.Encode(),
 		}
 
-		if parentDialer, err = httpupgrade.NewDialer(u.String(), parentDialer); err != nil {
-			return nil, err
+		layer.Data, err = httpupgrade.NewDialer(u.String(), layer.Data)
+		if err != nil {
+			return
 		}
 	}
 	if strings.HasPrefix(s.Encryption, "ss;") {
 		fields := strings.SplitN(s.Encryption, ";", 3)
-		transport := parentDialer
-		if parentDialer, err = protocol.NewDialer("shadowsocks", transport, protocol.Header{
+		err = layer.AppendResult(protocol.Build("shadowsocks", layer.Data, protocol.Header{
 			ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 			Cipher:       fields[1],
 			Password:     fields[2],
-		}); err != nil {
-			return nil, err
+		}))
+		if err != nil {
+			return
 		}
-		parentDialer = netproxy.ComposeDialer(parentDialer, transport)
 	}
-	d, err := protocol.NewDialer("trojanc", parentDialer, protocol.Header{
+	err = layer.AppendResult(protocol.Build("trojanc", layer.Data, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Password:     s.Password,
-	})
+	}))
 	if err != nil {
-		return nil, err
+		return
 	}
-	return netproxy.ComposeDialer(d, parentDialer), nil
+	return layer, nil
 }
 
 func ParseTrojanURL(u string) (data *Trojan, err error) {

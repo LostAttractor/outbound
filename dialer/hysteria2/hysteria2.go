@@ -35,7 +35,7 @@ type Hysteria2 struct {
 	MaxRx     uint64
 }
 
-func NewHysteria2(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewHysteria2(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseHysteria2URL(link)
 	if err != nil {
 		return nil, nil, err
@@ -48,7 +48,7 @@ func NewHysteria2(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *Hysteria2) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *Hysteria2) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	header := protocol.Header{
 		ProxyAddress: s.Server,
 		TlsConfig: &tls.Config{
@@ -71,11 +71,11 @@ func (s *Hysteria2) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dia
 	} else if option.BandwidthMaxRx != "" && option.BandwidthMaxTx != "" {
 		maxRx, err := bandwidth.Parse(option.BandwidthMaxRx)
 		if err != nil {
-			return nil, fmt.Errorf("invalid bandwidth value for MaxRx: %w", err)
+			return netproxy.Layer{}, fmt.Errorf("invalid bandwidth value for MaxRx: %w", err)
 		}
 		maxTx, err := bandwidth.Parse(option.BandwidthMaxTx)
 		if err != nil {
-			return nil, fmt.Errorf("invalid bandwidth value for MaxTx: %w", err)
+			return netproxy.Layer{}, fmt.Errorf("invalid bandwidth value for MaxTx: %w", err)
 		}
 		if maxRx > 0 && maxTx > 0 {
 			feature1.BandwidthConfig = client.BandwidthConfig{
@@ -102,7 +102,7 @@ func (s *Hysteria2) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dia
 			return fmt.Errorf("no matching certificate found, %s not in %v", nHash, certHashes)
 		}
 	}
-	return protocol.NewDialer("hysteria2", parentDialer, header)
+	return protocol.Build("hysteria2", upstream, header)
 }
 
 func normalizeCertHash(hash string) string {

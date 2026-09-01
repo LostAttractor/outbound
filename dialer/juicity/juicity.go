@@ -34,7 +34,7 @@ type Juicity struct {
 	Protocol              string
 }
 
-func NewJuicity(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewJuicity(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseJuicityURL(link)
 	if err != nil {
 		return nil, nil, err
@@ -47,7 +47,7 @@ func NewJuicity(link string) (dialer.Dialer, *dialer.Property, error) {
 	}, nil
 }
 
-func (s *Juicity) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *Juicity) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	tlsConfig := &tls.Config{
 		NextProtos:         []string{"h3"},
 		MinVersion:         tls.VersionTLS13,
@@ -61,7 +61,7 @@ func (s *Juicity) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer)
 			if err != nil {
 				pinnedHash, err = hex.DecodeString(s.PinnedCertchainSha256)
 				if err != nil {
-					return nil, fmt.Errorf("failed to decode PinnedCertchainSha256")
+					return netproxy.Layer{}, fmt.Errorf("failed to decode PinnedCertchainSha256")
 				}
 			}
 		}
@@ -73,7 +73,7 @@ func (s *Juicity) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer)
 			return nil
 		}
 	}
-	return protocol.NewDialer("juicity", nextDialer, protocol.Header{
+	return protocol.Build("juicity", upstream, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Feature1:     s.CongestionControl,
 		TlsConfig:    tlsConfig,

@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"syscall"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -36,93 +34,40 @@ type Property struct {
 	Link     string
 }
 
-type Dialer interface {
-	Dialer(option *ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error)
+// Builder constructs one outbound layer over an upstream data path. A failed
+// Build retains responsibility for all resources it created and returns no
+// partially owned Layer.
+type Builder interface {
+	Build(option *ExtraOption, upstream Upstream) (netproxy.Layer, error)
 }
 
-type dataPlane struct{ dialer netproxy.Dialer }
+// Upstream exposes only data operations from the already built inner chain.
+// Connections returned by those operations are passed through unchanged.
+type Upstream struct{ data netproxy.Dialer }
 
-type streamView struct{ net.Conn }
+func NewUpstream(data netproxy.Dialer) Upstream { return Upstream{data: data} }
 
-type packetView struct{ net.PacketConn }
-
-type syscallStreamView struct {
-	*streamView
-	raw syscall.Conn
+func (u Upstream) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return u.data.DialContext(ctx, network, address)
 }
 
-func (c *syscallStreamView) SyscallConn() (syscall.RawConn, error) {
-	return c.raw.SyscallConn()
+func (u Upstream) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	return u.data.ListenPacket(ctx, address)
 }
 
-type closeWriteSyscallStreamView struct {
-	*syscallStreamView
-	closeWriter netproxy.CloseWriter
-}
-
-func (c *closeWriteSyscallStreamView) CloseWrite() error {
-	return c.closeWriter.CloseWrite()
-}
-
-type syscallPacketView struct {
-	*packetView
-	raw syscall.Conn
-}
-
-func (c *syscallPacketView) SyscallConn() (syscall.RawConn, error) {
-	return c.raw.SyscallConn()
-}
-
-func (d *dataPlane) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	conn, err := d.dialer.DialContext(ctx, network, address)
-	if err != nil {
-		return nil, err
+// BuildRuntime constructs a chain and transfers its ownership to one Runtime.
+func BuildRuntime(base netproxy.Layer, option *ExtraOption, builders ...Builder) (*netproxy.Runtime, error) {
+	if base.Data == nil {
+		return nil, netproxy.ErrMissingDialer
 	}
-	view := &streamView{Conn: conn}
-	closeWriter, hasCloseWriter := conn.(netproxy.CloseWriter)
-	raw, hasSyscallConn := conn.(syscall.Conn)
-	if hasSyscallConn {
-		withSyscall := &syscallStreamView{streamView: view, raw: raw}
-		if hasCloseWriter {
-			return &closeWriteSyscallStreamView{syscallStreamView: withSyscall, closeWriter: closeWriter}, nil
-		}
-		return withSyscall, nil
-	}
-	if hasCloseWriter {
-		return &netproxy.CloseWriteConn{Conn: view, CloseWriter: closeWriter}, nil
-	}
-	return view, nil
-}
-
-func (d *dataPlane) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
-	conn, err := d.dialer.ListenPacket(ctx, address)
-	if err != nil {
-		return nil, err
-	}
-	view := &packetView{PacketConn: conn}
-	if raw, ok := conn.(syscall.Conn); ok {
-		return &syscallPacketView{packetView: view, raw: raw}, nil
-	}
-	return view, nil
-}
-
-// BuildRuntime takes ownership of base, constructs the complete owned chain,
-// and adds the single Runtime data-plane and drain boundary. On failure it
-// closes both a returned partial child and the previously constructed chain.
-func BuildRuntime(base netproxy.Dialer, option *ExtraOption, builders ...Dialer) (*netproxy.Runtime, error) {
-	owned := base
 	for _, builder := range builders {
-		d, err := builder.Dialer(option, &dataPlane{dialer: owned})
+		layer, err := builder.Build(option, NewUpstream(base.Data))
 		if err != nil {
-			if closer, ok := d.(io.Closer); ok {
-				err = errors.Join(err, closer.Close())
-			}
-			if closer, ok := owned.(io.Closer); ok {
-				err = errors.Join(err, closer.Close())
-			}
-			return nil, err
+			return nil, errors.Join(err, base.Close())
 		}
-		owned = netproxy.ComposeDialer(d, owned)
+		if err := base.Append(layer); err != nil {
+			return nil, errors.Join(err, layer.Close(), base.Close())
+		}
 	}
-	return netproxy.NewRuntime(owned), nil
+	return netproxy.NewRuntime(base), nil
 }

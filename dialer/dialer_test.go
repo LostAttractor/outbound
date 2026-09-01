@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol/direct"
+	"github.com/daeuniverse/quic-go"
 )
 
 type runtimeTestDialer struct {
@@ -40,18 +42,17 @@ type composingBuilder struct {
 }
 
 type failingBuilder struct {
-	child *runtimeTestDialer
-	err   error
+	err error
 }
 
-func (b *composingBuilder) Dialer(_ *ExtraOption, parent netproxy.Dialer) (netproxy.Dialer, error) {
-	_, b.sawParentSession = parent.(netproxy.Session)
-	_, b.sawParentCloser = parent.(io.Closer)
-	return runtimeTestDataPlane{}, nil
+func (b *composingBuilder) Build(_ *ExtraOption, upstream Upstream) (netproxy.Layer, error) {
+	_, b.sawParentSession = any(upstream).(netproxy.Session)
+	_, b.sawParentCloser = any(upstream).(io.Closer)
+	return netproxy.Layer{Data: runtimeTestDataPlane{}}, nil
 }
 
-func (b *failingBuilder) Dialer(*ExtraOption, netproxy.Dialer) (netproxy.Dialer, error) {
-	return b.child, b.err
+func (b *failingBuilder) Build(*ExtraOption, Upstream) (netproxy.Layer, error) {
+	return netproxy.Layer{}, b.err
 }
 
 type runtimeTestDataPlane struct{}
@@ -82,12 +83,19 @@ func (runtimeTestDataPlane) ListenPacket(context.Context, string) (net.PacketCon
 func TestBuildRuntimeKeepsParentLifecycleOutOfBuilder(t *testing.T) {
 	parentDialer := &runtimeTestDialer{state: netproxy.NewStateBroadcaster(netproxy.SessionConnected)}
 	builder := new(composingBuilder)
-	runtime, err := BuildRuntime(parentDialer, new(ExtraOption), builder)
+	runtime, err := BuildRuntime(netproxy.Layer{
+		Data:      parentDialer,
+		Sessions:  []netproxy.Session{parentDialer},
+		Resources: []io.Closer{parentDialer},
+	}, new(ExtraOption), builder)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if builder.sawParentSession || builder.sawParentCloser {
 		t.Fatal("builder received the parent's lifecycle capability")
+	}
+	if _, ok := runtime.Session(); !ok {
+		t.Fatal("runtime lost the explicitly declared parent session")
 	}
 	runtime.Retire()
 	if err := runtime.Wait(context.Background()); err != nil {
@@ -98,26 +106,27 @@ func TestBuildRuntimeKeepsParentLifecycleOutOfBuilder(t *testing.T) {
 	}
 }
 
-func TestBuildRuntimeClosesPartialChainOnFailure(t *testing.T) {
+func TestBuildRuntimeClosesAccumulatedChainOnFailure(t *testing.T) {
 	wantErr := errors.New("build failed")
 	parent := &runtimeTestDialer{state: netproxy.NewStateBroadcaster(netproxy.SessionConnected)}
-	child := &runtimeTestDialer{state: netproxy.NewStateBroadcaster(netproxy.SessionConnected)}
-	if _, err := BuildRuntime(parent, new(ExtraOption), &failingBuilder{child: child, err: wantErr}); !errors.Is(err, wantErr) {
+	if _, err := BuildRuntime(netproxy.Layer{
+		Data:      parent,
+		Sessions:  []netproxy.Session{parent},
+		Resources: []io.Closer{parent},
+	}, new(ExtraOption), &failingBuilder{err: wantErr}); !errors.Is(err, wantErr) {
 		t.Fatalf("BuildRuntime error = %v, want %v", err, wantErr)
-	}
-	if got := child.closes.Load(); got != 1 {
-		t.Fatalf("partial child closes = %d, want 1", got)
 	}
 	if got := parent.closes.Load(); got != 1 {
 		t.Fatalf("parent closes = %d, want 1", got)
 	}
 }
 
-func TestDataPlanePreservesSyscallAndSeparatesIOPlanes(t *testing.T) {
+func TestUpstreamPreservesReturnedConnectionCapabilities(t *testing.T) {
 	conn, peer := net.Pipe()
 	firstPeer := peer
 	t.Cleanup(func() { _ = firstPeer.Close() })
-	view := &dataPlane{dialer: &capabilityDialer{conn: &capabilityConn{Conn: conn}}}
+	underlying := &capabilityConn{Conn: conn}
+	view := NewUpstream(&capabilityDialer{conn: underlying})
 	stream, err := view.DialContext(context.Background(), "udp", "example.com:53")
 	if err != nil {
 		t.Fatal(err)
@@ -125,15 +134,19 @@ func TestDataPlanePreservesSyscallAndSeparatesIOPlanes(t *testing.T) {
 	if _, ok := stream.(syscall.Conn); !ok {
 		t.Fatal("stream view hid syscall.Conn")
 	}
-	if _, ok := stream.(net.PacketConn); ok {
-		t.Fatal("stream view exposed packet-plane methods")
+	if stream != underlying {
+		t.Fatal("Upstream replaced the DialContext result")
+	}
+	if _, ok := stream.(net.PacketConn); !ok {
+		t.Fatal("Upstream hid packet methods implemented by the connection")
 	}
 	_ = stream.Close()
 
 	conn, peer = net.Pipe()
 	secondPeer := peer
 	t.Cleanup(func() { _ = secondPeer.Close() })
-	view = &dataPlane{dialer: &capabilityDialer{conn: &capabilityConn{Conn: conn}}}
+	underlying = &capabilityConn{Conn: conn}
+	view = NewUpstream(&capabilityDialer{conn: underlying})
 	packet, err := view.ListenPacket(context.Background(), "example.com:53")
 	if err != nil {
 		t.Fatal(err)
@@ -141,8 +154,47 @@ func TestDataPlanePreservesSyscallAndSeparatesIOPlanes(t *testing.T) {
 	if _, ok := packet.(syscall.Conn); !ok {
 		t.Fatal("packet view hid syscall.Conn")
 	}
-	if _, ok := packet.(net.Conn); ok {
-		t.Fatal("packet view exposed stream-plane methods")
+	if packet != underlying {
+		t.Fatal("Upstream replaced the ListenPacket result")
+	}
+	if _, ok := packet.(net.Conn); !ok {
+		t.Fatal("Upstream hid stream methods implemented by the connection")
 	}
 	_ = packet.Close()
+}
+
+func TestDirectPacketConnInitializesQUICTransportThroughUpstream(t *testing.T) {
+	view := NewUpstream(direct.NewDirectDialer(direct.Option{}))
+	const remote = "127.0.0.1:9"
+	connected, err := view.DialContext(context.Background(), "udp", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connected.RemoteAddr() == nil || connected.RemoteAddr().String() != remote {
+		t.Fatalf("DialContext remote = %v, want %s", connected.RemoteAddr(), remote)
+	}
+	_ = connected.Close()
+
+	packet, err := view.ListenPacket(context.Background(), remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = packet.Close() })
+	conn, ok := packet.(net.Conn)
+	if !ok {
+		t.Fatal("direct packet connection lost its native net.Conn capability")
+	}
+	if conn.RemoteAddr() != nil {
+		t.Fatalf("ListenPacket connected to %v", conn.RemoteAddr())
+	}
+
+	transport := &quic.Transport{Conn: packet}
+	t.Cleanup(func() { _ = transport.Close() })
+	_, err = transport.WriteTo(
+		[]byte("probe"),
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 }

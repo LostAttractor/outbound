@@ -28,7 +28,7 @@ type HTTP struct {
 	AllowInsecure bool   `json:"allowInsecure"`
 }
 
-func NewHTTP(link string) (dialer.Dialer, *dialer.Property, error) {
+func NewHTTP(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseHTTPURL(link)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", dialer.InvalidParameterErr, err)
@@ -81,9 +81,9 @@ func ParseHTTPURL(link string) (data *HTTP, err error) {
 	}, nil
 }
 
-func (s *HTTP) Dialer(option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Dialer, error) {
+func (s *HTTP) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	u := s.URL()
-	return http.NewHTTPProxy(&u, option, parentDialer)
+	return http.BuildHTTPProxy(&u, option, upstream)
 }
 
 func (s *HTTP) URL() url.URL {

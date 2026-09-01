@@ -86,6 +86,22 @@ type orderedSession struct {
 	order *[]string
 }
 
+type orderedConnectSession struct {
+	*testSession
+	name  string
+	order *[]string
+}
+
+func (s *orderedConnectSession) Connect(ctx context.Context) error {
+	*s.order = append(*s.order, s.name)
+	return s.testSession.Connect(ctx)
+}
+
+type statefulTestDialer struct {
+	testDialer
+	*testSession
+}
+
 func (s *orderedSession) Close() error {
 	*s.order = append(*s.order, s.name)
 	return s.testSession.Close()
@@ -239,14 +255,28 @@ func TestStateBroadcasterConcurrentTransitionsStayOrdered(t *testing.T) {
 
 func TestRuntimeClosesResourceThroughStatelessWrapper(t *testing.T) {
 	resource := new(testResourceDialer)
-	wrapped := ComposeDialer(testDialer{}, resource)
-	runtime := NewRuntime(wrapped)
+	runtime := NewRuntime(Layer{
+		Data:      testDialer{},
+		Resources: []io.Closer{resource},
+	})
 	if _, ok := runtime.Session(); ok {
 		t.Fatal("resource-only runtime exposed a session")
 	}
 	retireRuntime(t, runtime)
 	if got := resource.closes.Load(); got != 1 {
 		t.Fatalf("resource closes = %d, want 1", got)
+	}
+}
+
+func TestRuntimeDoesNotInferLifecycleFromData(t *testing.T) {
+	data := &statefulTestDialer{testSession: newTestSession()}
+	runtime := NewRuntime(Layer{Data: data})
+	if _, ok := runtime.Session(); ok {
+		t.Fatal("Runtime inferred a Session from Layer.Data")
+	}
+	retireRuntime(t, runtime)
+	if state := data.Snapshot().State; state == SessionClosed {
+		t.Fatal("Runtime closed lifecycle omitted from Layer.Resources")
 	}
 }
 
@@ -257,7 +287,10 @@ func TestRuntimeRetireDoesNotWaitForCleanup(t *testing.T) {
 		release: make(chan struct{}),
 		err:     wantErr,
 	}
-	runtime := NewRuntime(resource)
+	runtime := NewRuntime(Layer{
+		Data:      resource,
+		Resources: []io.Closer{resource},
+	})
 	retired := make(chan struct{})
 	go func() {
 		runtime.Retire()
@@ -289,13 +322,35 @@ func TestRuntimeRetireDoesNotWaitForCleanup(t *testing.T) {
 
 func TestSessionGroupConnectUpdatesSnapshotBeforeReturn(t *testing.T) {
 	group := NewSessionGroup(newTestSession(), newTestSession())
-	defer group.Close()
+	defer group.Stop()
 	if err := group.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if state := group.Snapshot().State; state != SessionConnected {
 		t.Fatalf("state after Connect = %s, want connected", state)
 	}
+}
+
+func TestRuntimeConnectsSessionsFromInnerToOuter(t *testing.T) {
+	var order []string
+	inner := &orderedConnectSession{testSession: newTestSession(), name: "inner", order: &order}
+	outer := &orderedConnectSession{testSession: newTestSession(), name: "outer", order: &order}
+	runtime := NewRuntime(Layer{
+		Data:      testDialer{},
+		Sessions:  []Session{inner, outer},
+		Resources: []io.Closer{inner, outer},
+	})
+	session, ok := runtime.Session()
+	if !ok {
+		t.Fatal("Runtime lost sessions")
+	}
+	if err := session.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "inner" || order[1] != "outer" {
+		t.Fatalf("connect order = %v, want [inner outer]", order)
+	}
+	retireRuntime(t, runtime)
 }
 
 func TestSessionGroupUpdatesCauseWithoutAggregateStateChange(t *testing.T) {
@@ -308,7 +363,7 @@ func TestSessionGroupUpdatesCauseWithoutAggregateStateChange(t *testing.T) {
 	second.state.Transition(SessionConnecting, nil)
 	second.state.Transition(SessionDisconnected, secondErr)
 	group := NewSessionGroup(first, second)
-	defer group.Close()
+	defer group.Stop()
 	if cause := group.Snapshot().Cause; !errors.Is(cause, firstErr) {
 		t.Fatalf("initial cause = %v, want %v", cause, firstErr)
 	}
@@ -323,7 +378,7 @@ func TestSessionGroupUpdatesCauseWithoutAggregateStateChange(t *testing.T) {
 	}
 }
 
-func TestSessionGroupCloseWaitsForConcurrentCloseAndReturnsError(t *testing.T) {
+func TestRuntimeWaitsForOwnerCleanupAndReturnsErrorToAllWaiters(t *testing.T) {
 	wantErr := errors.New("close failed")
 	child := &blockingCloseSession{
 		testSession: newTestSession(),
@@ -331,12 +386,16 @@ func TestSessionGroupCloseWaitsForConcurrentCloseAndReturnsError(t *testing.T) {
 		release:     make(chan struct{}),
 		err:         wantErr,
 	}
-	group := NewSessionGroup(child)
+	runtime := NewRuntime(Layer{
+		Data:      testDialer{},
+		Resources: []io.Closer{child},
+	})
+	runtime.Retire()
 	first := make(chan error, 1)
 	second := make(chan error, 1)
-	go func() { first <- group.Close() }()
+	go func() { first <- runtime.Wait(context.Background()) }()
 	<-child.started
-	go func() { second <- group.Close() }()
+	go func() { second <- runtime.Wait(context.Background()) }()
 	select {
 	case err := <-second:
 		t.Fatalf("concurrent Close returned before cleanup: %v", err)
@@ -351,7 +410,7 @@ func TestSessionGroupCloseWaitsForConcurrentCloseAndReturnsError(t *testing.T) {
 	}
 }
 
-func TestSessionGroupConnectCannotSucceedAfterClose(t *testing.T) {
+func TestSessionGroupConnectCannotSucceedAfterStop(t *testing.T) {
 	child := &blockingConnectSession{
 		testSession: newTestSession(),
 		started:     make(chan struct{}),
@@ -361,13 +420,12 @@ func TestSessionGroupConnectCannotSucceedAfterClose(t *testing.T) {
 	connected := make(chan error, 1)
 	go func() { connected <- group.Connect(context.Background()) }()
 	<-child.started
-	if err := group.Close(); err != nil {
-		t.Fatal(err)
-	}
+	group.Stop()
 	close(child.release)
 	if err := <-connected; !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Connect error = %v, want net.ErrClosed", err)
 	}
+	_ = child.Close()
 }
 
 func TestRuntimeRetireWaitsForConnect(t *testing.T) {
@@ -376,7 +434,11 @@ func TestRuntimeRetireWaitsForConnect(t *testing.T) {
 		started:     make(chan struct{}),
 		release:     make(chan struct{}),
 	}
-	runtime := NewRuntime(WithSession(testDialer{}, owner))
+	runtime := NewRuntime(Layer{
+		Data:      testDialer{},
+		Sessions:  []Session{owner},
+		Resources: []io.Closer{owner},
+	})
 	session, ok := runtime.Session()
 	if !ok {
 		t.Fatal("Runtime lost Session")
@@ -400,11 +462,17 @@ func TestRuntimeRetireWaitsForConnect(t *testing.T) {
 	}
 }
 
-func TestRuntimePreservesComposedParentSession(t *testing.T) {
+func TestRuntimePreservesParentSessionThroughStatelessData(t *testing.T) {
 	parentSession := newTestSession()
-	parent := WithSession(testDialer{}, parentSession)
+	if err := parentSession.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	child := testDialer{}
-	runtime := NewRuntime(ComposeDialer(child, parent))
+	runtime := NewRuntime(Layer{
+		Data:      child,
+		Sessions:  []Session{parentSession},
+		Resources: []io.Closer{parentSession},
+	})
 	session, ok := runtime.Session()
 	if !ok || session.Snapshot() != parentSession.Snapshot() {
 		t.Fatal("composed runtime lost the parent session")
@@ -419,7 +487,12 @@ func TestRuntimePreservesComposedParentSession(t *testing.T) {
 }
 
 func TestRuntimeDialerHidesOwnedLifecycle(t *testing.T) {
-	runtime := NewRuntime(WithSession(testDialer{}, newTestSession()))
+	owner := newTestSession()
+	runtime := NewRuntime(Layer{
+		Data:      testDialer{},
+		Sessions:  []Session{owner},
+		Resources: []io.Closer{owner},
+	})
 	if _, ok := runtime.Dialer().(Session); ok {
 		t.Fatal("Runtime.Dialer exposed Session")
 	}
@@ -444,14 +517,11 @@ func newPacketCapableTestConn(t *testing.T) *packetCapableTestConn {
 	return &packetCapableTestConn{Conn: conn}
 }
 
-func TestRuntimeDialContextHidesPacketPlane(t *testing.T) {
-	runtime := NewRuntime(&streamTestDialer{conn: newPacketCapableTestConn(t)})
+func TestRuntimeDialContextPreservesSyscallConn(t *testing.T) {
+	runtime := NewRuntime(Layer{Data: &streamTestDialer{conn: newPacketCapableTestConn(t)}})
 	conn, err := runtime.Dialer().DialContext(context.Background(), "udp", "example.com:53")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if _, ok := conn.(net.PacketConn); ok {
-		t.Fatal("DialContext exposed packet-plane methods")
 	}
 	if _, ok := conn.(syscall.Conn); !ok {
 		t.Fatal("DialContext hid syscall.Conn")
@@ -462,14 +532,11 @@ func TestRuntimeDialContextHidesPacketPlane(t *testing.T) {
 	retireRuntime(t, runtime)
 }
 
-func TestRuntimeListenPacketHidesStreamPlane(t *testing.T) {
-	runtime := NewRuntime(&packetTestDialer{conn: newPacketCapableTestConn(t)})
+func TestRuntimeListenPacketPreservesSyscallConn(t *testing.T) {
+	runtime := NewRuntime(Layer{Data: &packetTestDialer{conn: newPacketCapableTestConn(t)}})
 	conn, err := runtime.Dialer().ListenPacket(context.Background(), "example.com:53")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if _, ok := conn.(net.Conn); ok {
-		t.Fatal("ListenPacket exposed stream-plane methods")
 	}
 	if _, ok := conn.(syscall.Conn); !ok {
 		t.Fatal("ListenPacket hid syscall.Conn")
@@ -482,7 +549,10 @@ func TestRuntimeListenPacketHidesStreamPlane(t *testing.T) {
 
 func TestRuntimeDefersCloseForStreamLease(t *testing.T) {
 	resource := &ownedTestDialer{Dialer: &streamTestDialer{conn: newPacketCapableTestConn(t)}}
-	runtime := NewRuntime(resource)
+	runtime := NewRuntime(Layer{
+		Data:      resource,
+		Resources: []io.Closer{resource},
+	})
 	conn, err := runtime.Dialer().DialContext(context.Background(), "tcp", "example.com:443")
 	if err != nil {
 		t.Fatal(err)
@@ -504,7 +574,10 @@ func TestRuntimeDefersCloseForStreamLease(t *testing.T) {
 
 func TestRuntimeDefersCloseForPacketLease(t *testing.T) {
 	resource := &ownedTestDialer{Dialer: &packetTestDialer{conn: newPacketCapableTestConn(t)}}
-	runtime := NewRuntime(resource)
+	runtime := NewRuntime(Layer{
+		Data:      resource,
+		Resources: []io.Closer{resource},
+	})
 	conn, err := runtime.Dialer().ListenPacket(context.Background(), "example.com:53")
 	if err != nil {
 		t.Fatal(err)
@@ -524,56 +597,22 @@ func TestRuntimeDefersCloseForPacketLease(t *testing.T) {
 	}
 }
 
-func TestComposeDialerClosesOutsideIn(t *testing.T) {
-	tests := []struct {
-		name        string
-		build       func(*[]string) Dialer
-		wantSession bool
-	}{
-		{
-			name: "resources",
-			build: func(order *[]string) Dialer {
-				return ComposeDialer(
-					&orderedResourceDialer{name: "child", order: order},
-					&orderedResourceDialer{name: "parent", order: order},
-				)
-			},
-		},
-		{
-			name:        "resource then session",
-			wantSession: true,
-			build: func(order *[]string) Dialer {
-				parent := WithSession(testDialer{}, &orderedSession{testSession: newTestSession(), name: "parent", order: order})
-				return ComposeDialer(&orderedResourceDialer{name: "child", order: order}, parent)
-			},
-		},
-		{
-			name:        "session then resource",
-			wantSession: true,
-			build: func(order *[]string) Dialer {
-				child := WithSession(testDialer{}, &orderedSession{testSession: newTestSession(), name: "child", order: order})
-				return ComposeDialer(child, &orderedResourceDialer{name: "parent", order: order})
-			},
-		},
+func TestLayerClosesOutsideIn(t *testing.T) {
+	var order []string
+	parent := &orderedSession{testSession: newTestSession(), name: "parent", order: &order}
+	layer := Layer{
+		Data:      testDialer{},
+		Sessions:  []Session{parent},
+		Resources: []io.Closer{parent},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var order []string
-			composed := tt.build(&order)
-			if _, ok := composed.(SessionOwner); ok != tt.wantSession {
-				t.Fatalf("SessionOwner = %t, want %t", ok, tt.wantSession)
-			}
-			closer, ok := composed.(io.Closer)
-			if !ok {
-				t.Fatal("composed dialer lost resource ownership")
-			}
-			if err := closer.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if len(order) != 2 || order[0] != "child" || order[1] != "parent" {
-				t.Fatalf("close order = %v, want [child parent]", order)
-			}
-		})
+	if err := layer.Append(Layer{
+		Data:      testDialer{},
+		Resources: []io.Closer{&orderedResourceDialer{name: "child", order: &order}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retireRuntime(t, NewRuntime(layer))
+	if len(order) != 2 || order[0] != "child" || order[1] != "parent" {
+		t.Fatalf("close order = %v, want [child parent]", order)
 	}
 }

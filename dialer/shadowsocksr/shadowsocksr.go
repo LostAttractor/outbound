@@ -34,48 +34,47 @@ type ShadowsocksR struct {
 	Protocol   string `json:"protocol"`
 }
 
-func NewShadowsocksR(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
+func NewShadowsocksR(link string) (dialer.Builder, *dialer.Property, error) {
 	s, err := ParseSSRURL(link)
 	if err != nil {
 		return nil, nil, err
 	}
-	return s.Dialer(option, nextDialer)
+	return s, &dialer.Property{
+		Name:     s.Name,
+		Address:  net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+		Protocol: s.Protocol,
+		Link:     s.ExportToURL(),
+	}, nil
 }
 
-func (s *ShadowsocksR) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
-	d := nextDialer
-	obfsDialer, err := obfs.NewDialer(d, &obfs.ObfsParam{
+func (s *ShadowsocksR) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
+	layer := netproxy.Layer{Data: upstream}
+	obfsDialer, err := obfs.NewDialer(layer.Data, &obfs.ObfsParam{
 		ObfsHost:  s.Server,
 		ObfsPort:  uint16(s.Port),
 		Obfs:      s.Obfs,
 		ObfsParam: s.ObfsParam,
 	})
 	if err != nil {
-		return nil, nil, err
+		return netproxy.Layer{}, err
 	}
-	d = obfsDialer
-	d, err = protocol.NewDialer("shadowsocks_stream", d, protocol.Header{
+	layer.Data = obfsDialer
+	err = layer.AppendResult(protocol.Build("shadowsocks_stream", layer.Data, protocol.Header{
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Cipher:       s.Cipher,
 		Password:     s.Password,
 		IsClient:     true,
-	})
+	}))
 	if err != nil {
-		return nil, nil, err
+		return netproxy.Layer{}, err
 	}
-	d = &proto.Dialer{
-		NextDialer:    d,
+	layer.Data = &proto.Dialer{
+		NextDialer:    layer.Data,
 		Protocol:      s.Proto,
 		ProtocolParam: s.ProtoParam,
 		ObfsOverhead:  obfsDialer.ObfsOverhead(),
 	}
-
-	return d, &dialer.Property{
-		Name:     s.Name,
-		Address:  net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-		Protocol: s.Protocol,
-		Link:     s.ExportToURL(),
-	}, nil
+	return layer, nil
 }
 
 func ParseSSRURL(u string) (data *ShadowsocksR, err error) {

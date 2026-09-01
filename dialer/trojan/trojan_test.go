@@ -21,8 +21,8 @@ func (testParentDialer) ListenPacket(context.Context, string) (net.PacketConn, e
 	return nil, nil
 }
 
-func TestGRPCShadowsocksPreservesSession(t *testing.T) {
-	d, err := (&Trojan{
+func TestGRPCShadowsocksDeclaresSessionAndOwnership(t *testing.T) {
+	layer, err := (&Trojan{
 		Server:      "example.com",
 		Port:        443,
 		Password:    "trojan-password",
@@ -30,15 +30,17 @@ func TestGRPCShadowsocksPreservesSession(t *testing.T) {
 		Type:        "grpc",
 		ServiceName: "service",
 		Encryption:  "ss;aes-128-gcm;shadowsocks-password",
-	}).Dialer(new(dialer.ExtraOption), testParentDialer{})
+	}).Build(new(dialer.ExtraOption), dialer.NewUpstream(testParentDialer{}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, ok := d.(netproxy.SessionOwner)
-	if !ok {
-		t.Fatal("gRPC session was hidden by the Shadowsocks wrapper")
+	if len(layer.Sessions) != 1 || len(layer.Resources) != 1 {
+		t.Fatalf("layer lifecycle = %d sessions, %d resources; want 1, 1", len(layer.Sessions), len(layer.Resources))
 	}
-	if err := session.Close(); err != nil {
+	if _, ok := layer.Data.(netproxy.Session); ok {
+		t.Fatal("outer Trojan data unexpectedly exposes the inner gRPC session")
+	}
+	if err := layer.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

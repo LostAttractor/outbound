@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 
@@ -16,7 +17,17 @@ import (
 )
 
 func init() {
-	protocol.Register("anytls", NewDialer)
+	protocol.RegisterLayer("anytls", func(parent netproxy.Dialer, header protocol.Header) (netproxy.Layer, error) {
+		dialer, err := NewDialer(parent, header)
+		if err != nil {
+			return netproxy.Layer{}, err
+		}
+		return netproxy.Layer{
+			Data:      dialer,
+			Sessions:  []netproxy.Session{dialer},
+			Resources: []io.Closer{dialer},
+		}, nil
+	})
 }
 
 type Dialer struct {
@@ -39,9 +50,7 @@ type Dialer struct {
 	state        *netproxy.StateBroadcaster
 }
 
-var _ netproxy.StatefulDialer = (*Dialer)(nil)
-
-func NewDialer(ParentDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+func NewDialer(ParentDialer netproxy.Dialer, header protocol.Header) (*Dialer, error) {
 	sum := sha256.Sum256([]byte(header.Password))
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Dialer{

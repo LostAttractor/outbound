@@ -2,7 +2,6 @@ package netproxy
 
 import (
 	"context"
-	"io"
 	"net"
 	"sync"
 	"syscall"
@@ -11,10 +10,10 @@ import (
 // Runtime owns one fully constructed outbound chain. Retire rejects new work
 // and releases the chain after all operations and returned connections drain.
 type Runtime struct {
-	owned   Dialer
-	dialer  Dialer
-	session Session
-	closer  io.Closer
+	layer        Layer
+	dialer       Dialer
+	session      Session
+	sessionGroup *SessionGroup
 
 	mu        sync.Mutex
 	refs      int
@@ -88,7 +87,7 @@ func (d *runtimeDialer) DialContext(ctx context.Context, network, address string
 	if !r.acquire() {
 		return nil, net.ErrClosed
 	}
-	conn, err := r.owned.DialContext(ctx, network, address)
+	conn, err := r.layer.Data.DialContext(ctx, network, address)
 	if err != nil {
 		r.release()
 		return nil, err
@@ -119,7 +118,7 @@ func (d *runtimeDialer) ListenPacket(ctx context.Context, address string) (net.P
 	if !r.acquire() {
 		return nil, net.ErrClosed
 	}
-	conn, err := r.owned.ListenPacket(ctx, address)
+	conn, err := r.layer.Data.ListenPacket(ctx, address)
 	if err != nil {
 		r.release()
 		return nil, err
@@ -146,12 +145,20 @@ func (c *runtimePacketConn) Close() error {
 	return c.PacketConn.Close()
 }
 
-func NewRuntime(owned Dialer) *Runtime {
-	runtime := &Runtime{owned: owned, done: make(chan struct{})}
+// NewRuntime transfers ownership of layer to a Runtime.
+func NewRuntime(layer Layer) *Runtime {
+	if layer.Data == nil {
+		panic(ErrMissingDialer)
+	}
+	runtime := &Runtime{layer: layer, done: make(chan struct{})}
 	runtime.dialer = &runtimeDialer{runtime: runtime}
-	runtime.closer, _ = owned.(io.Closer)
-	if session, ok := owned.(SessionOwner); ok {
-		runtime.session = &runtimeSession{Session: session, runtime: runtime}
+	switch len(layer.Sessions) {
+	case 0:
+	case 1:
+		runtime.session = &runtimeSession{Session: layer.Sessions[0], runtime: runtime}
+	default:
+		runtime.sessionGroup = NewSessionGroup(layer.Sessions...)
+		runtime.session = &runtimeSession{Session: runtime.sessionGroup, runtime: runtime}
 	}
 	return runtime
 }
@@ -159,8 +166,8 @@ func NewRuntime(owned Dialer) *Runtime {
 // Dialer returns the data-plane view. It does not expose Session or ownership.
 func (r *Runtime) Dialer() Dialer { return r.dialer }
 
-// Session returns the optional shared-connection controller. Runtime remains
-// the sole owner of its closure.
+// Session returns the optional shared-connection controller without exposing
+// resource ownership.
 func (r *Runtime) Session() (Session, bool) { return r.session, r.session != nil }
 
 func (r *Runtime) acquire() bool {
@@ -196,20 +203,12 @@ func (r *Runtime) startClose() {
 }
 
 func (r *Runtime) closeOwned() {
-	var err error
-	if r.closer != nil {
-		err = r.closer.Close()
+	if r.sessionGroup != nil {
+		r.sessionGroup.Stop()
 	}
-	r.mu.Lock()
+	err := r.layer.Close()
 	r.closeErr = err
-	r.mu.Unlock()
 	close(r.done)
-}
-
-func (r *Runtime) waitErr() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.closeErr
 }
 
 // Retire rejects new operations. Resource cleanup runs after the last active
@@ -228,16 +227,16 @@ func (r *Runtime) Retire() {
 func (r *Runtime) Wait(ctx context.Context) error {
 	select {
 	case <-r.done:
-		return r.waitErr()
+		return r.closeErr
 	default:
 	}
 	select {
 	case <-r.done:
-		return r.waitErr()
+		return r.closeErr
 	case <-ctx.Done():
 		select {
 		case <-r.done:
-			return r.waitErr()
+			return r.closeErr
 		default:
 			return ctx.Err()
 		}

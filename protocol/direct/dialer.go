@@ -161,5 +161,13 @@ func (d *directDialer) ListenPacket(ctx context.Context, _ string) (c net.Packet
 	if err != nil {
 		return nil, err
 	}
-	return &PacketConn{c, d.resolver}, nil
+	conn, ok := c.(*net.UDPConn)
+	if !ok {
+		_ = c.Close()
+		return nil, errors.New("UDP listener did not return a UDP connection")
+	}
+	return &PacketConn{
+		UDPConn:  conn,
+		resolver: d.resolver,
+	}, nil
 }

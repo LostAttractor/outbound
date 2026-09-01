@@ -16,7 +16,7 @@ import (
 	"github.com/daeuniverse/outbound/common/url"
 )
 
-type FromLinkCreator func(link string) (dialer Dialer, property *Property, err error)
+type FromLinkCreator func(link string) (builder Builder, property *Property, err error)
 
 var fromLinkCreators = make(map[string]FromLinkCreator)
 
@@ -73,7 +73,7 @@ func FromLinkRegister(name string, creator FromLinkCreator) {
 	fromLinkCreators[strings.ToLower(name)] = creator
 }
 
-func NewFromLink(link string) ([]Dialer, *Property, error) {
+func NewFromLink(link string) ([]Builder, *Property, error) {
 	/// Get overwritten name.
 	overwrittenName, linklike := common.GetTagFromLinkLikePlaintext(link)
 	linklike = strings.TrimSpace(linklike)
@@ -95,5 +95,5 @@ func NewFromLink(link string) ([]Dialer, *Property, error) {
 	if overwrittenName != "" {
 		property.Name = overwrittenName
 	}
-	return []Dialer{s}, property, nil
+	return []Builder{s}, property, nil
 }

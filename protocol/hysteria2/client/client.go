@@ -55,8 +55,6 @@ func (r *clientResource) close() error {
 	return nil
 }
 
-var _ netproxy.StatefulDialer = (*Client)(nil)
-
 func NewClient(config *Config) (*Client, error) {
 	if err := config.verifyAndFill(); err != nil {
 		return nil, err

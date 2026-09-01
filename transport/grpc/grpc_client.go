@@ -309,8 +309,6 @@ type Dialer struct {
 	lifecycle *netproxy.SingleSession[*grpc.ClientConn]
 }
 
-var _ netproxy.StatefulDialer = (*Dialer)(nil)
-
 func (d *Dialer) session() *netproxy.SingleSession[*grpc.ClientConn] {
 	d.initOnce.Do(func() {
 		d.lifecycle = netproxy.NewSingleSession(netproxy.SingleSessionConfig[*grpc.ClientConn]{
