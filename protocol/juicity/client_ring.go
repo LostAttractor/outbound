@@ -18,6 +18,7 @@ type clientRing struct {
 	current   *list.Element
 	newClient func(capabilityCallback func(n int64)) *clientImpl
 	reserved  int64
+	closed    bool
 }
 
 type clientRingNode struct {
@@ -27,11 +28,8 @@ type clientRingNode struct {
 }
 
 func newClientRing(newClient func(capabilityCallback func(n int64)) *clientImpl, reserved int64) *clientRing {
-	ring := list.New().Init()
 	return &clientRing{
-		mu:        sync.Mutex{},
-		ring:      ring,
-		current:   nil,
+		ring:      list.New(),
 		newClient: newClient,
 		reserved:  reserved,
 	}
@@ -40,6 +38,9 @@ func newClientRing(newClient func(capabilityCallback func(n int64)) *clientImpl,
 func (r *clientRing) DialContext(ctx context.Context, metadata *trojanc.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (conn *Conn, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return nil, common.ErrClientClosed
+	}
 	newCurrent := r.current
 	err = r._tryNext(&newCurrent, func(node *clientRingNode) error {
 		cap := node.capability
@@ -56,6 +57,9 @@ func (r *clientRing) DialContext(ctx context.Context, metadata *trojanc.Metadata
 func (r *clientRing) DialAuth(ctx context.Context, metadata *trojanc.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (iv []byte, psk []byte, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return nil, nil, common.ErrClientClosed
+	}
 	newCurrent := r.current
 	err = r._tryNext(&newCurrent, func(node *clientRingNode) error {
 		cap := node.capability
@@ -138,4 +142,24 @@ func (r *clientRing) passiveRemove(elem *list.Element) {
 		r.current = elem.Next()
 	}
 	r.ring.Remove(elem)
+}
+
+func (r *clientRing) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	var err error
+	for elem := r.ring.Front(); elem != nil; elem = elem.Next() {
+		if elem.Value != nil {
+			client := elem.Value.(*clientRingNode).cli
+			elem.Value = nil
+			err = errors.Join(err, client.Close())
+		}
+	}
+	r.ring.Init()
+	r.current = nil
+	return err
 }

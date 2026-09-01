@@ -3,6 +3,7 @@ package juicity
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"strconv"
@@ -19,7 +20,13 @@ import (
 )
 
 func init() {
-	protocol.Register("juicity", NewDialer)
+	protocol.RegisterLayer("juicity", func(parent netproxy.Dialer, header protocol.Header) (netproxy.Layer, error) {
+		dialer, err := NewDialer(parent, header)
+		if err != nil {
+			return netproxy.Layer{}, err
+		}
+		return netproxy.Layer{Data: dialer, Resources: []io.Closer{dialer}}, nil
+	})
 }
 
 type Dialer struct {
@@ -29,7 +36,7 @@ type Dialer struct {
 	nextDialer   netproxy.Dialer
 }
 
-func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, error) {
 	id, err := uuid.Parse(header.User)
 	if err != nil {
 		return nil, fmt.Errorf("parse UUID: %w", err)
@@ -76,6 +83,8 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		nextDialer:   nextDialer,
 	}, nil
 }
+
+func (d *Dialer) Close() error { return d.clientRing.Close() }
 
 func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
 	return d.DialContext(ctx, "tcp", addr)

@@ -91,7 +91,7 @@ type quicStreamPacketConn struct {
 	udpRelayMode          common.UdpRelayMode
 	maxUdpRelayPacketSize int
 
-	deferQuicConnFn func(quicConn *quic.Conn, err error)
+	deferQuicConnFn func(err error)
 	closeDeferFn    func()
 
 	closeOnce sync.Once
@@ -121,7 +121,7 @@ func (q *quicStreamPacketConn) close() (err error) {
 	}
 	if q.deferQuicConnFn != nil {
 		defer func() {
-			q.deferQuicConnFn(q.quicConn, err)
+			q.deferQuicConnFn(err)
 		}()
 	}
 	if q.incomingPackets != nil {
@@ -214,7 +214,7 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 	}
 	if q.deferQuicConnFn != nil {
 		defer func() {
-			q.deferQuicConnFn(q.quicConn, err)
+			q.deferQuicConnFn(err)
 		}()
 	}
 	buf := pool.GetBuffer()
@@ -256,8 +256,7 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error)
 			data := buf.Bytes()
 			err = q.quicConn.SendDatagram(data)
 		}
-		var tooLarge *quic.DatagramTooLargeError
-		if errors.As(err, &tooLarge) {
+		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			err = fragWriteNative(q.quicConn, packet, buf, int(tooLarge.MaxDatagramPayloadSize)-PacketOverHead)
 		}
 		if err != nil {

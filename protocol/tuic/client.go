@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -51,6 +52,9 @@ type clientImpl struct {
 func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (*quic.Conn, error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
+	if t.closed {
+		return nil, common.ErrClientClosed
+	}
 	if t.quicConn != nil {
 		return t.quicConn, nil
 	}
@@ -92,7 +96,7 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 
 func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 	defer func() {
-		t.deferQuicConn(quicConn, err)
+		t.deferQuicConn(err)
 	}()
 	stream, err := quicConn.OpenUniStream()
 	if err != nil {
@@ -121,7 +125,7 @@ func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 
 func (t *clientImpl) handleUniStream(quicConn *quic.Conn) (err error) {
 	defer func() {
-		t.deferQuicConn(quicConn, err)
+		t.deferQuicConn(err)
 	}()
 	for {
 		var stream *quic.ReceiveStream
@@ -132,7 +136,7 @@ func (t *clientImpl) handleUniStream(quicConn *quic.Conn) (err error) {
 		go func(stream *quic.ReceiveStream) (err error) {
 			var assocId uint16
 			defer func() {
-				t.deferQuicConn(quicConn, err)
+				t.deferQuicConn(err)
 				if err != nil && assocId != 0 {
 					if val, loaded := t.udpIncomingPacketsMap.LoadAndDelete(assocId); loaded {
 						val.(*Packets).Close()
@@ -168,7 +172,7 @@ func (t *clientImpl) handleUniStream(quicConn *quic.Conn) (err error) {
 
 func (t *clientImpl) handleMessage(quicConn *quic.Conn) (err error) {
 	defer func() {
-		t.deferQuicConn(quicConn, err)
+		t.deferQuicConn(err)
 	}()
 	for {
 		// TODO:
@@ -181,7 +185,7 @@ func (t *clientImpl) handleMessage(quicConn *quic.Conn) (err error) {
 		go func(message []byte) (err error) {
 			var assocId uint16
 			defer func() {
-				t.deferQuicConn(quicConn, err)
+				t.deferQuicConn(err)
 				if err != nil && assocId != 0 {
 					if val, loaded := t.udpIncomingPacketsMap.LoadAndDelete(assocId); loaded {
 						val.(*Packets).Close()
@@ -218,71 +222,58 @@ func (t *clientImpl) handleMessage(quicConn *quic.Conn) (err error) {
 	}
 }
 
-func (t *clientImpl) deferQuicConn(quicConn *quic.Conn, err error) {
+func (t *clientImpl) deferQuicConn(err error) {
 	if err != nil && !strings.Contains(err.Error(), common.ErrTooManyOpenStreams.Error()) {
-		t.forceClose(quicConn, err)
+		_ = t.forceClose(err)
 	}
 }
 
-func (t *clientImpl) forceClose(quicConn *quic.Conn, err error) {
+func (t *clientImpl) forceClose(cause error) error {
 	t.connMutex.Lock()
+	defer t.connMutex.Unlock()
 	if t.closed {
-		t.connMutex.Unlock()
-		return
+		return nil
 	}
 	t.closed = true
 	if t.onClose != nil {
 		go t.onClose()
 		t.onClose = nil
 	}
-	t.connMutex.Unlock()
-	// Give 10s for closing.
-	time.AfterFunc(10*time.Second, func() {
-		t.connMutex.Lock()
-		defer t.connMutex.Unlock()
-		if quicConn == nil {
-			quicConn = t.quicConn
+	quicConn := t.quicConn
+	t.quicConn = nil
+
+	var err error
+	if quicConn != nil {
+		message := ""
+		if cause != nil {
+			message = cause.Error()
 		}
-		if quicConn != nil {
-			if quicConn == t.quicConn {
-				t.quicConn = nil
-			}
-		}
-		errStr := ""
-		if err != nil {
-			errStr = err.Error()
-		}
-		if quicConn != nil {
-			_ = quicConn.CloseWithError(ProtocolError, errStr)
-		}
-		if t.underConn != nil {
-			err = t.underConn.Close()
-			t.underConn = nil
-		}
-		t.udpIncomingPacketsMap.Range(func(key, value any) bool {
-			_ = value.(*Packets).Close()
-			t.udpIncomingPacketsMap.Delete(key)
-			return true
-		})
+		err = errors.Join(err, quicConn.CloseWithError(ProtocolError, message))
+	}
+	if t.underConn != nil {
+		err = errors.Join(err, t.underConn.Close())
+		t.underConn = nil
+	}
+	t.udpIncomingPacketsMap.Range(func(key, value any) bool {
+		err = errors.Join(err, value.(*Packets).Close())
+		t.udpIncomingPacketsMap.Delete(key)
+		return true
 	})
+	return err
 }
 
 func (t *clientImpl) Close() error {
-	t.forceClose(nil, common.ErrClientClosed)
-	return nil
+	return t.forceClose(common.ErrClientClosed)
 }
 
 func (t *clientImpl) DialContextWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (netproxy.Conn, error) {
-	if t.closed {
-		return nil, common.ErrClientClosed
-	}
 	quicConn, err := t.getQuicConn(ctx, dialer, dialFn)
 	if err != nil {
 		return nil, err
 	}
 	stream, err := func() (stream net.Conn, err error) {
 		defer func() {
-			t.deferQuicConn(quicConn, err)
+			t.deferQuicConn(err)
 		}()
 		connect := NewConnect(NewAddress(metadata), Ver5)
 		buf := pool.Get(connect.BytesLen())
@@ -315,9 +306,6 @@ func (t *clientImpl) DialContextWithDialer(ctx context.Context, metadata *protoc
 }
 
 func (t *clientImpl) ListenPacketWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (*quicStreamPacketConn, error) {
-	if t.closed {
-		return nil, common.ErrClientClosed
-	}
 	quicConn, err := t.getQuicConn(ctx, dialer, dialFn)
 	if err != nil {
 		return nil, err

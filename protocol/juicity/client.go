@@ -3,11 +3,11 @@ package juicity
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -92,6 +92,9 @@ type clientImpl struct {
 func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (*quic.Conn, error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
+	if t.Ctx.Err() != nil {
+		return nil, common.ErrClientClosed
+	}
 	if t.quicConn != nil {
 		return t.quicConn, nil
 	}
@@ -158,9 +161,9 @@ func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 
 func (t *clientImpl) Close() (err error) {
 	t.connMutex.Lock()
+	defer t.connMutex.Unlock()
 	select {
 	case <-t.Ctx.Done():
-		t.connMutex.Unlock()
 		return
 	default:
 		t.Cancel()
@@ -169,20 +172,14 @@ func (t *clientImpl) Close() (err error) {
 		go t.detachCallback()
 		t.detachCallback = nil
 	}
-	t.connMutex.Unlock()
-	// Give 10s for closing.
-	time.AfterFunc(10*time.Second, func() {
-		t.connMutex.Lock()
-		defer t.connMutex.Unlock()
-		if t.quicConn != nil {
-			err = t.quicConn.CloseWithError(tuic.ProtocolError, common.ErrClientClosed.Error())
-			t.quicConn = nil
-		}
-		if t.underConn != nil {
-			err = t.underConn.Close()
-			t.underConn = nil
-		}
-	})
+	if t.quicConn != nil {
+		err = errors.Join(err, t.quicConn.CloseWithError(tuic.ProtocolError, common.ErrClientClosed.Error()))
+		t.quicConn = nil
+	}
+	if t.underConn != nil {
+		err = errors.Join(err, t.underConn.Close())
+		t.underConn = nil
+	}
 	return err
 }
 

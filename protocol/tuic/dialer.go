@@ -3,6 +3,7 @@ package tuic
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -16,7 +17,13 @@ import (
 )
 
 func init() {
-	protocol.Register("tuic", NewDialer)
+	protocol.RegisterLayer("tuic", func(parent netproxy.Dialer, header protocol.Header) (netproxy.Layer, error) {
+		dialer, err := NewDialer(parent, header)
+		if err != nil {
+			return netproxy.Layer{}, err
+		}
+		return netproxy.Layer{Data: dialer, Resources: []io.Closer{dialer}}, nil
+	})
 }
 
 type Dialer struct {
@@ -27,7 +34,7 @@ type Dialer struct {
 	metadata     protocol.Metadata
 }
 
-func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, error) {
 	metadata := protocol.Metadata{
 		IsClient: header.IsClient,
 	}
@@ -75,6 +82,8 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		metadata:     metadata,
 	}, nil
 }
+
+func (d *Dialer) Close() error { return d.clientRing.Close() }
 
 func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
 	return d.DialContext(ctx, "tcp", addr)
