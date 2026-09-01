@@ -75,9 +75,7 @@ func (p *smuxPool) activateLocked(slot *smuxSlot) {
 	slot.activated = true
 	slot.state = slot.lifecycle.Snapshot()
 	events := slot.lifecycle.WatchState(p.ctx)
-	p.watchers.Add(1)
-	go func() {
-		defer p.watchers.Done()
+	p.watchers.Go(func() {
 		for event := range events {
 			p.mu.Lock()
 			if p.ctx.Err() != nil {
@@ -90,7 +88,7 @@ func (p *smuxPool) activateLocked(slot *smuxSlot) {
 			}
 			p.mu.Unlock()
 		}
-	}()
+	})
 }
 
 func (p *smuxPool) syncSlotStateLocked(slot *smuxSlot) {

@@ -114,9 +114,7 @@ func (s *WsConfig) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (
 		Path:   s.Path,
 	}
 	ws := &Ws{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: upstream,
-		},
+		ParentDialer:   upstream,
 		wsAddr:         wsUrl.String(),
 		passthroughUdp: s.PassthroughUdp,
 		header:         http.Header{},

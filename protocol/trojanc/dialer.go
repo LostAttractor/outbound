@@ -22,9 +22,7 @@ type Dialer struct {
 
 func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
 	return &Dialer{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: parentDialer,
-		},
+		ParentDialer: parentDialer,
 		proxyAddress: header.ProxyAddress,
 		password:     header.Password,
 	}, nil

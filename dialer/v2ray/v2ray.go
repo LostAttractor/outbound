@@ -82,6 +82,7 @@ func NewV2Ray(link string) (dialer.Builder, *dialer.Property, error) {
 
 func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (layer netproxy.Layer, err error) {
 	layer.Data = upstream
+	proxyAddress := net.JoinHostPort(s.Add, s.Port)
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, layer.Close())
@@ -100,6 +101,10 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		err = fmt.Errorf("only VLESS supports reality")
 		return
 	}
+	sni := s.SNI
+	if sni == "" {
+		sni = s.Host
+	}
 
 	switch strings.ToLower(s.Net) {
 	case "ws":
@@ -107,21 +112,17 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		if s.TLS == "tls" || s.TLS == "reality" {
 			scheme = "wss"
 		}
-		sni := s.SNI
-		if sni == "" {
-			sni = s.Host
-		}
 		host := s.Host
 		if host == "" {
 			host = s.Add
 		}
 		wsBuilder := &ws.WsConfig{
 			Scheme:        scheme,
-			Host:          net.JoinHostPort(s.Add, s.Port),
+			Host:          proxyAddress,
 			Path:          s.Path,
 			Hostname:      host,
 			Sni:           sni,
-			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
+			AllowInsecure: s.AllowInsecure,
 		}
 		if err = layer.AppendResult(wsBuilder.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
 			return
@@ -132,14 +133,10 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 			return
 		}
 		if s.TLS == "tls" || s.TLS == "reality" {
-			sni := s.SNI
-			if sni == "" {
-				sni = s.Host
-			}
 			if s.TLS == "reality" {
 				u := url.URL{
 					Scheme: "reality",
-					Host:   net.JoinHostPort(s.Add, s.Port),
+					Host:   proxyAddress,
 					RawQuery: url.Values{
 						"sni": []string{sni},
 						"fp":  []string{s.Fingerprint},
@@ -151,9 +148,9 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 				layer.Data, err = tls.NewReality(u.String(), layer.Data)
 			} else {
 				tlsConfig := tls.TLSConfig{
-					Host:          net.JoinHostPort(s.Add, s.Port),
+					Host:          proxyAddress,
 					Sni:           sni,
-					AllowInsecure: s.AllowInsecure || option.AllowInsecure,
+					AllowInsecure: s.AllowInsecure,
 				}
 				err = layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data)))
 			}
@@ -162,20 +159,12 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 			}
 		}
 	case "grpc":
-		sni := s.SNI
-		if sni == "" {
-			sni = s.Host
-		}
-		serviceName := s.Path
-		if serviceName == "" {
-			serviceName = "GunService"
-		}
 		transport := &grpc.Dialer{
-			StatelessDialer: protocol.StatelessDialer{ParentDialer: layer.Data},
-			ServiceName:     serviceName,
-			ServerName:      sni,
-			Address:         net.JoinHostPort(s.Add, s.Port),
-			AllowInsecure:   s.AllowInsecure || option.AllowInsecure,
+			ParentDialer:  layer.Data,
+			ServiceName:   s.Path,
+			ServerName:    sni,
+			Address:       proxyAddress,
+			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
 		}
 		layer.Data = transport
 		layer.Sessions = append(layer.Sessions, transport)
@@ -191,16 +180,14 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		}
 		u := url.URL{
 			Scheme: scheme,
-			Host:   net.JoinHostPort(s.Add, s.Port),
+			Host:   proxyAddress,
 			Path:   s.Path,
 			RawQuery: url.Values{
-				"sni":               []string{sni},
-				"allowInsecure":     []string{common.BoolToString(s.AllowInsecure || option.AllowInsecure)},
-				"tlsImplementation": []string{option.TlsImplementation},
-				"utlsImitate":       []string{option.UtlsImitate},
-				"host":              []string{s.Host},
-				"alpn":              []string{s.Alpn},
-				"transport":         []string{"1"},
+				"sni":           []string{sni},
+				"allowInsecure": []string{common.BoolToString(s.AllowInsecure)},
+				"host":          []string{s.Host},
+				"alpn":          []string{s.Alpn},
+				"transport":     []string{"1"},
 			}.Encode(),
 		}
 		if err = layer.AppendResult(http.BuildHTTPProxy(&u, option, layer.Data)); err != nil {
@@ -214,7 +201,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 
 		u := url.URL{
 			Scheme: "meek",
-			Host:   net.JoinHostPort(s.Add, s.Port),
+			Host:   proxyAddress,
 			RawQuery: url.Values{
 				"url":           []string{s.Path},
 				"alpn":          []string{s.Alpn},
@@ -237,7 +224,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		}
 		u := url.URL{
 			Scheme: scheme,
-			Host:   net.JoinHostPort(s.Add, s.Port),
+			Host:   proxyAddress,
 			RawQuery: url.Values{
 				"host":          []string{s.Host},
 				"path":          []string{s.Path},
@@ -255,16 +242,13 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 	}
 
 	err = layer.AppendResult(protocol.Build(s.Protocol, layer.Data, protocol.Header{
-		ProxyAddress: net.JoinHostPort(s.Add, s.Port),
+		ProxyAddress: proxyAddress,
 		Cipher:       getAutoCipher(),
 		Password:     s.ID,
 		Feature1:     s.Flow,
 		//Flags:        protocol.Flags_VMess_UsePacketAddr,
 	}))
-	if err != nil {
-		return
-	}
-	return layer, nil
+	return
 }
 
 func ParseVlessURL(vless string) (data *V2Ray, err error) {

@@ -41,9 +41,7 @@ type TLSConfig struct {
 // NewTls returns a Tls infra.
 func (s *TLSConfig) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
 	t := &Tls{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: upstream,
-		},
+		ParentDialer:    upstream,
 		addr:            s.Host,
 		tlsImplentation: option.TlsImplementation,
 		utlsImitate:     option.UtlsImitate,

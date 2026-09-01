@@ -33,9 +33,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 	//log.Trace("shadowsocks.NewDialer: metadata: %v, password: %v", metadata, password)
 	return &Dialer{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: nextDialer,
-		},
+		ParentDialer: nextDialer,
 		proxyAddress: header.ProxyAddress,
 		conf:         conf,
 		key:          key,

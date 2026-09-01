@@ -54,9 +54,7 @@ func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.D
 		return nil, err
 	}
 	return &Dialer{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: parentDialer,
-		},
+		ParentDialer:       parentDialer,
 		proxyAddress:       header.ProxyAddress,
 		conf:               conf,
 		pskList:            pskList,

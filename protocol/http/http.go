@@ -29,53 +29,51 @@ type HttpProxy struct {
 }
 
 func BuildHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Layer, error) {
+	query := u.Query()
 	layer := netproxy.Layer{Data: parentDialer}
-	s := &HttpProxy{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: layer.Data,
-		},
-		Addr: u.Host,
-		Path: u.Path,
-		Host: u.Query().Get("host"),
-	}
-	if !strings.HasPrefix(s.Path, "/") {
-		s.Path = "/" + s.Path
-	}
-
-	if u.User != nil {
-		s.HaveAuth = true
-		s.Username = u.User.Username()
-		s.Password, _ = u.User.Password()
-	}
-
-	s.transport, _ = strconv.ParseBool(u.Query().Get("transport"))
-
-	if u.Scheme == "https" {
-		s.https = true
-		alpn := u.Query().Get("alpn")
+	https := u.Scheme == "https"
+	if https {
+		alpn := query.Get("alpn")
 		if alpn == "" {
 			alpn = "h2,http/1.1"
 		}
-		allowInsecure, _ := strconv.ParseBool(u.Query().Get("allowInsecure"))
+		allowInsecure, _ := strconv.ParseBool(query.Get("allowInsecure"))
 		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(u.Query().Get("allow_insecure"))
+			allowInsecure, _ = strconv.ParseBool(query.Get("allow_insecure"))
 		}
 		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(u.Query().Get("allowinsecure"))
+			allowInsecure, _ = strconv.ParseBool(query.Get("allowinsecure"))
 		}
 		if !allowInsecure {
-			allowInsecure, _ = strconv.ParseBool(u.Query().Get("skipVerify"))
+			allowInsecure, _ = strconv.ParseBool(query.Get("skipVerify"))
 		}
 		tlsConfig := tls2.TLSConfig{
 			Host:          u.Host,
 			Alpn:          alpn,
-			Sni:           u.Query().Get("sni"),
+			Sni:           query.Get("sni"),
 			AllowInsecure: allowInsecure,
 		}
 		if err := layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
 			return netproxy.Layer{}, err
 		}
-		s.ParentDialer = layer.Data
+	}
+	path := u.Path
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	transport, _ := strconv.ParseBool(query.Get("transport"))
+	s := &HttpProxy{
+		ParentDialer: layer.Data,
+		https:        https,
+		transport:    transport,
+		Addr:         u.Host,
+		Path:         path,
+		Host:         query.Get("host"),
+	}
+	if u.User != nil {
+		s.HaveAuth = true
+		s.Username = u.User.Username()
+		s.Password, _ = u.User.Password()
 	}
 	s.pool = newH2ConnsPool(s.ParentDialer, s.Addr)
 	layer.Data = s

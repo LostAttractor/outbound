@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 )
 
 type blockingDialer struct {
@@ -29,10 +28,10 @@ func (d *blockingDialer) ListenPacket(context.Context, string) (net.PacketConn, 
 func TestCloseCancelsConnect(t *testing.T) {
 	parent := &blockingDialer{started: make(chan struct{})}
 	dialer := &Dialer{
-		StatelessDialer: protocol.StatelessDialer{ParentDialer: parent},
-		Address:         "proxy.example:443",
-		ServerName:      "proxy.example",
-		AllowInsecure:   true,
+		ParentDialer:  parent,
+		Address:       "proxy.example:443",
+		ServerName:    "proxy.example",
+		AllowInsecure: true,
 	}
 	result := make(chan error, 1)
 	go func() { result <- dialer.Connect(context.Background()) }()

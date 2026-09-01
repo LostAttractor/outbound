@@ -65,10 +65,10 @@ func NewDialerFactory(proto protocol.Protocol) protocol.LayerCreator {
 		d.protocol = proto
 		if proto == protocol.ProtocolVMessTlsGrpc {
 			transport := &grpc.Dialer{
-				StatelessDialer: protocol.StatelessDialer{ParentDialer: nextDialer},
-				ServiceName:     d.grpcServiceName,
-				ServerName:      d.proxySNI,
-				Address:         d.proxyAddress,
+				ParentDialer: nextDialer,
+				ServiceName:  d.grpcServiceName,
+				ServerName:   d.proxySNI,
+				Address:      d.proxyAddress,
 			}
 			d.nextDialer = transport
 			return netproxy.Layer{

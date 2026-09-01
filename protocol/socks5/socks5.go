@@ -43,12 +43,10 @@ func NewSocks5(s string, d netproxy.Dialer) (*Socks5, error) {
 	pass, _ := u.User.Password()
 
 	h := &Socks5{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: d,
-		},
-		addr:     addr,
-		user:     user,
-		password: pass,
+		ParentDialer: d,
+		addr:         addr,
+		user:         user,
+		password:     pass,
 	}
 
 	return h, nil

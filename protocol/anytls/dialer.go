@@ -54,9 +54,7 @@ func NewDialer(ParentDialer netproxy.Dialer, header protocol.Header) (*Dialer, e
 	sum := sha256.Sum256([]byte(header.Password))
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Dialer{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: ParentDialer,
-		},
+		ParentDialer: ParentDialer,
 		proxyAddress: header.ProxyAddress,
 		key:          sum[:],
 		tlsConfig:    header.TlsConfig,
@@ -216,9 +214,7 @@ func (d *Dialer) openContext[T interface{ Close() error }](ctx context.Context, 
 		err   error
 	}
 	results := make(chan result)
-	d.workers.Add(1)
-	go func() {
-		defer d.workers.Done()
+	d.workers.Go(func() {
 		value, err := open()
 		select {
 		case results <- result{value: value, err: err}:
@@ -227,7 +223,7 @@ func (d *Dialer) openContext[T interface{ Close() error }](ctx context.Context, 
 				_ = value.Close()
 			}
 		}
-	}()
+	})
 	select {
 	case result := <-results:
 		if result.err != nil {
@@ -295,12 +291,10 @@ func (d *Dialer) createSession(ctx context.Context) (*session, error) {
 	d.sessions[s] = struct{}{}
 	d.state.Transition(netproxy.SessionConnected, nil)
 	d.idleSessionLock.Unlock()
-	d.workers.Add(1)
-	go func() {
-		defer d.workers.Done()
+	d.workers.Go(func() {
 		err := s.run()
 		d.sessionClosed(s, err)
-	}()
+	})
 
 	return s, nil
 }

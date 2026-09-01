@@ -38,11 +38,9 @@ func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 	}
 
 	t := &Dialer{
-		StatelessDialer: protocol.StatelessDialer{
-			ParentDialer: d,
-		},
-		addr: u.Host,
-		path: path,
+		ParentDialer: d,
+		addr:         u.Host,
+		path:         path,
 	}
 
 	if query.Get("allowInsecure") == "true" || query.Get("allowInsecure") == "1" ||

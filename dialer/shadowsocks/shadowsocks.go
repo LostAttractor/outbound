@@ -49,6 +49,8 @@ func NewShadowsocks(link string) (dialer.Builder, *dialer.Property, error) {
 
 func (s *Shadowsocks) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (layer netproxy.Layer, err error) {
 	layer.Data = upstream
+	proxyAddress := net.JoinHostPort(s.Server, strconv.Itoa(s.Port))
+	opts := s.Plugin.Opts
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, layer.Close())
@@ -58,33 +60,30 @@ func (s *Shadowsocks) Build(option *dialer.ExtraOption, upstream dialer.Upstream
 
 	switch s.Plugin.Name {
 	case "simple-obfs":
-		obfsType, obfsErr := simpleobfs.NewObfsType(s.Plugin.Opts.Obfs)
+		obfsType, obfsErr := simpleobfs.NewObfsType(opts.Obfs)
 		if obfsErr != nil {
 			err = obfsErr
 			return
 		}
-		host := s.Plugin.Opts.Host
+		host := opts.Host
 		if host == "" {
 			host = "cloudflare.com"
 		}
 		layer.Data = &simpleobfs.SimpleObfs{
-			StatelessDialer: protocol.StatelessDialer{
-				ParentDialer: layer.Data,
-			},
-			Addr:     net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-			ObfsType: obfsType,
-			Host:     host,
-			Path:     s.Plugin.Opts.Path,
+			ParentDialer: layer.Data,
+			Addr:         proxyAddress,
+			ObfsType:     obfsType,
+			Host:         host,
+			Path:         opts.Path,
 		}
 	case "v2ray-plugin":
 		// https://github.com/teddysun/v2ray-plugin
-		switch s.Plugin.Opts.Obfs {
+		switch opts.Obfs {
 		case "":
-			if s.Plugin.Opts.Tls == "tls" {
+			if opts.Tls == "tls" {
 				tlsConfig := tls.TLSConfig{
-					Host:           net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-					Sni:            s.Plugin.Opts.Host,
-					AllowInsecure:  option.AllowInsecure,
+					Host:           proxyAddress,
+					Sni:            opts.Host,
 					PassthroughUdp: true,
 				}
 				if err = layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
@@ -93,23 +92,21 @@ func (s *Shadowsocks) Build(option *dialer.ExtraOption, upstream dialer.Upstream
 			}
 			wsConfig := ws.WsConfig{
 				Scheme:         "ws",
-				Host:           net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+				Host:           proxyAddress,
 				Path:           "/",
-				Hostname:       s.Plugin.Opts.Host,
+				Hostname:       opts.Host,
 				PassthroughUdp: true,
 			}
 			if err = layer.AppendResult(wsConfig.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
 				return
 			}
 			layer.Data = &mux.Mux{
-				StatelessDialer: protocol.StatelessDialer{
-					ParentDialer: layer.Data,
-				},
-				Addr:           net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+				ParentDialer:   layer.Data,
+				Addr:           proxyAddress,
 				PassthroughUdp: true,
 			}
 		default:
-			err = fmt.Errorf("unsupported mode %v of plugin %v", s.Plugin.Opts.Obfs, s.Plugin.Name)
+			err = fmt.Errorf("unsupported mode %v of plugin %v", opts.Obfs, s.Plugin.Name)
 			return
 		}
 	}
@@ -127,14 +124,11 @@ func (s *Shadowsocks) Build(option *dialer.ExtraOption, upstream dialer.Upstream
 		return
 	}
 	err = layer.AppendResult(protocol.Build(typeName, layer.Data, protocol.Header{
-		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+		ProxyAddress: proxyAddress,
 		Cipher:       s.Cipher,
 		Password:     s.Password,
 	}))
-	if err != nil {
-		return
-	}
-	return layer, nil
+	return
 }
 
 func ParseSSURL(ssurl string) (data *Shadowsocks, err error) {

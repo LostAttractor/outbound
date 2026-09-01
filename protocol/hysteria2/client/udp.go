@@ -125,8 +125,7 @@ func (u *udpConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	buf := pool.GetBuffer(protocol.MaxUDPSize)
 	defer pool.PutBuffer(buf)
 	err = u.WritePacket(buf, msg)
-	var errTooLarge *quic.DatagramTooLargeError
-	if errors.As(err, &errTooLarge) {
+	if errTooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 		// Message too large, try fragmentation
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
 		fMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
@@ -137,9 +136,8 @@ func (u *udpConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 			}
 		}
 		return len(b), nil
-	} else {
-		return len(b), err
 	}
+	return len(b), err
 }
 
 func (u *udpConn) WritePacket(buf []byte, msg *protocol.UDPMessage) error {
