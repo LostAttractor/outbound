@@ -42,6 +42,9 @@ func newClientRing(newClient func(capabilityCallback func(n int64)) *clientImpl,
 }
 
 func (r *clientRing) DialContext(ctx context.Context, metadata *Metadata) (conn *Conn, err error) {
+	if r.ctx.Err() != nil {
+		return nil, common.ErrClientClosed
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(r.ctx, cancel)
 	defer stop()
@@ -68,6 +71,9 @@ func (r *clientRing) DialContext(ctx context.Context, metadata *Metadata) (conn 
 }
 
 func (r *clientRing) DialAuth(ctx context.Context, metadata *Metadata) (auth *UnderlayAuth, err error) {
+	if r.ctx.Err() != nil {
+		return nil, common.ErrClientClosed
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(r.ctx, cancel)
 	defer stop()

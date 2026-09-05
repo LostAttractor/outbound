@@ -44,6 +44,9 @@ func newClientRing(newClient func(capabilityCallback func(n int64)) *clientImpl,
 }
 
 func (r *clientRing) DialContext(ctx context.Context, metadata *protocol.Metadata) (conn net.Conn, err error) {
+	if r.ctx.Err() != nil {
+		return nil, common.ErrClientClosed
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(r.ctx, cancel)
 	defer stop()
