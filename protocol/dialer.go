@@ -31,7 +31,3 @@ func Build(name string, parentDialer netproxy.Dialer, header Header) (netproxy.L
 	}
 	return creator(parentDialer, header)
 }
-
-type StatelessDialer struct {
-	ParentDialer netproxy.Dialer
-}

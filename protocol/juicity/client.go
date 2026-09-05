@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 
@@ -13,7 +12,6 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol/trojanc"
 	"github.com/daeuniverse/outbound/protocol/tuic"
 	"github.com/daeuniverse/outbound/protocol/tuic/common"
 	"github.com/daeuniverse/quic-go"
@@ -36,35 +34,8 @@ func init() {
 type UnderlayAuth struct {
 	IV       []byte
 	Psk      []byte
-	Metadata *trojanc.Metadata
-}
-
-func (a *UnderlayAuth) PackFromPool() (buf pool.PB) {
-	buf = pool.Get(a.Metadata.Len() + len(a.IV) + len(a.Psk))
-	copy(buf, a.IV)
-	copy(buf[len(a.IV):], a.Psk)
-	a.Metadata.PackTo(buf[len(a.IV)+len(a.Psk):])
-	return buf
-}
-
-func (a *UnderlayAuth) Unpack(r io.Reader) (n int, err error) {
-	var _n int
-	a.IV = make([]byte, CipherConf.SaltLen)
-	if _n, err = io.ReadFull(r, a.IV); err != nil {
-		return 0, err
-	}
-	n += _n
-	a.Psk = make([]byte, CipherConf.KeyLen)
-	if _n, err = io.ReadFull(r, a.Psk); err != nil {
-		return 0, err
-	}
-	n += _n
-	a.Metadata = &trojanc.Metadata{}
-	if _n, err = a.Metadata.Unpack(r); err != nil {
-		return 0, err
-	}
-	n += _n
-	return n, nil
+	Metadata *Metadata
+	lease    *netproxy.Lease
 }
 
 type ClientOption struct {
@@ -84,9 +55,13 @@ type clientImpl struct {
 
 	quicConn  *quic.Conn
 	underConn net.PacketConn
+	transport *quic.Transport
 	connMutex sync.Mutex
 
 	detachCallback func()
+	resource       netproxy.ResourceRef
+	lease          *netproxy.Lease
+	poolState      *common.QUICPoolState
 }
 
 func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, dialFn common.DialFunc) (*quic.Conn, error) {
@@ -96,7 +71,13 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 		return nil, common.ErrClientClosed
 	}
 	if t.quicConn != nil {
+		if t.quicConn.Context().Err() != nil || !t.lease.Valid() {
+			return nil, common.ErrClientClosed
+		}
 		return t.quicConn, nil
+	}
+	if t.resource == (netproxy.ResourceRef{}) {
+		t.resource = netproxy.NewResourceRef()
 	}
 	transport, addr, err := dialFn(ctx, dialer)
 	if err != nil {
@@ -111,36 +92,69 @@ func (t *clientImpl) getQuicConn(ctx context.Context, dialer netproxy.Dialer, di
 
 	common.SetCongestionController(quicConn, t.CongestionController, t.CWND)
 
-	go func() {
-		if err := t.sendAuthentication(quicConn); err != nil {
-			_ = t.Close()
-		}
-	}()
-
+	authStream, err := t.openAuthentication(ctx, quicConn)
+	if err != nil {
+		_ = quicConn.CloseWithError(tuic.ProtocolError, "authentication failed")
+		_ = transport.Close()
+		_ = transport.Conn.Close()
+		return nil, common.WrapQUICError(err, t.resource, nil, netproxy.OpHandshake, nil)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = quicConn.CloseWithError(0, "establishment canceled")
+		_ = transport.Close()
+		_ = transport.Conn.Close()
+		return nil, err
+	}
+	t.lease = netproxy.NewLease(t.resource, netproxy.DependencyOf(transport.Conn))
+	if !t.lease.Valid() {
+		_ = quicConn.CloseWithError(0, "dependency invalidated during establishment")
+		_ = transport.Close()
+		_ = transport.Conn.Close()
+		return nil, t.lease.Cause()
+	}
+	t.transport = transport
 	t.underConn = transport.Conn
 	t.quicConn = quicConn
+	if t.poolState != nil {
+		t.poolState.Ready(t.resource)
+	}
+	go func() {
+		if err := t.sendAuthentication(authStream); err != nil {
+			t.failConnection(err)
+		}
+	}()
+	go func() {
+		select {
+		case <-quicConn.Context().Done():
+			t.failConnection(context.Cause(quicConn.Context()))
+		case <-t.lease.Done():
+			t.failConnection(t.lease.Cause())
+		}
+	}()
 	return quicConn, nil
 }
 
-func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
+func (t *clientImpl) openAuthentication(ctx context.Context, quicConn *quic.Conn) (*quic.SendStream, error) {
 	uniStream, err := quicConn.OpenUniStream()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	buf := pool.GetBuffer()
-	defer pool.PutBuffer(buf)
-	token, err := tuic.GenToken(quicConn.ConnectionState(), t.Uuid, t.Password)
-	if err != nil {
-		return err
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { uniStream.CancelWrite(0); close(done) })
+	defer func() {
+		if !stop() {
+			<-done
+		}
+	}()
+	if err = tuic.WriteAuthentication(uniStream, Version0, quicConn.ConnectionState(), t.Uuid, t.Password); err != nil {
+		uniStream.CancelWrite(0)
+		return nil, err
 	}
-	err = tuic.NewAuthenticate(t.Uuid, token, Version0).WriteTo(buf)
-	if err != nil {
-		return err
-	}
-	_, err = buf.WriteTo(uniStream)
-	if err != nil {
-		return err
-	}
+
+	return uniStream, nil
+}
+
+func (t *clientImpl) sendAuthentication(uniStream *quic.SendStream) error {
 	defer uniStream.Close()
 	for {
 		var auth *UnderlayAuth
@@ -149,14 +163,34 @@ func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 			return t.Ctx.Err()
 		case auth = <-t.UnderlayAuth:
 		}
-		buf := auth.PackFromPool()
-		_, err = uniStream.Write(buf)
-		buf.Put()
+		buf := pool.GetBytesBuffer()
+		buf.Write(auth.IV)
+		buf.Write(auth.Psk)
+		err := auth.Metadata.appendTo(buf)
+		if err == nil {
+			_, err = buf.WriteTo(uniStream)
+		}
+		pool.PutBytesBuffer(buf)
 		if err != nil {
-			t.Close()
 			return err
 		}
 	}
+}
+
+func (t *clientImpl) failConnection(cause error) {
+	if cause == nil {
+		cause = net.ErrClosed
+	}
+	failure := netproxy.ClassifyFailure(common.WrapQUICError(cause, t.resource, nil, netproxy.OpRead, nil))
+	failure.Scope = netproxy.ScopeSharedResource
+	wrapped := netproxy.WrapFailure(cause, failure)
+	if t.lease != nil {
+		t.lease.Invalidate(wrapped)
+	}
+	if t.poolState != nil {
+		t.poolState.Failed(t.resource, wrapped)
+	}
+	_ = t.Close()
 }
 
 func (t *clientImpl) Close() (err error) {
@@ -168,6 +202,12 @@ func (t *clientImpl) Close() (err error) {
 	default:
 		t.Cancel()
 	}
+	if t.lease != nil {
+		t.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: t.resource, Scope: netproxy.ScopeSharedResource, Layer: netproxy.LayerQUIC, Origin: netproxy.OriginLocalCleanup, Reason: netproxy.ReasonClosed}))
+	}
+	if t.poolState != nil {
+		t.poolState.Failed(t.resource, net.ErrClosed)
+	}
 	if t.detachCallback != nil {
 		go t.detachCallback()
 		t.detachCallback = nil
@@ -176,6 +216,10 @@ func (t *clientImpl) Close() (err error) {
 		err = errors.Join(err, t.quicConn.CloseWithError(tuic.ProtocolError, common.ErrClientClosed.Error()))
 		t.quicConn = nil
 	}
+	if t.transport != nil {
+		err = errors.Join(err, t.transport.Close())
+		t.transport = nil
+	}
 	if t.underConn != nil {
 		err = errors.Join(err, t.underConn.Close())
 		t.underConn = nil
@@ -183,7 +227,7 @@ func (t *clientImpl) Close() (err error) {
 	return err
 }
 
-func (t *clientImpl) DialContext(ctx context.Context, metadata *trojanc.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (*Conn, error) {
+func (t *clientImpl) DialContext(ctx context.Context, metadata *Metadata) (*Conn, error) {
 	select {
 	case <-t.Ctx.Done():
 		return nil, common.ErrClientClosed
@@ -191,53 +235,60 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *trojanc.Metadata
 		return nil, ctx.Err()
 	default:
 	}
-	quicConn, err := t.getQuicConn(ctx, dialer, dialFn)
+	quicConn, err := t.currentConn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getQuicConn: %w", err)
 	}
 	quicStream, err := quicConn.OpenStream()
 	if err != nil {
-		t.connMutex.Lock()
-		// Detach it from pool due to bad connection.
-		if t.detachCallback != nil {
-			go t.detachCallback()
-			t.detachCallback = nil
-		}
-		t.connMutex.Unlock()
-		return nil, fmt.Errorf("OpenStream: %w", err)
+		return nil, common.WrapQUICError(err, t.resource, nil, netproxy.OpOpenStream, t.failConnection)
 	}
-	stream := NewConn(
-		quicStream,
-		metadata,
-		nil,
-	)
+
+	stream := newConn(quicStream, metadata)
+	stream.lease, stream.fail = t.lease.NewStream(), t.failConnection
+	if !stream.lease.Valid() {
+		quicStream.CancelRead(0)
+		quicStream.CancelWrite(0)
+		return nil, stream.lease.Cause()
+	}
+	stream.lAddr, stream.rAddr = quicConn.LocalAddr(), quicConn.RemoteAddr()
 	return stream, nil
 }
-func (t *clientImpl) DialAuth(ctx context.Context, metadata *trojanc.Metadata, dialer netproxy.Dialer, dialFn common.DialFunc) (iv []byte, psk []byte, err error) {
+func (t *clientImpl) DialAuth(ctx context.Context, metadata *Metadata) (*UnderlayAuth, error) {
+	if _, err := t.currentConn(ctx); err != nil {
+		return nil, err
+	}
+	auth := &UnderlayAuth{IV: make([]byte, CipherConf.SaltLen), Psk: make([]byte, CipherConf.KeyLen), Metadata: metadata, lease: t.lease.NewStream()}
+	if !auth.lease.Valid() {
+		return nil, auth.lease.Cause()
+	}
+	_, _ = fastrand.Read(auth.IV[2:])
+	_, _ = fastrand.Read(auth.Psk)
 	select {
-	case <-t.Ctx.Done():
-		return nil, nil, common.ErrClientClosed
+	case t.UnderlayAuth <- auth:
+		return auth, nil
 	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-	default:
+		auth.lease.Invalidate(ctx.Err())
+		return nil, ctx.Err()
+	case <-t.Ctx.Done():
+		auth.lease.Invalidate(common.ErrClientClosed)
+		return nil, common.ErrClientClosed
 	}
-	_, err = t.getQuicConn(ctx, dialer, dialFn)
-	if err != nil {
-		return nil, nil, fmt.Errorf("getQuicConn: %w", err)
-	}
-	iv = make([]byte, CipherConf.SaltLen)
-	psk = make([]byte, CipherConf.KeyLen)
-	iv[0], iv[1] = 0, 0
-	_, _ = fastrand.Read(iv[2:])
-	_, _ = fastrand.Read(psk)
-	t.UnderlayAuth <- &UnderlayAuth{
-		IV:       iv,
-		Psk:      psk,
-		Metadata: metadata,
-	}
-	return iv, psk, nil
 }
 
 func (t *clientImpl) setOnClose(f func()) {
 	t.detachCallback = f
+}
+
+// currentConn never establishes a transport on behalf of a relay.
+func (t *clientImpl) currentConn(ctx context.Context) (*quic.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	t.connMutex.Lock()
+	defer t.connMutex.Unlock()
+	if t.quicConn == nil || t.quicConn.Context().Err() != nil || !t.lease.Valid() {
+		return nil, common.ErrClientClosed
+	}
+	return t.quicConn, nil
 }

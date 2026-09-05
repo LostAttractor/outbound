@@ -23,7 +23,10 @@ func TestClientRingCloseStopsAndClosesClients(t *testing.T) {
 	if err := ring.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if _, err := ring.DialContext(context.Background(), nil, nil, nil); !errors.Is(err, common.ErrClientClosed) {
+	// A late cleanup callback may still hold the allocation mutex.
+	ring.mu.Lock()
+	defer ring.mu.Unlock()
+	if _, err := ring.DialContext(context.Background(), nil); !errors.Is(err, common.ErrClientClosed) {
 		t.Fatalf("DialContext after Close returned %v", err)
 	}
 }

@@ -3,9 +3,9 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"io"
 
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/quic-go/quicvarint"
 	"github.com/samber/oops"
 )
@@ -18,13 +18,6 @@ const (
 	MaxAddressLength = 2048
 	MaxMessageLength = 2048
 	MaxPaddingLength = 4096
-
-	MaxUDPSize = 4096
-
-	maxVarInt1 = 63
-	maxVarInt2 = 16383
-	maxVarInt4 = 1073741823
-	maxVarInt8 = 4611686018427387903
 )
 
 // TCPRequest format:
@@ -34,50 +27,16 @@ const (
 // Padding length (QUIC varint)
 // Padding (bytes)
 
-func ReadTCPRequest(r io.Reader) (string, error) {
-	bReader := quicvarint.NewReader(r)
-	addrLen, err := quicvarint.Read(bReader)
-	if err != nil {
-		return "", err
-	}
-	if addrLen == 0 || addrLen > MaxAddressLength {
-		return "", oops.Tags("protocol error").New("invalid address length")
-	}
-	addrBuf := make([]byte, addrLen)
-	_, err = io.ReadFull(r, addrBuf)
-	if err != nil {
-		return "", err
-	}
-	paddingLen, err := quicvarint.Read(bReader)
-	if err != nil {
-		return "", err
-	}
-	if paddingLen > MaxPaddingLength {
-		return "", oops.Tags("protocol error").New("invalid padding length")
-	}
-	if paddingLen > 0 {
-		_, err = io.CopyN(io.Discard, r, int64(paddingLen))
-		if err != nil {
-			return "", err
-		}
-	}
-	return string(addrBuf), nil
-}
-
 func WriteTCPRequest(w io.Writer, addr string) error {
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
 	padding := tcpRequestPadding.String()
-	paddingLen := len(padding)
-	addrLen := len(addr)
-	sz := int(quicvarint.Len(FrameTypeTCPRequest)) +
-		int(quicvarint.Len(uint64(addrLen))) + addrLen +
-		int(quicvarint.Len(uint64(paddingLen))) + paddingLen
-	buf := make([]byte, sz)
-	i := varintPut(buf, FrameTypeTCPRequest)
-	i += varintPut(buf[i:], uint64(addrLen))
-	i += copy(buf[i:], addr)
-	i += varintPut(buf[i:], uint64(paddingLen))
-	copy(buf[i:], padding)
-	_, err := w.Write(buf)
+	buf.Write(quicvarint.Append(nil, FrameTypeTCPRequest))
+	buf.Write(quicvarint.Append(nil, uint64(len(addr))))
+	buf.WriteString(addr)
+	buf.Write(quicvarint.Append(nil, uint64(len(padding))))
+	buf.WriteString(padding)
+	_, err := buf.WriteTo(w)
 	return err
 }
 
@@ -126,26 +85,6 @@ func ReadTCPResponse(r io.Reader) (bool, string, error) {
 	return status[0] == 0, string(msgBuf), nil
 }
 
-func WriteTCPResponse(w io.Writer, ok bool, msg string) error {
-	padding := tcpResponsePadding.String()
-	paddingLen := len(padding)
-	msgLen := len(msg)
-	sz := 1 + int(quicvarint.Len(uint64(msgLen))) + msgLen +
-		int(quicvarint.Len(uint64(paddingLen))) + paddingLen
-	buf := make([]byte, sz)
-	if ok {
-		buf[0] = 0
-	} else {
-		buf[0] = 1
-	}
-	i := varintPut(buf[1:], uint64(msgLen))
-	i += copy(buf[1+i:], msg)
-	i += varintPut(buf[1+i:], uint64(paddingLen))
-	copy(buf[1+i:], padding)
-	_, err := w.Write(buf)
-	return err
-}
-
 // UDPMessage format:
 // Session ID (uint32 BE)
 // Packet ID (uint16 BE)
@@ -173,82 +112,31 @@ func (m *UDPMessage) Size() int {
 	return m.HeaderSize() + len(m.Data)
 }
 
-func (m *UDPMessage) Serialize(buf []byte) int {
-	// Make sure the buffer is big enough
-	if len(buf) < m.Size() {
-		return -1
-	}
-	binary.BigEndian.PutUint32(buf, m.SessionID)
-	binary.BigEndian.PutUint16(buf[4:], m.PacketID)
-	buf[6] = m.FragID
-	buf[7] = m.FragCount
-	i := varintPut(buf[8:], uint64(len(m.Addr)))
-	i += copy(buf[8+i:], m.Addr)
-	i += copy(buf[8+i:], m.Data)
-	return 8 + i
+func (m *UDPMessage) AppendTo(buf *bytes.Buffer) {
+	buf.Write(binary.BigEndian.AppendUint32(nil, m.SessionID))
+	buf.Write(binary.BigEndian.AppendUint16(nil, m.PacketID))
+	buf.Write([]byte{m.FragID, m.FragCount})
+	buf.Write(quicvarint.Append(nil, uint64(len(m.Addr))))
+	buf.WriteString(m.Addr)
+	buf.Write(m.Data)
 }
 
 func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
-	m := &UDPMessage{}
-	buf := bytes.NewBuffer(msg)
-	if err := binary.Read(buf, binary.BigEndian, &m.SessionID); err != nil {
-		return nil, err
+	if len(msg) < 9 {
+		return nil, io.ErrUnexpectedEOF
 	}
-	if err := binary.Read(buf, binary.BigEndian, &m.PacketID); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &m.FragID); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &m.FragCount); err != nil {
-		return nil, err
-	}
-	lAddr, err := quicvarint.Read(buf)
+	reader := bytes.NewReader(msg[8:])
+	addrLen, err := quicvarint.Read(reader)
 	if err != nil {
 		return nil, err
 	}
-	if lAddr == 0 || lAddr > MaxMessageLength {
-		return nil, oops.Tags("protocol error").New("invalid address length")
+	if addrLen == 0 || addrLen > MaxAddressLength || addrLen >= uint64(reader.Len()) {
+		return nil, oops.Tags("protocol error").New("invalid UDP address or payload length")
 	}
-	bs := buf.Bytes()
-	if len(bs) <= int(lAddr) {
-		// We use <= instead of < here as we expect at least one byte of data after the address
-		return nil, oops.Tags("protocol error").New("invalid message length")
-	}
-	m.Addr = string(bs[:lAddr])
-	m.Data = bs[lAddr:]
-	return m, nil
-}
-
-// varintPut is like quicvarint.Append, but instead of appending to a slice,
-// it writes to a fixed-size buffer. Returns the number of bytes written.
-func varintPut(b []byte, i uint64) int {
-	if i <= maxVarInt1 {
-		b[0] = uint8(i)
-		return 1
-	}
-	if i <= maxVarInt2 {
-		b[0] = uint8(i>>8) | 0x40
-		b[1] = uint8(i)
-		return 2
-	}
-	if i <= maxVarInt4 {
-		b[0] = uint8(i>>24) | 0x80
-		b[1] = uint8(i >> 16)
-		b[2] = uint8(i >> 8)
-		b[3] = uint8(i)
-		return 4
-	}
-	if i <= maxVarInt8 {
-		b[0] = uint8(i>>56) | 0xc0
-		b[1] = uint8(i >> 48)
-		b[2] = uint8(i >> 40)
-		b[3] = uint8(i >> 32)
-		b[4] = uint8(i >> 24)
-		b[5] = uint8(i >> 16)
-		b[6] = uint8(i >> 8)
-		b[7] = uint8(i)
-		return 8
-	}
-	panic(fmt.Sprintf("%#x doesn't fit into 62 bits", i))
+	offset := len(msg) - reader.Len()
+	return &UDPMessage{
+		SessionID: binary.BigEndian.Uint32(msg), PacketID: binary.BigEndian.Uint16(msg[4:]),
+		FragID: msg[6], FragCount: msg[7],
+		Addr: string(msg[offset : offset+int(addrLen)]), Data: msg[offset+int(addrLen):],
+	}, nil
 }

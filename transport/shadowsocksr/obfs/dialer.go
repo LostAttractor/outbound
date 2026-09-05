@@ -2,18 +2,18 @@ package obfs
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
 type Dialer struct {
-	NextDialer netproxy.Dialer
-	param      *ObfsParam
-
-	constructor *constructor
+	ParentDialer netproxy.Dialer
+	param        ObfsParam
+	constructor  constructor
 }
+
 type ObfsParam struct {
 	ObfsHost  string
 	ObfsPort  uint16
@@ -21,52 +21,32 @@ type ObfsParam struct {
 	ObfsParam string
 }
 
-func NewDialer(nextDialer netproxy.Dialer, param *ObfsParam) (*Dialer, error) {
-
-	constructor := NewObfs(param.Obfs)
-	if constructor == nil {
-		return nil, errors.New("unsupported protocol type: " + param.Obfs)
+func NewDialer(parent netproxy.Dialer, param *ObfsParam) (*Dialer, error) {
+	factory, ok := constructors[param.Obfs]
+	if !ok {
+		return nil, fmt.Errorf("unsupported SSR obfuscation %q", param.Obfs)
 	}
-
-	d := &Dialer{
-		NextDialer:  nextDialer,
-		param:       param,
-		constructor: constructor,
-	}
-	return d, nil
+	return &Dialer{ParentDialer: parent, param: *param, constructor: factory}, nil
 }
 
-func (d *Dialer) ObfsOverhead() int {
-	return d.constructor.Overhead
-}
+func (d *Dialer) ObfsOverhead() int { return d.constructor.Overhead }
 
-func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network == "udp" {
+		return d.ParentDialer.DialContext(ctx, network, address)
+	}
+	if network != "tcp" {
+		return nil, fmt.Errorf("%w: SSR obfuscation+%s", netproxy.UnsupportedTunnelTypeError, network)
+	}
+	conn, err := d.ParentDialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
-	switch magicNetwork.Network {
-	case "tcp":
-		conn, err := d.NextDialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		obfs := d.constructor.New()
-		if obfs == nil {
-			return nil, errors.New("unsupported protocol type: " + d.param.Obfs)
-		}
-		obfsServerInfo := &ServerInfo{
-			Host:  d.param.ObfsHost,
-			Port:  d.param.ObfsPort,
-			Param: d.param.ObfsParam,
-		}
-		obfs.SetData(obfs.GetData())
-		obfs.SetServerInfo(obfsServerInfo)
+	codec := d.constructor.New()
+	codec.SetServerInfo(&ServerInfo{Host: d.param.ObfsHost, Port: d.param.ObfsPort, Param: d.param.ObfsParam})
+	return &Conn{Conn: conn, codec: codec, addrLen: 30}, nil
+}
 
-		return NewConn(conn, obfs)
-	case "udp":
-		return d.NextDialer.DialContext(ctx, network, addr)
-	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
-	}
+func (d *Dialer) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	return d.ParentDialer.ListenPacket(ctx, address)
 }

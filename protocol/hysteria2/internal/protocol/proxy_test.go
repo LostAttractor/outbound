@@ -8,20 +8,6 @@ import (
 )
 
 func TestUDPMessage(t *testing.T) {
-	t.Run("buffer too small", func(t *testing.T) {
-		// Make sure Serialize returns -1 when the buffer is too small.
-		tBuf := make([]byte, 20)
-		if (&UDPMessage{
-			SessionID: 66,
-			PacketID:  77,
-			FragID:    2,
-			FragCount: 5,
-			Addr:      "random_addr",
-			Data:      []byte("random_data"),
-		}).Serialize(tBuf) != -1 {
-			t.Error("Serialize() did not return -1 when the buffer was too small")
-		}
-	})
 
 	type fields struct {
 		SessionID uint32
@@ -72,9 +58,9 @@ func TestUDPMessage(t *testing.T) {
 				Data:      tt.fields.Data,
 			}
 			// Serialize
-			buf := make([]byte, MaxUDPSize)
-			n := m.Serialize(buf)
-			if got := buf[:n]; !reflect.DeepEqual(got, tt.want) {
+			buf := new(bytes.Buffer)
+			m.AppendTo(buf)
+			if got := buf.Bytes(); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Serialize() = %v, want %v", got, tt.want)
 			}
 			// Parse back
@@ -120,53 +106,6 @@ func TestUDPMessageMalformed(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := ParseUDPMessage(tt.data); err == nil {
 				t.Errorf("ParseUDPMessage() should fail")
-			}
-		})
-	}
-}
-
-func TestReadTCPRequest(t *testing.T) {
-	tests := []struct {
-		name    string
-		data    []byte
-		want    string
-		wantErr bool
-	}{
-		{
-			name:    "normal no padding",
-			data:    []byte("\x0egoogle.com:443\x00"),
-			want:    "google.com:443",
-			wantErr: false,
-		},
-		{
-			name:    "normal with padding",
-			data:    []byte("\x0bholy.cc:443\x02gg"),
-			want:    "holy.cc:443",
-			wantErr: false,
-		},
-		{
-			name:    "incomplete 1",
-			data:    []byte("\x0bhoho"),
-			want:    "",
-			wantErr: true,
-		},
-		{
-			name:    "incomplete 2",
-			data:    []byte("\x0bholy.cc:443\x05x"),
-			want:    "",
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r := bytes.NewReader(tt.data)
-			got, err := ReadTCPRequest(r)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ReadTCPRequest() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("ReadTCPRequest() got = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -266,51 +205,6 @@ func TestReadTCPResponse(t *testing.T) {
 			}
 			if got1 != tt.want1 {
 				t.Errorf("ReadTCPResponse() got1 = %v, want %v", got1, tt.want1)
-			}
-		})
-	}
-}
-
-func TestWriteTCPResponse(t *testing.T) {
-	type args struct {
-		ok  bool
-		msg string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		wantW   string // Just a prefix, we don't care about the padding
-		wantErr bool
-	}{
-		{
-			name:    "normal ok",
-			args:    args{ok: true, msg: "hello world"},
-			wantW:   "\x00\x0bhello world",
-			wantErr: false,
-		},
-		{
-			name:    "normal error",
-			args:    args{ok: false, msg: "stop!!"},
-			wantW:   "\x01\x06stop!!",
-			wantErr: false,
-		},
-		{
-			name:    "empty",
-			args:    args{ok: true, msg: ""},
-			wantW:   "\x00\x00",
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			w := &bytes.Buffer{}
-			err := WriteTCPResponse(w, tt.args.ok, tt.args.msg)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("WriteTCPResponse() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if gotW := w.String(); !(strings.HasPrefix(gotW, tt.wantW) && len(gotW) > len(tt.wantW)) {
-				t.Errorf("WriteTCPResponse() gotW = %v, want %v", gotW, tt.wantW)
 			}
 		})
 	}

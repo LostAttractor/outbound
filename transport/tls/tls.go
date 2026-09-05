@@ -9,13 +9,12 @@ import (
 
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 	utls "github.com/refraction-networking/utls"
 )
 
 // Tls is a base Tls struct
 type Tls struct {
-	protocol.StatelessDialer
+	ParentDialer        netproxy.Dialer
 	addr                string
 	tlsImplentation     string
 	utlsImitate         string
@@ -88,6 +87,13 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c net.Conn
 		if err != nil {
 			return nil, fmt.Errorf("[Tls]: dial to %s: %w", s.addr, err)
 		}
+		netproxy.CaptureDependency(ctx, rc)
+		keep := false
+		defer func() {
+			if !keep {
+				_ = rc.Close()
+			}
+		}()
 
 		if s.fragmentation {
 			rc = NewFragmentConn(rc, s.fragmentMinLength, s.fragmentMaxLength, s.fragmentMinInterval, s.fragmentMaxInterval)
@@ -95,12 +101,12 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c net.Conn
 
 		var tlsConn interface {
 			net.Conn
-			Handshake() error
+			HandshakeContext(context.Context) error
 		}
 
 		switch s.tlsImplentation {
 		case "tls":
-			tlsConn = tls.Client(rc, s.tlsConfig)
+			tlsConn = &leasedTLSConn{Conn: tls.Client(rc, s.tlsConfig), lease: netproxy.DependencyOf(rc)}
 
 		case "utls":
 			clientHelloID, err := nameToUtlsClientHelloID(s.utlsImitate)
@@ -108,15 +114,16 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c net.Conn
 				return nil, err
 			}
 
-			tlsConn = utls.UClient(rc, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID)
+			tlsConn = &leasedUTLSConn{UConn: utls.UClient(rc, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID), lease: netproxy.DependencyOf(rc)}
 
 		default:
 			return nil, fmt.Errorf("unknown tls implementation: %v", s.tlsImplentation)
 		}
 
-		if err := tlsConn.Handshake(); err != nil {
-			return nil, err
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, netproxy.WrapFailure(err, netproxy.Failure{Phase: netproxy.OpHandshake})
 		}
+		keep = true
 		return tlsConn, err
 	case "udp":
 		if s.passthroughUdp {

@@ -45,7 +45,7 @@ func (s *Socks) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (netproxy
 	link := s.ExportToURL()
 	switch s.Protocol {
 	case "", "socks", "socks5":
-		d, err := socks5.NewSocks5Dialer(link, upstream) // Socks5 Proxy supports full-cone.
+		d, err := socks5.NewSocks5(link, upstream) // Socks5 Proxy supports full-cone.
 		if err != nil {
 			return netproxy.Layer{}, err
 		}

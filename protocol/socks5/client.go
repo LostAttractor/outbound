@@ -1,20 +1,16 @@
 // Modified from https://github.com/nadoo/glider/tree/v0.16.2
-
 package socks5
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
-	"strings"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
-
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
 )
 
@@ -23,159 +19,174 @@ const (
 	replyAddressTypeNotSupported = 8
 )
 
-// NewSocks5Dialer returns a socks5 proxy netproxy.
-func NewSocks5Dialer(s string, d netproxy.Dialer) (netproxy.Dialer, error) {
-	return NewSocks5(s, d)
-}
-
 func (s *Socks5) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	switch network {
 	case "tcp":
 		c, err := s.ParentDialer.DialContext(ctx, "tcp", s.addr)
 		if err != nil {
-			return nil, fmt.Errorf("[socks5]: dial to %s error: %w", s.addr, err)
+			return nil, fmt.Errorf("socks5 dial proxy: %w", err)
 		}
-		_, err = common.Invoke(ctx, func() (socks.Addr, error) {
-			return s.connect(c, address, socks.CmdConnect)
-		}, func() {
-			c.Close()
-		})
-		return c, err
+		if err := protocol.Handshake(ctx, c, func() error { _, err := s.connect(c, address, socks.CmdConnect); return err }); err != nil {
+			return nil, err
+		}
+		return c, nil
 	case "udp":
 		c, err := s.ListenPacket(ctx, address)
 		if err != nil {
 			return nil, err
 		}
-		return &netproxy.BindPacketConn{
-			PacketConn: c,
-			Address:    netproxy.NewAddr("udp", address),
-		}, nil
+		return &netproxy.BindPacketConn{PacketConn: c, Address: netproxy.NewAddr("udp", address)}, nil
 	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
+		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, network)
 	}
 }
 
-func (s *Socks5) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
-	ctrlConn, err := s.ParentDialer.DialContext(ctx, "tcp", s.addr)
+func (s *Socks5) ListenPacket(ctx context.Context, _ string) (net.PacketConn, error) {
+	ctrl, err := s.ParentDialer.DialContext(ctx, "tcp", s.addr)
 	if err != nil {
-		return nil, fmt.Errorf("[socks5]: dial to %s error: %w", s.addr, err)
+		return nil, fmt.Errorf("socks5 dial proxy: %w", err)
 	}
-	// Get the proxy addr we should dial.
-	// TODO: target should be laddr of udp conn
-	uAddr, err := common.Invoke(ctx, func() (socks.Addr, error) {
-		return s.connect(ctrlConn, addr, socks.CmdUDPAssociate)
-	}, func() {
-		ctrlConn.Close()
-	})
-	if err != nil {
+	var bound socks.Addr
+	if err := protocol.Handshake(ctx, ctrl, func() error {
+		// This request names the client's UDP source, which is not yet known.
+		bound, err = s.connect(ctrl, "0.0.0.0:0", socks.CmdUDPAssociate)
+		return err
+	}); err != nil {
 		return nil, err
 	}
-
-	buf := pool.GetBuffer(socks.MaxAddrLen)
-	defer pool.PutBuffer(buf)
-
-	uAddress := uAddr.String()
-	h, p, err := net.SplitHostPort(uAddress)
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = ctrl.Close()
+		}
+	}()
+	host, port, err := net.SplitHostPort(bound.String())
 	if err != nil {
-		return nil, fmt.Errorf("[socks5] invalid bind address: %w", err)
+		return nil, fmt.Errorf("socks5 invalid bind address: %w", err)
 	}
-	// if returned bind ip is unspecified
-	if h == "" {
-		// indicate using conventional addr
-		h, _, _ = net.SplitHostPort(s.addr)
-		uAddress = net.JoinHostPort(h, p)
+	if port == "0" {
+		return nil, fmt.Errorf("socks5 returned zero UDP relay port")
 	}
-
-	conn, err := s.ParentDialer.ListenPacket(ctx, uAddress)
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		host, _, err = net.SplitHostPort(s.addr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	relay := net.JoinHostPort(host, port)
+	conn, err := s.ParentDialer.ListenPacket(ctx, relay)
 	if err != nil {
-		return nil, fmt.Errorf("[socks5] dialudp to %s error: %w", uAddress, err)
+		return nil, fmt.Errorf("socks5 dial UDP relay: %w", err)
 	}
-
-	return NewPktConn(conn, ctrlConn, netproxy.NewAddr("udp", uAddress)), nil
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	pc := NewPktConn(conn, ctrl, netproxy.NewAddr("udp", relay))
+	handedOff = true
+	if !pc.lease.Valid() {
+		_ = pc.Close()
+		return nil, pc.lease.Cause()
+	}
+	return pc, nil
 }
 
-// connect takes an existing connection to a socks5 proxy server,
-// and commands the server to extend that connection to target,
-// which must be a canonical address with a host and port.
-func (s *Socks5) connect(conn net.Conn, target string, cmd byte) (addr socks.Addr, err error) {
-	// the size here is just an estimate
-	buf := pool.GetBuffer(socks.MaxAddrLen)
-	defer pool.PutBuffer(buf)
+func handshakeFailure(err error, origin netproxy.FailureOrigin, reason netproxy.FailureReason, code byte) error {
+	return netproxy.WrapFailure(err, netproxy.Failure{Scope: netproxy.ScopeStream, Layer: netproxy.LayerProxy, Phase: netproxy.OpHandshake, Origin: origin, Reason: reason, Code: strconv.Itoa(int(code))})
+}
 
-	buf = append(buf[:0], Version)
-	if len(s.user) > 0 && len(s.user) < 256 && len(s.password) < 256 {
-		buf = append(buf, 2 /* num auth methods */, socks.AuthNone, socks.AuthPassword)
-	} else {
-		buf = append(buf, 1 /* num auth methods */, socks.AuthNone)
+func writeHandshake(conn net.Conn, b []byte) error {
+	n, err := conn.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
 	}
-
-	if _, err := conn.Write(buf); err != nil {
-		return addr, errors.New("proxy: failed to write greeting to SOCKS5 proxy at " + s.addr + ": " + err.Error())
+	if err != nil {
+		return fmt.Errorf("socks5 write handshake: %w", err)
 	}
+	return nil
+}
 
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return addr, errors.New("proxy: failed to read greeting from SOCKS5 proxy at " + s.addr + ": " + err.Error())
-	}
-	if buf[0] != Version {
-		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " has unexpected version " + strconv.Itoa(int(buf[0])))
-	}
-	if buf[1] == 0xff {
-		return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " requires authentication")
-	}
-
-	if buf[1] == socks.AuthPassword {
-		buf = buf[:0]
-		buf = append(buf, 1 /* password protocol version */)
-		buf = append(buf, uint8(len(s.user)))
-		buf = append(buf, s.user...)
-		buf = append(buf, uint8(len(s.password)))
-		buf = append(buf, s.password...)
-
-		if _, err := conn.Write(buf); err != nil {
-			return addr, errors.New("proxy: failed to write authentication request to SOCKS5 proxy at " + s.addr + ": " + err.Error())
-		}
-
-		if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-			return addr, errors.New("proxy: failed to read authentication reply from SOCKS5 proxy at " + s.addr + ": " + err.Error())
-		}
-
-		if buf[1] != 0 {
-			return addr, errors.New("proxy: SOCKS5 proxy at " + s.addr + " rejected username/password")
-		}
-	}
-
-	buf = buf[:0]
-	buf = append(buf, Version, cmd, 0 /* reserved */)
-	tgtAddr, err := socks.ParseAddr(target)
+func (s *Socks5) connect(conn net.Conn, target string, cmd byte) (socks.Addr, error) {
+	address, err := socks.ParseAddr(target)
 	if err != nil {
 		return nil, err
 	}
-	buf = append(buf, tgtAddr...)
-
-	if _, err := conn.Write(buf); err != nil {
-		return addr, errors.New("proxy: failed to write connect request to SOCKS5 proxy at " + s.addr + ": " + err.Error())
+	authenticated := len(s.user) > 0
+	if len(s.user) > 255 || len(s.password) > 255 || (authenticated && len(s.password) == 0) {
+		return nil, fmt.Errorf("socks5 username/password must contain 1 to 255 bytes")
 	}
-
-	// read VER REP RSV
-	if _, err := io.ReadFull(conn, buf[:3]); err != nil {
-		return addr, errors.New("proxy: failed to read connect reply from SOCKS5 proxy at " + s.addr + ": " + err.Error())
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	buf.Write([]byte{Version, 1, socks.AuthNone})
+	if authenticated {
+		buf.Bytes()[1] = 2
+		buf.WriteByte(socks.AuthPassword)
 	}
-
-	failure := "unknown error"
-	if int(buf[1]) < len(socks.Errors) {
-		failure = socks.Errors[buf[1]].Error()
-		if strings.Contains(failure, "command not supported") {
-			failure += " by socks5 server: " + socks.Command[cmd]
+	if err := writeHandshake(conn, buf.Bytes()); err != nil {
+		return nil, err
+	}
+	var reply [3]byte
+	if _, err := io.ReadFull(conn, reply[:2]); err != nil {
+		return nil, fmt.Errorf("socks5 read method: %w", err)
+	}
+	if reply[0] != Version {
+		return nil, handshakeFailure(fmt.Errorf("socks5 invalid method version %d", reply[0]), netproxy.OriginPeer, netproxy.ReasonProtocol, reply[0])
+	}
+	switch reply[1] {
+	case socks.AuthNone:
+	case socks.AuthPassword:
+		if !authenticated {
+			return nil, handshakeFailure(fmt.Errorf("socks5 selected unoffered password method"), netproxy.OriginPeer, netproxy.ReasonAuth, reply[1])
 		}
-	}
-
-	if len(failure) > 0 {
-		err := errors.New("proxy: SOCKS5 proxy at " + s.addr + " failed to connect: " + failure)
-		if buf[1] == replyCommandNotSupported || buf[1] == replyAddressTypeNotSupported {
-			return addr, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, err)
+		buf.Reset()
+		buf.WriteByte(1)
+		buf.WriteByte(byte(len(s.user)))
+		buf.WriteString(s.user)
+		buf.WriteByte(byte(len(s.password)))
+		buf.WriteString(s.password)
+		if err := writeHandshake(conn, buf.Bytes()); err != nil {
+			return nil, err
 		}
-		return addr, err
+		if _, err := io.ReadFull(conn, reply[:2]); err != nil {
+			return nil, fmt.Errorf("socks5 read authentication: %w", err)
+		}
+		if reply[0] != 1 {
+			return nil, handshakeFailure(fmt.Errorf("socks5 invalid authentication version %d", reply[0]), netproxy.OriginPeer, netproxy.ReasonProtocol, reply[0])
+		}
+		if reply[1] != 0 {
+			return nil, handshakeFailure(fmt.Errorf("socks5 rejected username/password"), netproxy.OriginPeer, netproxy.ReasonAuth, reply[1])
+		}
+	default:
+		return nil, handshakeFailure(fmt.Errorf("socks5 unsupported selected method %d", reply[1]), netproxy.OriginPeer, netproxy.ReasonAuth, reply[1])
 	}
-
-	return socks.ReadAddr(conn)
+	buf.Reset()
+	buf.Write([]byte{Version, cmd, 0})
+	buf.Write(address)
+	if err := writeHandshake(conn, buf.Bytes()); err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		return nil, fmt.Errorf("socks5 read reply: %w", err)
+	}
+	if reply[0] != Version || reply[2] != 0 {
+		return nil, handshakeFailure(fmt.Errorf("socks5 invalid reply version/reserved field"), netproxy.OriginPeer, netproxy.ReasonProtocol, reply[0])
+	}
+	if reply[1] != 0 {
+		message := fmt.Sprintf("reply %d", reply[1])
+		if int(reply[1]) < len(socks.Errors) {
+			message = socks.Errors[reply[1]].Error()
+		}
+		err := fmt.Errorf("socks5 request rejected: %s", message)
+		origin := netproxy.OriginTarget
+		if reply[1] == replyCommandNotSupported || reply[1] == replyAddressTypeNotSupported {
+			err = fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, err)
+			origin = netproxy.OriginPeer
+		}
+		return nil, handshakeFailure(err, origin, netproxy.ReasonRejected, reply[1])
+	}
+	bound, err := socks.ReadAddr(conn)
+	if err != nil {
+		return nil, fmt.Errorf("socks5 read bind address: %w", err)
+	}
+	return bound, nil
 }

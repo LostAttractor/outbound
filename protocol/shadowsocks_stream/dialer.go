@@ -3,109 +3,94 @@ package shadowsocks_stream
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
-	"github.com/daeuniverse/outbound/protocol/infra/socks"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
-func init() {
-	protocol.Register("shadowsocks_stream", NewDialer)
-}
-
-const (
-	TransportMagicAddr = "<TRANSPORT>"
-)
+func init() { protocol.Register("shadowsocks_stream", NewDialer) }
 
 type Dialer struct {
-	nextDialer netproxy.Dialer
-	addr       string
-
-	EncryptMethod   string
-	EncryptPassword string
+	ParentDialer netproxy.Dialer
+	address      string
+	cipher       *ciphers.StreamCipher
 }
 
-func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
-	return &Dialer{
-		nextDialer:      nextDialer,
-		addr:            header.ProxyAddress,
-		EncryptMethod:   header.Cipher,
-		EncryptPassword: header.Password,
-	}, nil
-}
-
-// Addr returns forwarder's address
-func (d *Dialer) Addr() string {
-	return d.addr
-}
-
-func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
+func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+	cipher, err := ciphers.NewStreamCipher(header.Cipher, header.Password)
 	if err != nil {
 		return nil, err
 	}
-	switch magicNetwork.Network {
+	return &Dialer{ParentDialer: parent, address: header.ProxyAddress, cipher: cipher}, nil
+}
+
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	switch network {
 	case "tcp":
-		target, err := socks.ParseAddr(addr)
+		header := pool.GetBytesBuffer()
+		defer pool.PutBytesBuffer(header)
+		if err := socks5.WriteAddr(address, header); err != nil {
+			return nil, err
+		}
+		conn, err := d.DialTCPTransport(ctx)
 		if err != nil {
 			return nil, err
 		}
-
-		conn, err := d.DialTcpTransport(ctx, network)
-		if err != nil {
+		if err := protocol.Handshake(ctx, conn, func() error { _, err := conn.Write(header.Bytes()); return err }); err != nil {
 			return nil, err
 		}
-
-		if _, err := conn.Write(target); err != nil {
-			conn.Close()
-			return nil, err
-		}
-		return conn, err
+		return conn, nil
 	case "udp":
-		var target socks.Addr
-		if addr != TransportMagicAddr {
-			target, err = socks.ParseAddr(addr)
-			if err != nil {
-				return nil, err
-			}
+		if _, err := socks5.AddressFromString(address); err != nil {
+			return nil, err
 		}
-
-		ciph, err := ciphers.NewStreamCipher(d.EncryptMethod, d.EncryptPassword)
+		conn, err := d.ListenPacket(ctx, address)
 		if err != nil {
 			return nil, err
 		}
-
-		c, err := d.nextDialer.DialContext(ctx, network, d.addr)
-		if err != nil {
-			return nil, fmt.Errorf("dial to %v error: %w", d.addr, err)
-		}
-		return NewUdpConn(c.(netproxy.PacketConn), ciph, target, d.addr), nil
+		return &netproxy.BindPacketConn{PacketConn: conn, Address: netproxy.NewAddr("udp", address)}, nil
 	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
+		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, network)
 	}
 }
 
-func (d *Dialer) DialTcpTransport(ctx context.Context, magicNetwork string) (netproxy.Conn, error) {
-	ciph, err := ciphers.NewStreamCipher(d.EncryptMethod, d.EncryptPassword)
+func (d *Dialer) ListenPacket(ctx context.Context, _ string) (net.PacketConn, error) {
+	conn, err := d.DialUDPTransport(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	c, err := d.nextDialer.DialContext(ctx, magicNetwork, d.addr)
-	if err != nil {
-		return nil, fmt.Errorf("dial to %v error: %w", d.addr, err)
-	}
-
-	conn := NewTcpConn(c, ciph)
-
-	return conn, err
+	return &packetConn{UdpConn: conn}, nil
 }
 
-func (d *Dialer) DialUdpTransport(ctx context.Context, magicNetwork string) (netproxy.PacketConn, error) {
-	conn, err := d.DialContext(ctx, magicNetwork, TransportMagicAddr)
+// The transport methods expose encryption without a destination header to SSR.
+func (d *Dialer) DialTCPTransport(ctx context.Context) (*TcpConn, error) {
+	cipher := d.cipher.Clone()
+	conn, err := d.ParentDialer.DialContext(ctx, "tcp", d.address)
 	if err != nil {
 		return nil, err
 	}
-	return &UdpTransportConn{UdpConn: conn.(*UdpConn)}, nil
+	if err = ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	netproxy.CaptureDependency(ctx, conn)
+	return NewTCPConn(conn, cipher), nil
+}
+
+func (d *Dialer) DialUDPTransport(ctx context.Context) (*UdpConn, error) {
+	cipher := d.cipher.Clone()
+	conn, err := d.ParentDialer.DialContext(ctx, "udp", d.address)
+	if err != nil {
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	netproxy.CaptureDependency(ctx, conn)
+	return NewUDPConn(conn, cipher), nil
 }

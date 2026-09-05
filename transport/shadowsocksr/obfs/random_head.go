@@ -13,13 +13,6 @@ type randomHead struct {
 	dataBuffer       []byte
 }
 
-func init() {
-	register("random_head", &constructor{
-		New:      newRandomHead,
-		Overhead: 0,
-	})
-}
-
 func newRandomHead() IObfs {
 	p := &randomHead{}
 	return p
@@ -31,14 +24,6 @@ func (r *randomHead) SetServerInfo(s *ServerInfo) {
 
 func (r *randomHead) GetServerInfo() (s *ServerInfo) {
 	return &r.ServerInfo
-}
-
-func (r *randomHead) SetData(data interface{}) {
-
-}
-
-func (r *randomHead) GetData() interface{} {
-	return nil
 }
 
 func (r *randomHead) Encode(data []byte) (encodedData []byte, err error) {
@@ -77,5 +62,5 @@ func (r *randomHead) Decode(data []byte) (decodedData []byte, needSendBack bool,
 		return data, false, nil
 	}
 	r.rawTransReceived = true
-	return data, true, nil
+	return nil, true, nil
 }

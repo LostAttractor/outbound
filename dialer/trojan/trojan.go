@@ -1,6 +1,8 @@
 package trojan
 
 import (
+	"context"
+	cryptotls "crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -14,6 +16,7 @@ import (
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/protocol/shadowsocks"
 	"github.com/daeuniverse/outbound/transport/grpc"
 	"github.com/daeuniverse/outbound/transport/httpupgrade"
 	"github.com/daeuniverse/outbound/transport/ws"
@@ -62,6 +65,22 @@ func (s *Trojan) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (la
 		}
 	}()
 
+	switch s.Type {
+	case "", "tcp", "ws", "grpc", "httpupgrade":
+	default:
+		err = fmt.Errorf("unsupported Trojan transport %q", s.Type)
+		return
+	}
+
+	var encryption []string
+	if s.Encryption != "" && s.Encryption != "none" {
+		encryption = strings.SplitN(s.Encryption, ";", 3)
+		if len(encryption) != 3 || encryption[0] != "ss" || encryption[1] == "" {
+			err = fmt.Errorf("invalid Trojan encryption: expected ss;method;password")
+			return
+		}
+	}
+
 	if s.Type != "grpc" { // grpc contains tls
 		tlsConfig := tls.TLSConfig{
 			Host:          proxyAddress,
@@ -89,40 +108,33 @@ func (s *Trojan) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (la
 		}
 	case "grpc":
 		transport := &grpc.Dialer{
-			ParentDialer:  layer.Data,
-			ServiceName:   s.ServiceName,
-			ServerName:    s.Sni,
-			Address:       proxyAddress,
-			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
+			ParentDialer: layer.Data,
+			ServiceName:  s.ServiceName,
+			Address:      proxyAddress,
+			TLSConfig:    &cryptotls.Config{ServerName: s.Sni, InsecureSkipVerify: s.AllowInsecure || option.AllowInsecure},
 		}
 		layer.Data = transport
 		layer.Sessions = append(layer.Sessions, transport)
 		layer.Resources = append(layer.Resources, transport)
 	case "httpupgrade":
-		u := url.URL{
-			Scheme: "http",
-			Host:   proxyAddress,
-			RawQuery: url.Values{
-				"host": []string{s.Host},
-				"path": []string{s.Path},
-			}.Encode(),
-		}
-
-		layer.Data, err = httpupgrade.NewDialer(u.String(), layer.Data)
+		layer.Data, err = httpupgrade.NewDialer(layer.Data, httpupgrade.Config{
+			Address: proxyAddress, Host: s.Host, Path: s.Path,
+		})
 		if err != nil {
 			return
 		}
 	}
-	if strings.HasPrefix(s.Encryption, "ss;") {
-		fields := strings.SplitN(s.Encryption, ";", 3)
-		err = layer.AppendResult(protocol.Build("shadowsocks", layer.Data, protocol.Header{
+	if encryption != nil {
+		var encrypted netproxy.Dialer
+		encrypted, err = shadowsocks.NewDialer(layer.Data, protocol.Header{
 			ProxyAddress: proxyAddress,
-			Cipher:       fields[1],
-			Password:     fields[2],
-		}))
+			Cipher:       encryption[1],
+			Password:     encryption[2],
+		})
 		if err != nil {
 			return
 		}
+		layer.Data = shadowsocksTransport{encrypted.(*shadowsocks.Dialer)}
 	}
 	err = layer.AppendResult(protocol.Build("trojanc", layer.Data, protocol.Header{
 		ProxyAddress: proxyAddress,
@@ -131,57 +143,54 @@ func (s *Trojan) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (la
 	return
 }
 
-func ParseTrojanURL(u string) (data *Trojan, err error) {
-	//trojan://password@server:port#escape(remarks)
-	t, err := url.Parse(u)
-	if err != nil {
-		err = fmt.Errorf("invalid trojan format")
-		return
+// Trojan owns the destination header; this layer only encrypts its TCP carrier.
+type shadowsocksTransport struct{ *shadowsocks.Dialer }
+
+func (d shadowsocksTransport) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("%w: Trojan Shadowsocks transport: %s", netproxy.UnsupportedTunnelTypeError, network)
 	}
-	allowInsecure, _ := strconv.ParseBool(t.Query().Get("allowInsecure"))
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(t.Query().Get("allow_insecure"))
+	return d.DialTCPTransport(ctx)
+}
+func (shadowsocksTransport) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	return nil, fmt.Errorf("%w: Trojan Shadowsocks transport requires TCP", netproxy.UnsupportedTunnelTypeError)
+}
+
+func ParseTrojanURL(link string) (*Trojan, error) {
+	u, err := url.Parse(link)
+	if err != nil || (u.Scheme != "trojan" && u.Scheme != "trojan-go") {
+		return nil, dialer.InvalidParameterErr
 	}
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(t.Query().Get("allowinsecure"))
+	q := u.Query()
+	for _, key := range []string{"allow_insecure", "allowinsecure", "skipVerify", "peer"} {
+		if q.Has(key) {
+			return nil, fmt.Errorf("unsupported Trojan option %q; use allowInsecure and sni", key)
+		}
 	}
-	if !allowInsecure {
-		allowInsecure, _ = strconv.ParseBool(t.Query().Get("skipVerify"))
+	allowInsecure := false
+	if q.Has("allowInsecure") {
+		allowInsecure, err = strconv.ParseBool(q.Get("allowInsecure"))
+		if err != nil {
+			return nil, fmt.Errorf("invalid Trojan allowInsecure: %w", err)
+		}
 	}
-	sni := t.Query().Get("peer")
-	if sni == "" {
-		sni = t.Query().Get("sni")
-	}
-	if sni == "" {
-		sni = t.Hostname()
-	}
-	port, err := strconv.Atoi(t.Port())
+	port, err := strconv.Atoi(u.Port())
 	if err != nil {
 		return nil, dialer.InvalidParameterErr
 	}
-	data = &Trojan{
-		Name:          t.Fragment,
-		Server:        t.Hostname(),
-		Port:          port,
-		Password:      t.User.Username(),
-		Sni:           sni,
-		AllowInsecure: allowInsecure,
-		Protocol:      "trojan",
+	sni := q.Get("sni")
+	if sni == "" {
+		sni = u.Hostname()
 	}
-	if t.Query().Get("type") != "" {
-		t.Scheme = "trojan-go"
+	data := &Trojan{
+		Name: u.Fragment, Server: u.Hostname(), Port: port, Password: u.User.Username(), Sni: sni,
+		AllowInsecure: allowInsecure, Protocol: u.Scheme, Encryption: q.Get("encryption"),
+		Host: q.Get("host"), Path: q.Get("path"), Type: q.Get("type"), ServiceName: q.Get("serviceName"),
 	}
-	if t.Scheme == "trojan-go" {
-		data.Protocol = "trojan-go"
-		data.Encryption = t.Query().Get("encryption")
-		data.Host = t.Query().Get("host")
-		data.Path = t.Query().Get("path")
-		data.Type = t.Query().Get("type")
-		data.ServiceName = t.Query().Get("serviceName")
-		if data.Type == "grpc" && data.ServiceName == "" {
-			data.ServiceName = data.Path
-		}
+	if data.Type == "grpc" && data.Path != "" {
+		return nil, fmt.Errorf("Trojan gRPC uses serviceName, not path")
 	}
+
 	return data, nil
 }
 
@@ -200,11 +209,13 @@ func (t *Trojan) ExportToURL() string {
 
 	if t.Protocol == "trojan-go" {
 		u.Scheme = "trojan-go"
-		common.SetValue(&q, "host", t.Host)
-		common.SetValue(&q, "encryption", t.Encryption)
-		common.SetValue(&q, "type", t.Type)
-		common.SetValue(&q, "path", t.Path)
 	}
+	common.SetValue(&q, "host", t.Host)
+	common.SetValue(&q, "encryption", t.Encryption)
+	common.SetValue(&q, "type", t.Type)
+	common.SetValue(&q, "path", t.Path)
+	common.SetValue(&q, "serviceName", t.ServiceName)
+
 	u.RawQuery = q.Encode()
 	return u.String()
 }

@@ -1,32 +1,35 @@
 package anytls
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
-	"runtime/debug"
-	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
 )
 
 type session struct {
-	conn     net.Conn
-	connLock sync.Mutex
+	lease      *netproxy.Lease
+	failureMu  sync.Mutex
+	rootCause  error
+	conn       net.Conn
+	writeGate  chan struct{}
+	pendingFIN chan uint32
 
 	streams    map[uint32]*stream
 	streamLock sync.RWMutex
 
-	padding     atomic.Value
-	sendPadding bool
-	pktCounter  atomic.Uint32
-	peerVersion byte
+	padding      *atomic.Pointer[paddingFactory]
+	sendPadding  bool
+	pktCounter   uint32
+	settingsSent bool
 
 	sid       atomic.Uint32
 	closed    atomic.Bool
@@ -35,18 +38,25 @@ type session struct {
 	onIdle    func(*session)
 }
 
-func newSession(conn net.Conn, onIdle func(*session)) *session {
+func newSession(conn net.Conn, onIdle func(*session), dependency *netproxy.Lease) *session {
 	s := &session{
-		conn:        conn,
+		lease: netproxy.NewLease(netproxy.NewResourceRef(), dependency),
+		conn:  conn, writeGate: make(chan struct{}, 1), pendingFIN: make(chan uint32, 256),
 		streams:     map[uint32]*stream{},
 		onIdle:      onIdle,
 		sendPadding: true,
 	}
-	s.padding.Store(DefaultPaddingFactory.Load())
+	s.padding = new(atomic.Pointer[paddingFactory])
+	s.padding.Store(defaultPadding)
+	s.writeGate <- struct{}{}
+	go s.flushFIN()
 	return s
 }
 
-func (s *session) newStream(addr string) (*stream, error) {
+func (s *session) newStreamContext(ctx context.Context, addr string) (*stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	tgtAddr, err := socks.ParseAddr(addr)
 	if err != nil {
 		return nil, err
@@ -54,179 +64,128 @@ func (s *session) newStream(addr string) (*stream, error) {
 	sid := s.sid.Add(1)
 	stream := newStream(s, sid)
 	s.streamLock.Lock()
-	if s.closed.Load() {
+	if s.closed.Load() || !s.lease.Valid() {
 		s.streamLock.Unlock()
 		stream.sessionClose()
 		return nil, net.ErrClosed
 	}
 	s.streams[sid] = stream
 	s.streamLock.Unlock()
-	cleanup := func() {
-		s.streamLock.Lock()
-		if s.streams[sid] == stream {
-			delete(s.streams, sid)
+	cleanup := func() { _ = stream.Close() }
+	operationError := func(err error) error {
+		if canceled := ctx.Err(); canceled != nil {
+			failure := netproxy.ClassifyFailure(err)
+			if failure.Scope == netproxy.ScopeSharedResource && failure.Origin != netproxy.OriginLocalCleanup {
+				return errors.Join(err, canceled)
+			}
+			return canceled
 		}
-		s.streamLock.Unlock()
-		stream.sessionClose()
+		return err
 	}
 
-	frame := newFrame(cmdSettings, sid)
-	frame.data = settingsBytes(s.GetPadding())
-	if _, err := writeFrame(s, frame); err != nil {
+	if _, err := s.writeFrame(cmdSYN, sid, tgtAddr, stream.writeStop, ctx.Done()); err != nil {
 		cleanup()
-		return nil, err
+		return nil, operationError(err)
 	}
 
-	frame = newFrame(cmdSYN, sid)
-	if _, err := writeFrame(s, frame); err != nil {
-		cleanup()
-		return nil, err
-	}
-
-	frame = newFrame(cmdPSH, sid)
-	frame.data = tgtAddr
-	if _, err := writeFrame(s, frame); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if s.closed.Load() || stream.closed.Load() {
+	if s.closed.Load() || stream.closed.Load() || !stream.lease.Valid() {
 		cleanup()
 		return nil, net.ErrClosed
 	}
 
-	return stream, nil
-}
-
-func (s *session) newPacketStream(addr, packetAddr string) (*packetStream, error) {
-	stream, err := s.newStream(addr)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
+		cleanup()
 		return nil, err
 	}
-	return &packetStream{
-		stream: stream,
-		addr:   packetAddr,
-	}, nil
+	return stream, nil
 }
 
 func (s *session) removeStream(sid uint32) {
 	s.streamLock.Lock()
 	delete(s.streams, sid)
+	idle := len(s.streams) == 0
 	s.streamLock.Unlock()
-	if s.onIdle != nil {
+	if idle && s.onIdle != nil {
 		s.onIdle(s)
 	}
 }
 
 func (s *session) run() (err error) {
 	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("[Panic]", slog.String("stack", string(debug.Stack())))
-			err = fmt.Errorf("anytls session panic: %v", r)
+		if err != nil {
+			err = s.fail(err, netproxy.OpRead)
 		}
+		_ = s.Close()
 	}()
-	defer s.Close()
-
-	var header rawHeader
+	// A single reusable buffer owns the current frame until dispatch finishes.
+	// Reading every advertised body before dispatch also keeps control frames
+	// from accidentally becoming the next frame header.
+	body := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(body)
+	var header [headerOverHeadSize]byte
 	for {
-		if s.closed.Load() {
-			return net.ErrClosed
-		}
 		if _, err := io.ReadFull(s.conn, header[:]); err != nil {
 			return err
 		}
-		sid := header.StreamID()
-		length := int(header.Length())
-		switch header.Cmd() {
+		command, id, length := header[0], binary.BigEndian.Uint32(header[1:]), int(binary.BigEndian.Uint16(header[5:]))
+		body.Reset()
+		body.Grow(length)
+		if _, err := io.CopyN(body, s.conn, int64(length)); err != nil {
+			return err
+		}
+		data := body.Bytes()
+		s.streamLock.RLock()
+		stream := s.streams[id]
+		s.streamLock.RUnlock()
+		switch command {
 		case cmdWaste:
-			if _, err := io.CopyN(io.Discard, s.conn, int64(length)); err != nil {
-				return err
-			}
 		case cmdPSH:
-			buf := pool.GetBuffer(length)
-			if _, err := io.ReadFull(s.conn, buf); err != nil {
-				pool.PutBuffer(buf)
-				return err
+			if stream != nil && length != 0 {
+				_, _ = stream.pw.Write(data)
 			}
-			s.streamLock.RLock()
-			stream, ok := s.streams[sid]
-			s.streamLock.RUnlock()
-			if ok {
-				if _, err := stream.pw.Write(buf); err != nil {
-					pool.PutBuffer(buf)
+		case cmdFIN, cmdHeartRequest, cmdHeartResponse:
+			if length != 0 {
+				return protocolError(fmt.Sprintf("command %d cannot carry data", command))
+			}
+			if command == cmdFIN && stream != nil {
+				_ = stream.remoteClose()
+			}
+			if command == cmdHeartRequest {
+				if _, err := s.writeFrame(cmdHeartResponse, id, nil, nil, nil); err != nil {
 					return err
 				}
-			}
-			pool.PutBuffer(buf)
-		case cmdAlert:
-			buf := pool.GetBuffer(length)
-			if _, err := io.ReadFull(s.conn, buf); err != nil {
-				pool.PutBuffer(buf)
-				return err
-			}
-			slog.Error("[Alert]", slog.String("msg", string(buf)))
-			pool.PutBuffer(buf)
-		case cmdFIN:
-			s.streamLock.RLock()
-			stream, ok := s.streams[sid]
-			s.streamLock.RUnlock()
-			if ok {
-				stream.remoteClose()
-			}
-		case cmdUpdatePaddingScheme:
-			if length > 0 {
-				buf := pool.GetBuffer(length)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
-					pool.PutBuffer(buf)
-					return err
-				}
-				updatePaddingScheme(buf)
-				pool.PutBuffer(buf)
 			}
 		case cmdSYNACK:
-			if length > 0 {
-				buf := pool.GetBuffer(length)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
-					pool.PutBuffer(buf)
-					return err
-				}
-				s.streamLock.RLock()
-				stream, ok := s.streams[sid]
-				s.streamLock.RUnlock()
-				if ok {
-					stream.Close()
-				}
-				pool.PutBuffer(buf)
+			if length != 0 && stream != nil {
+				stream.reject(fmt.Errorf("target rejected connection: %s", data))
+			}
+		case cmdAlert:
+			return netproxy.WrapFailure(fmt.Errorf("AnyTLS peer alert: %s", data), netproxy.Failure{Layer: netproxy.LayerAnyTLS, Scope: netproxy.ScopeSharedResource, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonRejected})
+		case cmdUpdatePaddingScheme:
+			if padding := NewPaddingFactory(data); padding != nil {
+				s.padding.Store(padding)
 			}
 		case cmdServerSettings:
-			if length > 0 {
-				buffer := pool.GetBuffer(length)
-				if _, err := io.ReadFull(s.conn, buffer); err != nil {
-					pool.PutBuffer(buffer)
-					return err
-				}
-				// check server's version
-				m := stringMapFromBytes(buffer)
-				if v, err := strconv.Atoi(m["v"]); err == nil {
-					s.peerVersion = byte(v)
-				}
-				pool.PutBuffer(buffer)
-			}
-
-		case cmdHeartRequest:
-			frame := newFrame(cmdHeartResponse, sid)
-			if _, err := writeFrame(s, frame); err != nil {
-				return err
-			}
-		case cmdHeartResponse:
+			// Version 2 adds optional acknowledgements; opening remains optimistic.
 		default:
-			return fmt.Errorf("invalid cmd: %d", header.Cmd())
+			return protocolError(fmt.Sprintf("invalid server command %d", command))
 		}
 	}
+}
+func protocolError(detail string) error {
+	return netproxy.WrapFailure(errors.New(detail), netproxy.Failure{Layer: netproxy.LayerAnyTLS, Scope: netproxy.ScopeSharedResource, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonProtocol})
 }
 
 func (s *session) Close() error {
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
+		if s.lease != nil {
+			cause := s.failure(net.ErrClosed, netproxy.OpClose)
+			if netproxy.ClassifyFailure(cause).Scope != netproxy.ScopeSharedResource {
+				cause = netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: s.lease.Resource(), Scope: netproxy.ScopeSharedResource, Layer: netproxy.LayerAnyTLS, Phase: netproxy.OpClose, Origin: netproxy.OriginLocalCleanup})
+			}
+			s.lease.Invalidate(cause)
+		}
 		s.streamLock.Lock()
 		streams := make([]*stream, 0, len(s.streams))
 		for _, stream := range s.streams {
@@ -242,79 +201,162 @@ func (s *session) Close() error {
 	return s.closeErr
 }
 
-func (s *session) SetPadding(padding *paddingFactory) {
-	s.padding.Store(padding)
+func (s *session) lockWrite(streamStop, operationStop <-chan struct{}) error {
+	canceled := func() error {
+		return netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Scope: netproxy.ScopeOperation, Layer: netproxy.LayerAnyTLS, Origin: netproxy.OriginLocalCleanup, Phase: netproxy.OpWrite})
+	}
+	select {
+	case <-streamStop:
+		return canceled()
+	case <-operationStop:
+		return canceled()
+	case <-s.lease.Done():
+		return s.failure(net.ErrClosed, netproxy.OpWrite)
+	case <-s.writeGate:
+	}
+	select {
+	case <-streamStop:
+		s.writeGate <- struct{}{}
+		return canceled()
+	case <-operationStop:
+		s.writeGate <- struct{}{}
+		return canceled()
+	case <-s.lease.Done():
+		s.writeGate <- struct{}{}
+		return s.failure(net.ErrClosed, netproxy.OpWrite)
+	default:
+	}
+	return nil
 }
+func (s *session) writeLocked(b []byte) (n int, err error) {
+	defer func() {
+		if err != nil {
+			err = s.fail(err, netproxy.OpWrite)
+			_ = s.Close()
+		}
+	}()
 
-func (s *session) GetPadding() *paddingFactory {
-	return s.padding.Load().(*paddingFactory)
-}
-
-func (s *session) writeConn(b []byte) (n int, err error) {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-
-	// calulate & send padding
+	total := len(b)
+	write := func(data []byte) error {
+		n, err := s.conn.Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+		return err
+	}
 	if s.sendPadding {
-		pkt := s.pktCounter.Add(1)
-		paddingF := s.GetPadding()
-		if pkt < paddingF.Stop {
-			pktSizes := paddingF.GenerateRecordPayloadSizes(pkt)
-			for _, l := range pktSizes {
-				remainPayloadLen := len(b)
-				if l == CheckMark {
-					if remainPayloadLen == 0 {
-						break
-					} else {
-						continue
-					}
-				}
-				// logrus.Debugln(pkt, "write", l, "len", remainPayloadLen, "remain", remainPayloadLen-l)
-				if remainPayloadLen > l { // this packet is all payload
-					_, err = s.conn.Write(b[:l])
-					if err != nil {
-						return 0, err
-					}
-					n += l
-					b = b[l:]
-				} else if remainPayloadLen > 0 { // this packet contains padding and the last part of payload
-					paddingLen := l - remainPayloadLen - headerOverHeadSize
-					if paddingLen > 0 {
-						padding := make([]byte, headerOverHeadSize+paddingLen)
-						padding[0] = cmdWaste
-						binary.BigEndian.PutUint32(padding[1:5], 0)
-						binary.BigEndian.PutUint16(padding[5:7], uint16(paddingLen))
-						b = slices.Concat(b, padding)
-					}
-					_, err = s.conn.Write(b)
-					if err != nil {
-						return 0, err
-					}
-					n += remainPayloadLen
-					b = nil
-				} else { // this packet is all padding
-					padding := make([]byte, headerOverHeadSize+l)
-					padding[0] = cmdWaste
-					binary.BigEndian.PutUint32(padding[1:5], 0)
-					binary.BigEndian.PutUint16(padding[5:7], uint16(l))
-					_, err = s.conn.Write(padding)
-					if err != nil {
-						return 0, err
-					}
-					b = nil
-				}
-			}
-			// maybe still remain payload to write
-			if len(b) == 0 {
-				return
-			} else {
-				n2, err := s.conn.Write(b)
-				return n + n2, err
-			}
-		} else {
+		s.pktCounter++
+		padding := s.padding.Load()
+		if s.pktCounter >= padding.Stop {
 			s.sendPadding = false
+		} else {
+			record := pool.GetBytesBuffer()
+			defer pool.PutBytesBuffer(record)
+			for _, size := range padding.GenerateRecordPayloadSizes(s.pktCounter) {
+				if size == CheckMark {
+					if len(b) == 0 {
+						break
+					}
+					continue
+				}
+				record.Reset()
+				count := min(size, len(b))
+				_, _ = record.Write(b[:count])
+				b = b[count:]
+				if waste := size - count - headerOverHeadSize; waste >= 0 {
+					// Every byte exposed by a pooled buffer is initialized before sending.
+					appendFrame(record, cmdWaste, 0, make([]byte, waste))
+				}
+				if err := write(record.Bytes()); err != nil {
+					return 0, err
+				}
+			}
 		}
 	}
+	if len(b) != 0 {
+		if err := write(b); err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
+}
 
-	return s.conn.Write(b)
+func (s *session) fail(err error, phase netproxy.Operation) error {
+	if err == nil {
+		return nil
+	}
+	s.failureMu.Lock()
+	defer s.failureMu.Unlock()
+	if s.rootCause != nil {
+		return s.rootCause
+	}
+	if parentCause := s.lease.Cause(); parentCause != nil && netproxy.ClassifyFailure(parentCause).Origin != netproxy.OriginLocalCleanup {
+		err = parentCause
+	}
+	fact := netproxy.ClassifyFailure(err)
+	fact.Resource = s.lease.Resource()
+	fact.Scope, fact.Phase = netproxy.ScopeSharedResource, phase
+	if fact.Layer == netproxy.LayerUnknown {
+		fact.Layer = netproxy.LayerAnyTLS
+	}
+	if err == io.EOF {
+		fact.Reason = netproxy.ReasonClosed
+	}
+	s.rootCause = netproxy.WrapFailure(err, fact)
+	s.lease.Invalidate(s.rootCause)
+	return s.rootCause
+}
+func (s *session) failure(err error, phase netproxy.Operation) error {
+	s.failureMu.Lock()
+	cause := s.rootCause
+	s.failureMu.Unlock()
+	if cause != nil {
+		return cause
+	}
+	if parentCause := s.lease.Cause(); parentCause != nil && netproxy.ClassifyFailure(parentCause).Origin != netproxy.OriginLocalCleanup {
+		fact := netproxy.ClassifyFailure(parentCause)
+		fact.Resource, fact.Scope = s.lease.Resource(), netproxy.ScopeSharedResource
+		if fact.Layer == netproxy.LayerUnknown {
+			fact.Layer = netproxy.LayerAnyTLS
+		}
+		return netproxy.WrapFailure(parentCause, fact)
+	}
+	fact := netproxy.ClassifyFailure(err)
+	fact.Resource, fact.Phase = s.lease.Resource(), phase
+	if fact.Scope == netproxy.ScopeUnknown {
+		fact.Scope = netproxy.ScopeStream
+	}
+	if fact.Layer == netproxy.LayerUnknown {
+		fact.Layer = netproxy.LayerAnyTLS
+	}
+	return netproxy.WrapFailure(err, fact)
+}
+
+// A single bounded control queue prevents closed streams from leaving one
+// goroutine each waiting behind a blocked shared write.
+func (s *session) scheduleFIN(id uint32) {
+	if s.closed.Load() || !s.lease.Valid() {
+		return
+	}
+	select {
+	case s.pendingFIN <- id:
+		return
+	case <-s.lease.Done():
+		return
+	default:
+	}
+	_ = s.fail(netproxy.WrapFailure(errors.New("AnyTLS close-frame queue exhausted"), netproxy.Failure{Scope: netproxy.ScopeSharedResource, Layer: netproxy.LayerAnyTLS, Origin: netproxy.OriginLocalProtocol, Reason: netproxy.ReasonCapacity}), netproxy.OpClose)
+	_ = s.Close()
+}
+func (s *session) flushFIN() {
+	for {
+		select {
+		case <-s.lease.Done():
+			return
+		case id := <-s.pendingFIN:
+			if _, err := s.writeFrame(cmdFIN, id, nil, s.lease.Done(), nil); err != nil {
+				return
+			}
+		}
+	}
 }

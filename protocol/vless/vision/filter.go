@@ -5,84 +5,41 @@ import (
 	"encoding/binary"
 )
 
-var (
-	tls13SupportedVersions  = []byte{0x00, 0x2b, 0x00, 0x02, 0x03, 0x04}
-	tlsClientHandshakeStart = []byte{0x16, 0x03}
-	tlsServerHandshakeStart = []byte{0x16, 0x03, 0x03}
-	tlsApplicationDataStart = []byte{0x17, 0x03, 0x03}
+var tls13SupportedVersions = []byte{0, 43, 0, 2, 3, 4}
 
-	tls13CipherSuiteMap = map[uint16]string{
-		0x1301: "TLS_AES_128_GCM_SHA256",
-		0x1302: "TLS_AES_256_GCM_SHA384",
-		0x1303: "TLS_CHACHA20_POLY1305_SHA256",
-		0x1304: "TLS_AES_128_CCM_SHA256",
-		0x1305: "TLS_AES_128_CCM_8_SHA256",
+// Detection only enables the direct optimization when a supported TLS 1.3
+// ServerHello was observed. Undecidable/fragmented traffic remains encapsulated.
+func (c *Conn) filterTLS(p []byte) (bool, bool, int) {
+	c.filterMu.Lock()
+	defer c.filterMu.Unlock()
+	if len(p) == 0 || c.packetsToFilter <= 0 {
+		return c.isTLS, c.enableXTLS, c.packetsToFilter
 	}
-)
-
-const (
-	tlsHandshakeTypeClientHello byte = 0x01
-	tlsHandshakeTypeServerHello byte = 0x02
-)
-
-func (vc *Conn) FilterTLS(buffer []byte) (index int) {
-	if vc.packetsToFilter <= 0 {
-		return 0
-	}
-	lenP := len(buffer)
-	vc.packetsToFilter--
-	if index = bytes.Index(buffer, tlsServerHandshakeStart); index != -1 {
-		if lenP > index+5 {
-			if buffer[0] == 22 && buffer[1] == 3 && buffer[2] == 3 {
-				vc.isTLS = true
-				if buffer[5] == tlsHandshakeTypeServerHello {
-					//logrus.Infof("isTLS12orAbove")
-					vc.remainingServerHello = binary.BigEndian.Uint16(buffer[index+3:]) + 5
-					vc.isTLS12orAbove = true
-					if lenP-index >= 79 && vc.remainingServerHello >= 79 {
-						sessionIDLen := int(buffer[index+43])
-						vc.cipher = binary.BigEndian.Uint16(buffer[index+43+sessionIDLen+1:])
-					}
-				}
+	c.packetsToFilter--
+	index := bytes.Index(p, []byte{22, 3, 3})
+	if index >= 0 && len(p) >= index+6 && p[index+5] == 2 {
+		c.isTLS = true
+		c.remainingServerHello = binary.BigEndian.Uint16(p[index+3:]) + 5
+		if len(p) > index+43 {
+			sid := int(p[index+43])
+			if len(p) >= index+46+sid {
+				c.cipher = binary.BigEndian.Uint16(p[index+44+sid:])
 			}
 		}
-	} else if index = bytes.Index(buffer, tlsClientHandshakeStart); index != -1 {
-		if lenP > index+5 && buffer[index+5] == tlsHandshakeTypeClientHello {
-			vc.isTLS = true
+	} else if i := bytes.Index(p, []byte{22, 3}); i >= 0 && len(p) >= i+6 && p[i+5] == 1 {
+		c.isTLS = true
+	}
+	if c.remainingServerHello > 0 {
+		start := max(0, index)
+		size := min(int(c.remainingServerHello), len(p)-start)
+		if bytes.Contains(p[start:start+size], tls13SupportedVersions) && c.cipher >= 0x1301 && c.cipher <= 0x1304 {
+			c.enableXTLS = true
+			c.packetsToFilter = 0
+		}
+		c.remainingServerHello -= uint16(size)
+		if c.remainingServerHello == 0 {
+			c.packetsToFilter = 0
 		}
 	}
-
-	if vc.remainingServerHello > 0 {
-		end := int(vc.remainingServerHello)
-		i := index
-		if i < 0 {
-			i = 0
-		}
-		if i+end > lenP {
-			end = lenP
-			vc.remainingServerHello -= uint16(end - i)
-		} else {
-			vc.remainingServerHello -= uint16(end)
-			end += i
-		}
-		if bytes.Contains(buffer[i:end], tls13SupportedVersions) {
-			// TLS 1.3 Client Hello
-			cs, ok := tls13CipherSuiteMap[vc.cipher]
-			if ok && cs != "TLS_AES_128_CCM_8_SHA256" {
-				vc.enableXTLS = true
-			}
-			// logrus.Infof("XTLS Vision found TLS 1.3, packetLength=%d， CipherSuite=%s", lenP, cs)
-			vc.packetsToFilter = 0
-			return
-		} else if vc.remainingServerHello <= 0 {
-			// logrus.Infof("XTLS Vision found TLS 1.2, packetLength=%d", lenP)
-			vc.packetsToFilter = 0
-			return
-		}
-		// logrus.Infof("XTLS Vision found inconclusive server hello, packetLength=%d, remainingServerHelloBytes=%d", lenP, vc.remainingServerHello)
-	}
-	// if vc.packetsToFilter <= 0 {
-	// 	logrus.Infof("XTLS Vision stop filtering")
-	// }
-	return
+	return c.isTLS, c.enableXTLS, c.packetsToFilter
 }

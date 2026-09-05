@@ -14,10 +14,6 @@ func NewDialTimeoutContextFrom(ctx context.Context) (context.Context, context.Ca
 	return context.WithTimeout(ctx, DialTimeout)
 }
 
-func NewDialTimeoutContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), DialTimeout)
-}
-
 // Dialer establishes connections with one of two addressing semantics.
 // DialContext binds the returned connection to one destination. ListenPacket
 // opens a packet association whose ReadFrom and WriteTo calls carry per-packet

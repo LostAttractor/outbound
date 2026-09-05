@@ -6,12 +6,11 @@ import (
 	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 )
 
 // Mux is a base Mux struct
 type Mux struct {
-	protocol.StatelessDialer
+	ParentDialer   netproxy.Dialer
 	Addr           string
 	PassthroughUdp bool
 }

@@ -12,15 +12,14 @@ import (
 )
 
 func MultiWrite(dst io.Writer, bs ...[]byte) (int64, error) {
-	var n int
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
 	for _, b := range bs {
-		n += len(b)
+		buf.Write(b)
 	}
-	buf := pool.Get(n)[:0]
-	defer buf.Put()
-	for _, b := range bs {
-		buf = append(buf, b...)
+	n, err := dst.Write(buf.Bytes())
+	if n < buf.Len() && err == nil {
+		err = io.ErrShortWrite
 	}
-	n, err := dst.Write(buf)
 	return int64(n), err
 }

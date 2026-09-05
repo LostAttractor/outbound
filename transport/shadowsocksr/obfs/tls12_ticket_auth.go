@@ -14,17 +14,6 @@ import (
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/proto"
 )
 
-func init() {
-	register("tls1.2_ticket_auth", &constructor{
-		New:      newTLS12TicketAuth,
-		Overhead: 5,
-	})
-	register("tls1.2_ticket_fastauth", &constructor{
-		New:      newTLS12TicketFastAuth,
-		Overhead: 5,
-	})
-}
-
 type tlsAuthData struct {
 	localClientID [32]byte
 }
@@ -32,24 +21,19 @@ type tlsAuthData struct {
 // tls12TicketAuth tls1.2_ticket_auth Obfs encapsulate
 type tls12TicketAuth struct {
 	ServerInfo
-	data            *tlsAuthData
-	handshakeStatus int
-	sendSaver       bytes.Buffer
-	recvBuffer      bytes.Buffer
-	fastAuth        bool
-	buffer          bytes.Buffer
+	data              *tlsAuthData
+	handshakeStatus   int
+	sendSaver         bytes.Buffer
+	recvBuffer        bytes.Buffer
+	receivedHandshake bool
+	fastAuth          bool
+	buffer            bytes.Buffer
 }
 
-// newTLS12TicketAuth create a tlv1.2_ticket_auth object
-func newTLS12TicketAuth() IObfs {
-	return &tls12TicketAuth{}
-}
-
-// newTLS12TicketFastAuth create a tlv1.2_ticket_fastauth object
-func newTLS12TicketFastAuth() IObfs {
-	return &tls12TicketAuth{
-		fastAuth: true,
-	}
+func newTLS12TicketAuth(fast bool) IObfs {
+	t := &tls12TicketAuth{data: new(tlsAuthData), fastAuth: fast}
+	rand.Read(t.data.localClientID[:])
+	return t
 }
 
 func (t *tls12TicketAuth) SetServerInfo(s *ServerInfo) {
@@ -58,23 +42,6 @@ func (t *tls12TicketAuth) SetServerInfo(s *ServerInfo) {
 
 func (t *tls12TicketAuth) GetServerInfo() (s *ServerInfo) {
 	return &t.ServerInfo
-}
-
-func (t *tls12TicketAuth) SetData(data interface{}) {
-	if auth, ok := data.(*tlsAuthData); ok {
-		t.data = auth
-	}
-}
-
-func (t *tls12TicketAuth) GetData() interface{} {
-	if t.data == nil {
-		t.data = &tlsAuthData{}
-		b := make([]byte, 32)
-
-		rand.Read(b)
-		copy(t.data.localClientID[:], b)
-	}
-	return t.data
 }
 
 func (t *tls12TicketAuth) getHost() string {
@@ -229,51 +196,86 @@ func (t *tls12TicketAuth) Encode(data []byte) ([]byte, error) {
 		l += 1
 		packData(&t.sendSaver, data)
 		t.handshakeStatus = 1
+		if t.fastAuth {
+			finished, err := t.Encode(nil)
+			return append(encodedData, finished...), err
+		}
 		return encodedData, nil
 	default:
 		return nil, fmt.Errorf("unexpected handshake status: %d", t.handshakeStatus)
 	}
 }
 
-func (t *tls12TicketAuth) Decode(data []byte) (decodedData []byte, needSendBack bool, err error) {
-	if t.handshakeStatus == -1 {
-		return data, false, nil
-	}
+// Decode accepts fragmented server records and authenticates both the hello
+// and the complete handshake before exposing application bytes.
+func (t *tls12TicketAuth) Decode(data []byte) ([]byte, bool, error) {
+	t.recvBuffer.Write(data)
 	t.buffer.Reset()
-	if t.handshakeStatus == 8 {
-		t.recvBuffer.Write(data)
-		for t.recvBuffer.Len() > 5 {
-			var h [5]byte
-			_, _ = t.recvBuffer.Read(h[:])
-			if !bytes.Equal(h[0:3], []byte{0x17, 0x3, 0x3}) {
-				return nil, false, fmt.Errorf("%w: incorrect magic number: %v, 0x170303 is expected", proto.ErrTLS12TicketAuthIncorrectMagicNumber, h[0:3])
-			}
-			size := int(binary.BigEndian.Uint16(h[3:5]))
-			if t.recvBuffer.Len() < size {
-				// read it next time
-				unread := t.recvBuffer.Bytes()
-				t.recvBuffer.Reset()
-				t.recvBuffer.Write(h[:])
-				t.recvBuffer.Write(unread)
-				break
-			}
-			d := make([]byte, size)
-			_, _ = t.recvBuffer.Read(d)
-			t.buffer.Write(d)
-		}
-		return t.buffer.Bytes(), false, nil
-	}
-
-	if len(data) < 11+32+1+32 {
+	if t.recvBuffer.Len() > 64<<10 {
 		return nil, false, proto.ErrTLS12TicketAuthTooShortData
 	}
-
-	hash := t.hmacSHA1(data[11 : 11+22])
-
-	if !hmac.Equal(data[33:33+proto.ObfsHMACSHA1Len], hash) {
-		return nil, false, proto.ErrTLS12TicketAuthHMACError
+	needSendBack := false
+	if !t.receivedHandshake {
+		data = t.recvBuffer.Bytes()
+		changed := false
+		for offset := 0; ; {
+			if len(data)-offset < 5 {
+				return nil, false, nil
+			}
+			header := data[offset : offset+5]
+			if header[1] != 3 || header[2] != 3 {
+				return nil, false, proto.ErrTLS12TicketAuthIncorrectMagicNumber
+			}
+			size := int(binary.BigEndian.Uint16(header[3:]))
+			end := offset + 5 + size
+			if end > len(data) {
+				return nil, false, nil
+			}
+			if offset == 0 {
+				if header[0] != 0x16 || end < 76 || data[5] != 2 {
+					return nil, false, proto.ErrTLS12TicketAuthTooShortData
+				}
+				if !hmac.Equal(data[33:43], t.hmacSHA1(data[11:33])) {
+					return nil, false, proto.ErrTLS12TicketAuthHMACError
+				}
+			} else if changed {
+				if header[0] != 0x16 || size < 10 {
+					return nil, false, proto.ErrTLS12TicketAuthTooShortData
+				}
+				if !hmac.Equal(data[end-10:end], t.hmacSHA1(data[:end-10])) {
+					return nil, false, proto.ErrTLS12TicketAuthHMACError
+				}
+				t.recvBuffer.Next(end)
+				t.receivedHandshake = true
+				needSendBack = t.handshakeStatus != 8
+				break
+			} else if header[0] == 0x14 {
+				if size != 1 || data[offset+5] != 1 {
+					return nil, false, proto.ErrTLS12TicketAuthIncorrectMagicNumber
+				}
+				changed = true
+			} else if header[0] != 0x16 {
+				return nil, false, proto.ErrTLS12TicketAuthIncorrectMagicNumber
+			}
+			offset = end
+		}
 	}
-	return nil, true, nil
+	for t.recvBuffer.Len() >= 5 {
+		data = t.recvBuffer.Bytes()
+		if !bytes.Equal(data[:3], []byte{0x17, 3, 3}) {
+			return nil, false, proto.ErrTLS12TicketAuthIncorrectMagicNumber
+		}
+		size := int(binary.BigEndian.Uint16(data[3:5]))
+		if size > 16384 {
+			return nil, false, proto.ErrTLS12TicketAuthTooShortData
+		}
+		if len(data) < size+5 {
+			break
+		}
+		t.buffer.Write(data[5 : size+5])
+		t.recvBuffer.Next(size + 5)
+	}
+	return t.buffer.Bytes(), needSendBack, nil
 }
 
 func (t *tls12TicketAuth) packAuthData() (outData []byte) {

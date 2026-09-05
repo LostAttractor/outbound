@@ -1,220 +1,191 @@
 package vision
 
 import (
+	"bufio"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
+	"strconv"
+	"sync"
 
-	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 )
-
-var _ netproxy.PacketConn = (*PacketConn)(nil)
 
 type PacketConn struct {
 	*Conn
-	network string
-	addr    string
+	target                           net.Addr
+	reader                           *bufio.Reader
+	readPacketMu, writePacketMu      sync.Mutex
+	sent                             bool
+	stage, metadataSize, payloadSize int
+	source                           net.Addr
+	readPacketErr                    error
 }
 
-func (c *PacketConn) Read(b []byte) (n int, err error) {
-	switch c.network {
-	case "tcp":
-		return c.Conn.Read(b)
-	case "udp":
-		n, _, err = c.ReadFrom(b)
-		return n, err
-	default:
-		return 0, fmt.Errorf("unsupported network: %s", c.network)
-	}
+func NewPacketConn(conn *Conn, target net.Addr) *PacketConn {
+	return &PacketConn{Conn: conn, target: target, reader: bufio.NewReaderSize(conn, 65535)}
 }
-
-func (c *PacketConn) Write(b []byte) (n int, err error) {
-	switch c.network {
-	case "tcp":
-		return c.Conn.Write(b)
-	case "udp":
-		return c.WriteTo(b, c.addr)
-	default:
-		return 0, fmt.Errorf("unsupported network: %s", c.network)
+func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if addr == nil {
+		return 0, fmt.Errorf("missing XUDP destination")
 	}
-}
-
-// +-------------------+-------------------+
-// | Frame Length (2B) | Frame Header (4B) |
-// +-------------------+-------------------+
-// |Net Type (1B) | PORT (2B)  | IP Type (1B) | IP Address |
-// +-------------------+-------------------+
-// |   Length Data     |     Payload      |
-// +-------------------+-------------------+
-func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
-	// Read frame length (2 bytes)
-	var frameLengthBytes [2]byte
-	if _, err = io.ReadFull(c.Conn, frameLengthBytes[:]); err != nil {
-		return 0, netip.AddrPort{}, err
+	if len(p) > 65535 {
+		return 0, fmt.Errorf("XUDP datagram too large: %d", len(p))
 	}
-	frameLength := binary.BigEndian.Uint16(frameLengthBytes[:])
-
-	// Read frame header (4 bytes)
-	var frameHeaderBytes [4]byte
-	if _, err = io.ReadFull(c.Conn, frameHeaderBytes[:]); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-
-	switch frameHeaderBytes[2] {
-	case 0x01:
-		return 0, netip.AddrPort{}, fmt.Errorf("unexpected frame new")
-	case 0x02:
-		// Keep
-		if frameLength > 4 {
-			addrData := make([]byte, frameLength-4)
-			if _, err = io.ReadFull(c.Conn, addrData); err != nil {
-				return 0, netip.AddrPort{}, err
-			}
-			addr, err = ReadPacketAddr(addrData)
-			if err != nil {
-				return 0, netip.AddrPort{}, err
-			}
-		}
-	case 0x03:
-		return 0, netip.AddrPort{}, io.EOF
-	case 0x04:
-		// KeepAlive
-	default:
-		return 0, netip.AddrPort{}, fmt.Errorf("unsupported frame header: %x", frameHeaderBytes[2])
-	}
-
-	if frameHeaderBytes[3]&1 != 1 {
-		return c.ReadFrom(p)
-	}
-
-	// Read length and payload
-	var lengthBytes [2]byte
-	if _, err = io.ReadFull(c.Conn, lengthBytes[:]); err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	length := binary.BigEndian.Uint16(lengthBytes[:])
-
-	if length > uint16(len(p)) {
-		return 0, netip.AddrPort{}, fmt.Errorf("buffer too small")
-	}
-
-	n, err = io.ReadFull(c.Conn, p[:length])
-	return n, addr, err
-}
-
-// +------------------------+------------------------+
-// |  Metadata Length (2B)  |    Session ID (2B)    |
-// +------------------------+------------------------+
-// |    Type (1B)          |    Options (1B)        |
-// |    (New=1/Keep=2)     |                        |
-// +------------------------+------------------------+
-// |  Protocol Type (1B)    |                       |
-// +------------------------+                       |
-// |     Target Address     |       Port            |
-// |     (Variable)         |                       |
-// +------------------------+------------------------+
-// |     Global ID (8B)     |                       |
-// |     (Optional)         |                       |
-// +------------------------+------------------------+
-// |   Data Length (2B)     |      Payload          |
-// +------------------------+------------------------+
-func (pc *PacketConn) WriteTo(p []byte, addr string) (n int, err error) {
-	dataLen := len(p)
-	prefix, err := pc.prefixPacket(addr)
+	target, err := socks5.AddressFromString(addr.String())
 	if err != nil {
 		return 0, err
 	}
-	defer prefix.Put()
-	_, err = iout.MultiWrite(pc.writer, prefix, []byte{byte(dataLen >> 8), byte(dataLen)}, p)
+	if len(target.Hostname) > 255 {
+		return 0, fmt.Errorf("XUDP hostname exceeds 255 bytes")
+	}
+	c.writePacketMu.Lock()
+	defer c.writePacketMu.Unlock()
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	buf.Write([]byte{0, 0, 0, 0})
+	command := byte(1)
+	if c.sent {
+		command = 2
+	}
+	buf.WriteByte(command)
+	buf.WriteByte(1)
+	buf.WriteByte(2)
+	buf.WriteByte(byte(target.Port >> 8))
+	buf.WriteByte(byte(target.Port))
+	switch target.Type {
+	case socks5.AddressTypeIPv4:
+		buf.WriteByte(1)
+		buf.Write(target.IP.AsSlice())
+	case socks5.AddressTypeIPv6:
+		buf.WriteByte(3)
+		buf.Write(target.IP.AsSlice())
+	case socks5.AddressTypeDomain:
+		buf.WriteByte(2)
+		buf.WriteByte(byte(len(target.Hostname)))
+		buf.WriteString(target.Hostname)
+	}
+	binary.BigEndian.PutUint16(buf.Bytes(), uint16(buf.Len()-2))
+	buf.WriteByte(byte(len(p) >> 8))
+	buf.WriteByte(byte(len(p)))
+	buf.Write(p)
+	n, err := c.Conn.Write(buf.Bytes())
+	if err == nil && n != buf.Len() {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		return 0, err
 	}
+	c.sent = true
 	return len(p), nil
 }
-
-func (pc *PacketConn) prefixPacket(addr string) (pool.PB, error) {
-	address, err := netip.ParseAddrPort(addr)
-	if err != nil {
-		return nil, err
+func readPacketAddress(p []byte) (net.Addr, error) {
+	if len(p) < 4 || p[0] != 2 {
+		return nil, visionError("invalid XUDP network/address")
 	}
-	packetAddrLen := IPAddrToPacketAddrLength(address)
-	prefix := pool.Get(7 + packetAddrLen)
-	l := len(prefix) - 2
-	err = PutPacketAddr(prefix[7:], address)
-	if err != nil {
-		return nil, err
+	port := binary.BigEndian.Uint16(p[1:3])
+	typ := p[3]
+	p = p[4:]
+	host := ""
+	switch typ {
+	case 1, 3:
+		size := 4
+		if typ == 3 {
+			size = 16
+		}
+		if len(p) < size {
+			return nil, visionError("truncated XUDP IP")
+		}
+		ip, _ := netip.AddrFromSlice(p[:size])
+		host = ip.String()
+	case 2:
+		if len(p) < 1 || len(p) < 1+int(p[0]) {
+			return nil, visionError("truncated XUDP domain")
+		}
+		host = string(p[1 : 1+int(p[0])])
+	default:
+		return nil, visionError("invalid XUDP address type")
 	}
-	if pc.needHandshake {
-		pc.needHandshake = false
-		prefix[0] = byte(l >> 8)
-		prefix[1] = byte(l)
-		prefix[2] = 0
-		prefix[3] = 0
-		prefix[4] = 1 // new
-		prefix[5] = 1 // option
-		prefix[6] = 2 // udp
-	} else {
-		prefix[0] = byte(l >> 8)
-		prefix[1] = byte(l)
-		prefix[2] = 0
-		prefix[3] = 0
-		prefix[4] = 2 // keep
-		prefix[5] = 1 // option
-		prefix[6] = 2 // udp
-	}
-
-	return prefix, err
+	return netproxy.NewAddr("udp", net.JoinHostPort(host, strconv.Itoa(int(port)))), nil
 }
-
-func IPAddrToPacketAddrLength(addr netip.AddrPort) int {
-	nip, ok := netip.AddrFromSlice(addr.Addr().AsSlice())
-	if !ok {
-		return 0
+func (c *PacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.readPacketMu.Lock()
+	defer c.readPacketMu.Unlock()
+	if c.readPacketErr != nil {
+		return 0, nil, c.readPacketErr
 	}
-
-	if nip.Is4() {
-		return 1 + 4 + 2
-	} else {
-		return 1 + 16 + 2
+	for {
+		if c.stage == 0 {
+			header, err := c.reader.Peek(2)
+			if err != nil {
+				return 0, nil, err
+			}
+			c.metadataSize = int(binary.BigEndian.Uint16(header))
+			if c.metadataSize < 4 || c.metadataSize > 512 {
+				c.readPacketErr = visionError("invalid XUDP metadata length")
+				return 0, nil, c.readPacketErr
+			}
+			_, _ = c.reader.Discard(2)
+			c.stage = 1
+		}
+		if c.stage == 1 {
+			metadata, err := c.reader.Peek(c.metadataSize)
+			if err != nil {
+				return 0, nil, err
+			}
+			command, option := metadata[2], metadata[3]
+			c.source = c.target
+			if command == 3 {
+				c.readPacketErr = io.EOF
+				return 0, nil, io.EOF
+			}
+			if command != 2 && command != 4 {
+				c.readPacketErr = visionError("unexpected XUDP command")
+				return 0, nil, c.readPacketErr
+			}
+			if command == 2 && len(metadata) > 4 {
+				c.source, err = readPacketAddress(metadata[4:])
+				if err != nil {
+					c.readPacketErr = err
+					return 0, nil, err
+				}
+			}
+			_, _ = c.reader.Discard(c.metadataSize)
+			if option&1 == 0 {
+				c.stage = 0
+				continue
+			}
+			c.stage = 2
+			if command == 4 {
+				c.source = nil
+			}
+		}
+		if c.stage == 2 {
+			header, err := c.reader.Peek(2)
+			if err != nil {
+				return 0, nil, err
+			}
+			c.payloadSize = int(binary.BigEndian.Uint16(header))
+			_, _ = c.reader.Discard(2)
+			c.stage = 3
+		}
+		payload, err := c.reader.Peek(c.payloadSize)
+		if err != nil {
+			return 0, nil, err
+		}
+		n := copy(p, payload)
+		_, _ = c.reader.Discard(c.payloadSize)
+		c.stage = 0
+		if c.source == nil {
+			continue
+		}
+		if n < c.payloadSize {
+			return n, c.source, io.ErrShortBuffer
+		}
+		return n, c.source, nil
 	}
-}
-
-func PutPacketAddr(src []byte, addr netip.AddrPort) error {
-	nip, ok := netip.AddrFromSlice(addr.Addr().AsSlice())
-	if !ok {
-		return errors.New("invalid IP")
-	}
-
-	if nip.Is4() {
-		binary.BigEndian.PutUint16(src[0:2], addr.Port())
-		src[2] = 1
-		copy(src[3:7], nip.AsSlice())
-	} else {
-		binary.BigEndian.PutUint16(src[0:2], addr.Port())
-		src[2] = 3
-		copy(src[3:19], nip.AsSlice())
-	}
-
-	return nil
-}
-
-func ReadPacketAddr(p []byte) (addr netip.AddrPort, err error) {
-	p = p[1:]
-	port := binary.BigEndian.Uint16(p[0:2])
-	ipType := p[2]
-	ip := p[3:]
-	if ipType == 1 {
-		ip = ip[:4]
-	} else {
-		ip = ip[:16]
-	}
-	ipAddr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return netip.AddrPort{}, errors.New("invalid IP")
-	}
-	return netip.AddrPortFrom(ipAddr, port), nil
 }

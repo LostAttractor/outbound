@@ -1,12 +1,12 @@
 package tuic
 
 import (
-	"container/list"
-	"context"
+	"encoding/binary"
 	"errors"
 	"net"
-	"net/netip"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -17,268 +17,251 @@ import (
 	"github.com/daeuniverse/quic-go"
 )
 
-type Packets struct {
-	mu               sync.Mutex
-	list             *list.List
-	isEmptyState     context.Context
-	cancelEmptyState func()
-	closed           bool
+const packetQueueSize = 256
+
+// UDP delivery is bounded. A slow association drops packets rather than
+// retaining the connection's datagram reader or an unbounded linked list.
+type packetQueue struct {
+	packets chan *packetFrame
+	done    chan struct{}
+	once    sync.Once
 }
 
-func NewPackets() *Packets {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Packets{
-		mu:               sync.Mutex{},
-		list:             list.New().Init(),
-		isEmptyState:     ctx,
-		cancelEmptyState: cancel,
-	}
+func newPacketQueue() *packetQueue {
+	return &packetQueue{packets: make(chan *packetFrame, packetQueueSize), done: make(chan struct{})}
 }
-
-func (p *Packets) PushBack(packet *Packet) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.list.PushBack(packet)
+func (p *packetQueue) PushBack(packet *packetFrame) {
 	select {
-	case <-p.isEmptyState.Done():
+	case <-p.done:
+		return
 	default:
-		p.cancelEmptyState()
 	}
-}
-
-func (p *Packets) PopFrontBlock() (packet *Packet, closed bool) {
-	<-p.isEmptyState.Done()
-	if p.closed {
-		return nil, true
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	packet = p.list.Remove(p.list.Front()).(*Packet)
-	if p.list.Len() == 0 {
-		p.setEmpty()
-	}
-	return packet, false
-}
-
-func (p *Packets) setEmpty() {
-	p.isEmptyState, p.cancelEmptyState = context.WithCancel(context.Background())
-}
-
-func (p *Packets) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return nil
-	}
-	p.closed = true
 	select {
-	case <-p.isEmptyState.Done():
+	case p.packets <- packet:
 	default:
-		p.cancelEmptyState()
 	}
-	return nil
 }
+func (p *packetQueue) Close() error { p.once.Do(func() { close(p.done) }); return nil }
 
 type quicStreamPacketConn struct {
-	mu sync.Mutex
-
-	target string
-
-	connId          uint16
-	quicConn        *quic.Conn
-	incomingPackets *Packets
-
+	target                string
+	lease                 *netproxy.Lease
+	fail                  func(error)
+	connId                uint16
+	quicConn              *quic.Conn
+	incomingPackets       *packetQueue
 	udpRelayMode          common.UdpRelayMode
 	maxUdpRelayPacketSize int
+	closeDeferFn          func()
+	closeOnce             sync.Once
+	closeErr              error
+	closed                atomic.Bool
 
-	deferQuicConnFn func(err error)
-	closeDeferFn    func()
-
-	closeOnce sync.Once
-	closeErr  error
-	closed    bool
-
-	// TODO: multiple defraggers for different PKT_ID
-	deFraggers sync.Map
-
-	muTimer       sync.Mutex
-	deadlineTimer *time.Timer
+	readMu        sync.Mutex
+	fragments     map[uint16]*deFragger
+	readDeadline  protocol.Deadline
+	writeMu       sync.Mutex
+	stateMu       sync.Mutex
+	writeDeadline time.Time
+	sendStream    *quic.SendStream
 }
 
 func (q *quicStreamPacketConn) Close() error {
 	q.closeOnce.Do(func() {
-		q.closed = true
-		q.closeErr = q.close()
+		cause := netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: q.lease.Resource(), Stream: q.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerQUIC, Phase: netproxy.OpClose, Origin: netproxy.OriginLocalCleanup, Reason: netproxy.ReasonClosed})
+		if !q.shutdown(cause) {
+			return
+		}
+
+		// Dissociate is best effort and bounded even when the peer stops reading.
+		stream, err := q.quicConn.OpenUniStream()
+		if err != nil {
+			q.closeErr = err
+			return
+		}
+		_ = stream.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		frame := binary.BigEndian.AppendUint16([]byte{Ver5, DissociateType}, q.connId)
+		if _, err = stream.Write(frame); err != nil {
+			stream.CancelWrite(0)
+		} else {
+			err = stream.Close()
+		}
+		q.closeErr = common.WrapQUICError(err, q.lease.Resource(), nil, netproxy.OpClose, q.fail)
 	})
 	return q.closeErr
 }
 
-func (q *quicStreamPacketConn) close() (err error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+// shutdown is also used by the owning QUIC connection, so timers and blocked
+// local reads end even when the application has not yet called Close.
+func (q *quicStreamPacketConn) shutdown(cause error) bool {
+	if !q.closed.CompareAndSwap(false, true) {
+		return false
+	}
+	q.incomingPackets.Close()
+	q.lease.Invalidate(cause)
+	q.stateMu.Lock()
+	q.readDeadline.Set(time.Time{})
+	if q.sendStream != nil {
+		q.sendStream.CancelWrite(0)
+	}
+	q.stateMu.Unlock()
 	if q.closeDeferFn != nil {
-		defer q.closeDeferFn()
+		q.closeDeferFn()
 	}
-	if q.deferQuicConnFn != nil {
-		defer func() {
-			q.deferQuicConnFn(err)
-		}()
-	}
-	if q.incomingPackets != nil {
-		q.incomingPackets = nil
-
-		buf := pool.GetBuffer()
-		defer pool.PutBuffer(buf)
-		err = NewDissociate(q.connId, Ver5).WriteTo(buf)
-		if err != nil {
-			return
-		}
-		var stream *quic.SendStream
-		stream, err = q.quicConn.OpenUniStream()
-		if err != nil {
-			return
-		}
-		_, err = buf.WriteTo(stream)
-		if err != nil {
-			return
-		}
-		err = stream.Close()
-		if err != nil {
-			return
-		}
-	}
-	return
+	return true
 }
 
 func (q *quicStreamPacketConn) SetDeadline(t time.Time) error {
-	q.muTimer.Lock()
-	defer q.muTimer.Unlock()
-	dur := time.Until(t)
-	if q.deadlineTimer != nil {
-		q.deadlineTimer.Reset(dur)
-	} else {
-		q.deadlineTimer = time.AfterFunc(dur, func() {
-			q.muTimer.Lock()
-			defer q.muTimer.Unlock()
-			q.Close()
-			q.deadlineTimer = nil
-		})
+	return errors.Join(q.SetReadDeadline(t), q.SetWriteDeadline(t))
+}
+func (q *quicStreamPacketConn) SetReadDeadline(t time.Time) error {
+	q.stateMu.Lock()
+	defer q.stateMu.Unlock()
+	if q.closed.Load() {
+		return net.ErrClosed
+	}
+	q.readDeadline.Set(t)
+	return nil
+}
+func (q *quicStreamPacketConn) SetWriteDeadline(t time.Time) error {
+	q.stateMu.Lock()
+	defer q.stateMu.Unlock()
+	if q.closed.Load() {
+		return net.ErrClosed
+	}
+	q.writeDeadline = t
+	if q.sendStream != nil {
+		return q.sendStream.SetWriteDeadline(t)
 	}
 	return nil
 }
 
-func (q *quicStreamPacketConn) SetReadDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return q.SetDeadline(t)
+func (q *quicStreamPacketConn) terminalError(op netproxy.Operation) error {
+	cause := q.lease.Cause()
+	if cause == nil {
+		cause = net.ErrClosed
+	}
+	return common.WrapQUICError(cause, q.lease.Resource(), q.lease, op, q.fail)
 }
 
-func (q *quicStreamPacketConn) SetWriteDeadline(t time.Time) error {
-	// FIXME: Single direction.
-	return q.SetDeadline(t)
-}
-
-func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.incomingPackets != nil {
-		for {
-			packet, closed := q.incomingPackets.PopFrontBlock()
-			if closed {
-				err = net.ErrClosed
-				return
+func (q *quicStreamPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	q.readMu.Lock()
+	defer q.readMu.Unlock()
+	for {
+		if q.closed.Load() || !q.lease.Valid() {
+			return 0, nil, q.terminalError(netproxy.OpRead)
+		}
+		select {
+		case <-q.incomingPackets.done:
+			return 0, nil, q.terminalError(netproxy.OpRead)
+		case <-q.lease.Done():
+			return 0, nil, q.terminalError(netproxy.OpRead)
+		case <-q.readDeadline.Wait():
+			return 0, nil, common.WrapQUICError(os.ErrDeadlineExceeded, q.lease.Resource(), q.lease, netproxy.OpRead, q.fail)
+		case packet := <-q.incomingPackets.packets:
+			now := time.Now()
+			for id, entry := range q.fragments {
+				if now.Sub(entry.updated) >= 5*time.Second {
+					delete(q.fragments, id)
+				}
 			}
-			_d, _ := q.deFraggers.LoadOrStore(packet.PKT_ID, &deFragger{})
-			d := _d.(*deFragger)
-			var assembled bool
-			// Feed packet into this deFragger.
-			// Return if this PKT_ID is ready and assembled.
-			if n, addr, assembled = d.Feed(packet, p); assembled {
-				q.deFraggers.Delete(packet.PKT_ID)
-				return
-			} else {
-				// FIXME: Timeout to clean deFraggers.
+			if packet.FRAG_TOTAL == 1 {
+				return copy(p, packet.DATA), packet.ADDR.netAddr(), nil
+			}
+			if q.fragments == nil {
+				q.fragments = make(map[uint16]*deFragger)
+			}
+			d := q.fragments[packet.PKT_ID]
+			if d == nil {
+				if len(q.fragments) >= packetQueueSize {
+					continue
+				}
+				d = &deFragger{updated: now}
+				q.fragments[packet.PKT_ID] = d
+			}
+			if n, addr, ready := d.Feed(packet, p); ready {
+				delete(q.fragments, packet.PKT_ID)
+				return n, addr, nil
 			}
 		}
-	} else {
-		err = net.ErrClosed
 	}
-	return
 }
 
-func (q *quicStreamPacketConn) WriteTo(p []byte, addr string) (n int, err error) {
-	if len(p) > 0xffff { // uint16 max
+func (q *quicStreamPacketConn) writeTo(p []byte, addr string) (n int, err error) {
+	defer func() { err = common.WrapQUICError(err, q.lease.Resource(), q.lease, netproxy.OpWrite, q.fail) }()
+	if len(p) > 0xffff {
 		return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 0xffff}
 	}
-	if q.closed {
-		return 0, net.ErrClosed
+	q.writeMu.Lock()
+	defer q.writeMu.Unlock()
+	if q.closed.Load() || !q.lease.Valid() {
+		return 0, q.terminalError(netproxy.OpWrite)
 	}
-	if q.deferQuicConnFn != nil {
-		defer func() {
-			q.deferQuicConnFn(err)
-		}()
+	q.stateMu.Lock()
+	deadline := q.writeDeadline
+	q.stateMu.Unlock()
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return 0, os.ErrDeadlineExceeded
 	}
-	buf := pool.GetBuffer()
-	defer pool.PutBuffer(buf)
-	mdata, err := protocol.ParseMetadata(addr)
+	metadata, err := protocol.ParseMetadata(addr)
 	if err != nil {
 		return 0, err
 	}
-	address := NewAddress(&mdata)
-	pktId := uint16(fastrand.Uint32())
-	packet := NewPacket(q.connId, pktId, 1, 0, uint16(len(p)), address, p, Ver5)
-	switch q.udpRelayMode {
-	case common.QUIC:
-		err = packet.WriteTo(buf)
-		if err != nil {
-			return
+	packet := &packetFrame{ASSOC_ID: q.connId, PKT_ID: uint16(fastrand.Uint32()), FRAG_TOTAL: 1, ADDR: addressFromMetadata(&metadata), DATA: p}
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	if err = packet.appendTo(buf); err != nil {
+		return 0, err
+	}
+	if q.udpRelayMode == common.QUIC {
+		stream, openErr := q.quicConn.OpenUniStream()
+		if openErr != nil {
+			return 0, openErr
 		}
-		var stream *quic.SendStream
-		stream, err = q.quicConn.OpenUniStream()
-		if err != nil {
-			return
+		q.stateMu.Lock()
+		if q.closed.Load() {
+			q.stateMu.Unlock()
+			stream.CancelWrite(0)
+			return 0, net.ErrClosed
 		}
-		defer stream.Close()
+		q.sendStream = stream
+		_ = stream.SetWriteDeadline(q.writeDeadline)
+		q.stateMu.Unlock()
 		_, err = buf.WriteTo(stream)
+		q.stateMu.Lock()
+		q.sendStream = nil
+		q.stateMu.Unlock()
 		if err != nil {
-			return
-		}
-	default: // native
-		if len(p) > q.maxUdpRelayPacketSize {
-			err = fragWriteNative(q.quicConn, packet, buf, q.maxUdpRelayPacketSize)
-			if err != nil {
-				return
-			}
+			stream.CancelWrite(0)
 		} else {
-			err = packet.WriteTo(buf)
-			if err != nil {
-				return
-			}
-			data := buf.Bytes()
-			err = q.quicConn.SendDatagram(data)
+			err = stream.Close()
+		}
+	} else {
+		if q.maxUdpRelayPacketSize > 0 && len(p) > q.maxUdpRelayPacketSize {
+			err = fragWriteNative(q.quicConn, packet, buf, q.maxUdpRelayPacketSize)
+		} else {
+			err = q.quicConn.SendDatagram(buf.Bytes())
 		}
 		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
-			err = fragWriteNative(q.quicConn, packet, buf, int(tooLarge.MaxDatagramPayloadSize)-PacketOverHead)
-		}
-		if err != nil {
-			return
+			err = fragWriteNative(q.quicConn, packet, buf, int(tooLarge.MaxDatagramPayloadSize)-10-packet.ADDR.BytesLen())
 		}
 	}
-	n = len(p)
-
-	return
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
-func (q *quicStreamPacketConn) LocalAddr() net.Addr {
-	return q.quicConn.LocalAddr()
+func (q *quicStreamPacketConn) DependencyLease() *netproxy.Lease { return q.lease }
+func (q *quicStreamPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if addr == nil {
+		return 0, errors.New("nil packet destination")
+	}
+	return q.writeTo(p, addr.String())
 }
+func (q *quicStreamPacketConn) LocalAddr() net.Addr         { return q.quicConn.LocalAddr() }
+func (q *quicStreamPacketConn) RemoteAddr() net.Addr        { return netproxy.NewAddr("udp", q.target) }
+func (q *quicStreamPacketConn) Read(p []byte) (int, error)  { n, _, err := q.ReadFrom(p); return n, err }
+func (q *quicStreamPacketConn) Write(p []byte) (int, error) { return q.writeTo(p, q.target) }
 
-func (conn *quicStreamPacketConn) Read(b []byte) (n int, err error) {
-	n, _, err = conn.ReadFrom(b)
-	return n, err
-}
-
-func (conn *quicStreamPacketConn) Write(b []byte) (n int, err error) {
-	return conn.WriteTo(b, conn.target)
-}
-
-var _ netproxy.PacketConn = (*quicStreamPacketConn)(nil)
+var _ net.PacketConn = (*quicStreamPacketConn)(nil)

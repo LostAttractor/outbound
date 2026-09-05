@@ -1,8 +1,9 @@
-// from https://github.com/Dreamacro/clash/blob/master/component/simple-obfs/tls.go
-
+// Modified from https://github.com/Dreamacro/clash/blob/master/component/simple-obfs/tls.go
+// Wire format: shadowsocks/simple-obfs, src/obfs_tls.c.
 package simpleobfs
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"io"
@@ -11,124 +12,114 @@ import (
 	"time"
 
 	"github.com/daeuniverse/outbound/pkg/fastrand"
+	"github.com/daeuniverse/outbound/pool"
 )
 
-const (
-	chunkSize = 1 << 14 // 2 ** 14 == 16 * 1024
-)
+const chunkSize = 16 << 10
 
-// TLSObfs is shadowsocks tls simple-obfs implementation
 type TLSObfs struct {
 	net.Conn
-	server        string
-	remain        int
-	firstRequest  bool
-	firstResponse bool
-	rMu           sync.Mutex
-	wMu           sync.Mutex
+	reader                      *bufio.Reader
+	server                      string
+	remaining                   int
+	firstRequest, firstResponse bool
+	rMu, wMu                    sync.Mutex
+	readErr, writeErr           error
 }
 
-func (to *TLSObfs) read(b []byte, discardN int) (int, error) {
-	buf := make([]byte, discardN)
-	_, err := io.ReadFull(to.Conn, buf)
-	if err != nil {
-		return 0, err
-	}
-	sizeBuf := make([]byte, 2)
-	_, err = io.ReadFull(to.Conn, sizeBuf)
-	if err != nil {
+func (c *TLSObfs) Read(p []byte) (int, error) {
+	c.rMu.Lock()
+	defer c.rMu.Unlock()
+	if len(p) == 0 {
 		return 0, nil
 	}
-
-	length := int(binary.BigEndian.Uint16(sizeBuf))
-	if length > len(b) {
-		n, err := to.Conn.Read(b)
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+	for c.remaining == 0 {
+		size := 5
+		if c.firstResponse {
+			size = 107
+		}
+		header, err := c.reader.Peek(size)
 		if err != nil {
-			return n, err
+			if !isTimeout(err) {
+				if err == io.EOF && c.reader.Buffered() != 0 {
+					err = io.ErrUnexpectedEOF
+				}
+				c.readErr = err
+			}
+			return 0, err
 		}
-		to.remain = length - n
-		return n, nil
+		if c.firstResponse {
+			if !bytes.Equal(header[:5], []byte{0x16, 3, 1, 0, 91}) || header[5] != 2 || !bytes.Equal(header[96:105], []byte{0x14, 3, 3, 0, 1, 1, 0x16, 3, 3}) {
+				c.readErr = wireError("invalid TLS response preface")
+				return 0, c.readErr
+			}
+		} else if !bytes.Equal(header[:3], []byte{0x17, 3, 3}) {
+			c.readErr = wireError("invalid TLS data record")
+			return 0, c.readErr
+		}
+		c.remaining = int(binary.BigEndian.Uint16(header[size-2:]))
+		if !c.firstResponse && c.remaining > chunkSize {
+			c.readErr = wireError("TLS record too large")
+			return 0, c.readErr
+		}
+		c.reader.Discard(size)
+		c.firstResponse = false
 	}
-
-	return io.ReadFull(to.Conn, b[:length])
+	n, err := c.reader.Read(p[:min(len(p), c.remaining)])
+	c.remaining -= n
+	if err != nil && !isTimeout(err) {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		c.readErr = err
+	}
+	return n, err
 }
 
-func (to *TLSObfs) Read(b []byte) (int, error) {
-	to.rMu.Lock()
-	defer to.rMu.Unlock()
-	if to.remain > 0 {
-		length := to.remain
-		if length > len(b) {
-			length = len(b)
-		}
-
-		n, err := io.ReadFull(to.Conn, b[:length])
-		to.remain -= n
-		return n, err
+func (c *TLSObfs) Write(p []byte) (int, error) {
+	c.wMu.Lock()
+	defer c.wMu.Unlock()
+	if c.writeErr != nil {
+		return 0, c.writeErr
 	}
-
-	if to.firstResponse {
-		// type + ver + lensize + 91 = 96
-		// type + ver + lensize + 1 = 6
-		// type + ver = 3
-		to.firstResponse = false
-		return to.read(b, 105)
+	if len(c.server) > 255 {
+		return 0, wireError("TLS server name too long")
 	}
-
-	// type + ver = 3
-	return to.read(b, 3)
-}
-func (to *TLSObfs) Write(b []byte) (int, error) {
-	to.wMu.Lock()
-	defer to.wMu.Unlock()
-	length := len(b)
-	for i := 0; i < length; i += chunkSize {
-		end := i + chunkSize
-		if end > length {
-			end = length
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	written := 0
+	for len(p) > 0 {
+		n := min(len(p), chunkSize)
+		buf.Reset()
+		if c.firstRequest {
+			makeClientHelloMsg(buf, p[:n], c.server)
+		} else {
+			buf.Write([]byte{0x17, 3, 3, byte(n >> 8), byte(n)})
+			buf.Write(p[:n])
 		}
-
-		n, err := to.write(b[i:end])
-		if err != nil {
-			return n, err
+		if err := writeWire(c.Conn, buf.Bytes()); err != nil {
+			c.writeErr = err
+			return written, err
 		}
+		c.firstRequest = false
+		written += n
+		p = p[n:]
 	}
-	return length, nil
+	return written, nil
 }
 
-func (to *TLSObfs) write(b []byte) (int, error) {
-	if to.firstRequest {
-		helloMsg := makeClientHelloMsg(b, to.server)
-		_, err := to.Conn.Write(helloMsg)
-		to.firstRequest = false
-		return len(b), err
-	}
-
-	buf := &bytes.Buffer{}
-	buf.Write([]byte{0x17, 0x03, 0x03})
-	binary.Write(buf, binary.BigEndian, uint16(len(b)))
-	buf.Write(b)
-	_, err := to.Conn.Write(buf.Bytes())
-	return len(b), err
-}
-
-// NewTLSObfs return a SimpleObfs
 func NewTLSObfs(conn net.Conn, server string) net.Conn {
-	return &TLSObfs{
-		Conn:          conn,
-		server:        server,
-		firstRequest:  true,
-		firstResponse: true,
-	}
+	return &TLSObfs{Conn: conn, reader: bufio.NewReader(conn), server: server, firstRequest: true, firstResponse: true}
 }
 
-func makeClientHelloMsg(data []byte, server string) []byte {
+func makeClientHelloMsg(buf *bytes.Buffer, data []byte, server string) {
 	random := make([]byte, 28)
 	sessionID := make([]byte, 32)
 	fastrand.Read(random)
 	fastrand.Read(sessionID)
-
-	buf := &bytes.Buffer{}
 
 	// handshake, TLS 1.0 version, length
 	buf.WriteByte(22)
@@ -196,5 +187,4 @@ func makeClientHelloMsg(data []byte, server string) []byte {
 	// extended master secret
 	buf.Write([]byte{0x00, 0x17, 0x00, 0x00})
 
-	return buf.Bytes()
 }

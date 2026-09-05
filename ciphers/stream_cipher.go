@@ -30,31 +30,23 @@ const (
 	Encrypt
 )
 
-func newCTRStream(block cipher.Block, err error, key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
+func newAESCTRStream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
 	return cipher.NewCTR(block, iv), nil
 }
 
-func newAESCTRStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
+func newAESOFBStream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
 	block, err := aes.NewCipher(key)
-	return newCTRStream(block, err, key, iv, doe)
-}
-
-func newOFBStream(block cipher.Block, err error, key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	if err != nil {
 		return nil, err
 	}
 	return cipher.NewOFB(block, iv), nil
 }
 
-func newAESOFBStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
-	block, err := aes.NewCipher(key)
-	return newOFBStream(block, err, key, iv, doe)
-}
-
-func newCFBStream(block cipher.Block, err error, key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
+func newCFBStream(block cipher.Block, err error, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -67,22 +59,22 @@ func newCFBStream(block cipher.Block, err error, key, iv []byte, doe DecOrEnc) (
 
 func newAESCFBStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	block, err := aes.NewCipher(key)
-	return newCFBStream(block, err, key, iv, doe)
+	return newCFBStream(block, err, iv, doe)
 }
 
 func newDESStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	block, err := des.NewCipher(key)
-	return newCFBStream(block, err, key, iv, doe)
+	return newCFBStream(block, err, iv, doe)
 }
 
 func newBlowFishStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	block, err := blowfish.NewCipher(key)
-	return newCFBStream(block, err, key, iv, doe)
+	return newCFBStream(block, err, iv, doe)
 }
 
 func newCast5Stream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	block, err := cast5.NewCipher(key)
-	return newCFBStream(block, err, key, iv, doe)
+	return newCFBStream(block, err, iv, doe)
 }
 
 func newRC4MD5Stream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
@@ -95,10 +87,6 @@ func newRC4MD5Stream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
 }
 
 func newChaCha20Stream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
-	return chacha20.New(key, iv)
-}
-
-func newChacha20IETFStream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
 	return chacha20.New(key, iv)
 }
 
@@ -141,39 +129,31 @@ func newSalsa20Stream(key, iv []byte, _ DecOrEnc) (cipher.Stream, error) {
 
 func newCamelliaStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	block, err := camellia.New(key)
-	return newCFBStream(block, err, key, iv, doe)
+	return newCFBStream(block, err, iv, doe)
 }
 
 func newIdeaStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	block, err := idea.NewCipher(key)
-	return newCFBStream(block, err, key, iv, doe)
+	return newCFBStream(block, err, iv, doe)
 }
 
 func newRC2Stream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	block, err := rc2.New(key, 16)
-	return newCFBStream(block, err, key, iv, doe)
+	return newCFBStream(block, err, iv, doe)
 }
 
 func newRC4Stream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	return rc4.NewCipher(key)
 }
 
-func newSeedStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
-	// TODO: SEED block cipher implementation is required
-	block, err := rc2.New(key, 16)
-	return newCFBStream(block, err, key, iv, doe)
-}
+type noneStream struct{}
 
-type NoneStream struct {
-	cipher.Stream
-}
-
-func (*NoneStream) XORKeyStream(dst, src []byte) {
+func (*noneStream) XORKeyStream(dst, src []byte) {
 	copy(dst, src)
 }
 
 func newNoneStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
-	return new(NoneStream), nil
+	return new(noneStream), nil
 }
 
 type cipherInfo struct {
@@ -198,14 +178,13 @@ var streamCipherMethod = map[string]*cipherInfo{
 	"rc4-md5":          {16, 16, newRC4MD5Stream},
 	"rc4-md5-6":        {16, 6, newRC4MD5Stream},
 	"chacha20":         {32, 8, newChaCha20Stream},
-	"chacha20-ietf":    {32, 12, newChacha20IETFStream},
+	"chacha20-ietf":    {32, 12, newChaCha20Stream},
 	"salsa20":          {32, 8, newSalsa20Stream},
 	"camellia-128-cfb": {16, 16, newCamelliaStream},
 	"camellia-192-cfb": {24, 16, newCamelliaStream},
 	"camellia-256-cfb": {32, 16, newCamelliaStream},
 	"idea-cfb":         {16, 8, newIdeaStream},
 	"rc2-cfb":          {16, 8, newRC2Stream},
-	"seed-cfb":         {16, 8, newSeedStream},
 	"rc4":              {16, 0, newRC4Stream},
 	"none":             {16, 0, newNoneStream},
 	"plain":            {16, 0, newNoneStream},
@@ -225,9 +204,6 @@ type StreamCipher struct {
 func NewStreamCipher(method, password string) (c *StreamCipher, err error) {
 	if password == "" {
 		return nil, errEmptyPassword
-	}
-	if method == "" {
-		method = "rc4-md5"
 	}
 	mi, ok := streamCipherMethod[method]
 	if !ok {
@@ -268,10 +244,6 @@ func (c *StreamCipher) InitEncrypt() (iv []byte, err error) {
 }
 
 func (c *StreamCipher) NewEncryptor(iv []byte) (enc cipher.Stream, err error) {
-	if iv == nil {
-		iv = pool.GetBuffer(c.info.ivLen)
-		defer pool.PutBuffer(iv)
-	}
 	iv = iv[:c.info.ivLen]
 	rand.Read(iv)
 	return c.info.newStream(c.key, iv, Encrypt)
@@ -294,47 +266,15 @@ func (c *StreamCipher) Decrypt(dst, src []byte) {
 	c.dec.XORKeyStream(dst, src)
 }
 
-// Clone creates a new cipher at it's initial state.
+// Clone creates an independent connection cipher with a fresh IV.
 func (c *StreamCipher) Clone() *StreamCipher {
-	// This optimization maybe not necessary. But without this function, we
-	// need to maintain a table cache for newTableCipher and use lock to
-	// protect concurrent access to that cache.
-
-	// AES and DES ciphers does not return specific types, so it's difficult
-	// to create copy. But their initialization time is less than 4000ns on my
-	// 2.26 GHz Intel Core 2 Duo processor. So no need to worry.
-
-	// Currently, blow-fish and cast5 initialization cost is an order of
-	// magnitude slower than other ciphers. (I'm not sure whether this is
-	// because the current implementation is not highly optimized, or this is
-	// the nature of the algorithm.)
-
-	nc := *c
-	nc.enc = nil
-	nc.dec = nil
-	return &nc
+	return &StreamCipher{key: c.key, info: c.info}
 }
 
 func (c *StreamCipher) Key() []byte {
 	return c.key
 }
 
-func (c *StreamCipher) IV() []byte {
-	return c.iv
-}
-
-func (c *StreamCipher) SetIV(iv []byte) {
-	c.iv = iv
-}
-
-func (c *StreamCipher) SetKey(key []byte) {
-	c.key = key
-}
-
 func (c *StreamCipher) InfoIVLen() int {
 	return c.info.ivLen
-}
-
-func (c *StreamCipher) InfoKeyLen() int {
-	return c.info.keyLen
 }

@@ -6,7 +6,6 @@ import (
 	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 )
 
 type ObfsType int
@@ -29,25 +28,28 @@ func NewObfsType(obfsType string) (ObfsType, error) {
 
 // SimpleObfs is a base http-obfs struct
 type SimpleObfs struct {
-	protocol.StatelessDialer
-	ObfsType ObfsType
-	Addr     string
-	Path     string
-	Host     string
+	ParentDialer netproxy.Dialer
+	ObfsType     ObfsType
+	Addr         string
+	Path         string
+	Host         string
 }
 
 func (s *SimpleObfs) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {
 	switch network {
 	case "tcp":
+		_, port, err := net.SplitHostPort(s.Addr)
+		if err != nil {
+			return nil, err
+		}
+		if s.ObfsType != HTTP && s.ObfsType != TLS {
+			return nil, fmt.Errorf("unsupported obfs type: %v", s.ObfsType)
+		}
 		rc, err := s.ParentDialer.DialContext(ctx, network, s.Addr)
 		if err != nil {
 			return nil, fmt.Errorf("[simpleobfs]: dial to %s: %w", s.Addr, err)
 		}
 
-		_, port, err := net.SplitHostPort(s.Addr)
-		if err != nil {
-			return nil, err
-		}
 		switch s.ObfsType {
 		case HTTP:
 			c = NewHTTPObfs(rc, s.Host, port, s.Path)

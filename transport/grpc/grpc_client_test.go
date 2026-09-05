@@ -28,10 +28,8 @@ func (d *blockingDialer) ListenPacket(context.Context, string) (net.PacketConn, 
 func TestCloseCancelsConnect(t *testing.T) {
 	parent := &blockingDialer{started: make(chan struct{})}
 	dialer := &Dialer{
-		ParentDialer:  parent,
-		Address:       "proxy.example:443",
-		ServerName:    "proxy.example",
-		AllowInsecure: true,
+		ParentDialer: parent,
+		Address:      "proxy.example:443",
 	}
 	result := make(chan error, 1)
 	go func() { result <- dialer.Connect(context.Background()) }()

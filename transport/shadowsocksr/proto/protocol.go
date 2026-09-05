@@ -1,18 +1,19 @@
 package proto
 
 import (
-	"strings"
+	"bytes"
 
-	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/pool/bytes"
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto"
 )
 
-type creator func() IProtocol
-
-var (
-	creatorMap = make(map[string]creator)
-)
+var constructors = map[string]func() IProtocol{
+	"origin":           NewOrigin,
+	"auth_aes128_md5":  NewAuthAES128MD5,
+	"auth_aes128_sha1": NewAuthAES128SHA1,
+	"auth_chain_a":     NewAuthChainA,
+	"auth_chain_b":     NewAuthChainB,
+	"auth_sha1_v4":     NewAuthSHA1v4,
+}
 
 type hmacMethod func(key []byte, data []byte) []byte
 type hashDigestMethod func(data []byte) []byte
@@ -21,12 +22,10 @@ type pktRndMethod func(random *crypto.Shift128plusContext, lastHash []byte) int
 
 type IProtocol interface {
 	InitWithServerInfo(s *ServerInfo)
-	Encode(data []byte) ([]byte, error)
-	Decode(data []byte) ([]byte, int, error)
+	Encode(data []byte, dst *bytes.Buffer) error
+	Decode(data []byte, dst *bytes.Buffer) (int, error)
 	EncodePkt(buf *bytes.Buffer) error
-	DecodePkt(data []byte) (pool.Bytes, error)
-	SetData(data interface{})
-	GetData() interface{}
+	DecodePkt(data []byte) ([]byte, error)
 	GetOverhead() int
 }
 
@@ -35,14 +34,9 @@ type AuthData struct {
 	connectionID uint32
 }
 
-func register(name string, c creator) {
-	creatorMap[name] = c
-}
-
 func NewProtocol(name string) IProtocol {
-	c, ok := creatorMap[strings.ToLower(name)]
-	if ok {
-		return c()
+	if create := constructors[name]; create != nil {
+		return create()
 	}
 	return nil
 }

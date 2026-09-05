@@ -10,68 +10,53 @@ import (
 	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
-func init() {
-	protocol.Register("trojanc", NewDialer)
-}
+func init() { protocol.Register("trojanc", NewDialer) }
 
 type Dialer struct {
-	protocol.StatelessDialer
+	ParentDialer netproxy.Dialer
 	proxyAddress string
 	password     string
 }
 
-func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
-	return &Dialer{
-		ParentDialer: parentDialer,
-		proxyAddress: header.ProxyAddress,
-		password:     header.Password,
-	}, nil
+func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+	return &Dialer{ParentDialer: parent, proxyAddress: header.ProxyAddress, password: header.Password}, nil
 }
 
-func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c net.Conn, err error) {
+func (d *Dialer) dial(ctx context.Context, address string, command byte) (net.Conn, error) {
+	target, err := socks5.AddressFromString(address)
+	if err != nil {
+		return nil, err
+	}
+	carrier, err := d.ParentDialer.DialContext(ctx, "tcp", d.proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	conn := newConn(carrier, target, command, d.password)
+	if err := protocol.Handshake(ctx, conn, func() error { _, err := conn.Write(nil); return err }); err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	switch network {
 	case "tcp":
-		// Parse address using shadowsocks implementation
-		addressInfo, err := socks5.AddressFromString(addr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse address: %w", err)
-		}
-
-		// Connect to proxy server
-		conn, err := d.ParentDialer.DialContext(ctx, "tcp", d.proxyAddress)
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to proxy: %w", err)
-		}
-
-		// Create Trojan connection
-		return NewConn(conn, addressInfo, network, d.password), nil
+		return d.dial(ctx, address, commandConnect)
 	case "udp":
-		packetConn, err := d.ListenPacket(ctx, addr)
+		conn, err := d.ListenPacket(ctx, address)
 		if err != nil {
 			return nil, err
 		}
-		return &netproxy.BindPacketConn{
-			PacketConn: packetConn,
-			Address:    netproxy.NewAddr("udp", addr),
-		}, nil
+		return &netproxy.BindPacketConn{PacketConn: conn, Address: netproxy.NewAddr("udp", address)}, nil
 	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
+		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, network)
 	}
 }
 
-func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
-	// Parse address using shadowsocks implementation
-	addressInfo, err := socks5.AddressFromString(addr)
+func (d *Dialer) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	conn, err := d.dial(ctx, address, commandUDP)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse address: %w", err)
+		return nil, err
 	}
-
-	// Connect to proxy server
-	conn, err := d.ParentDialer.DialContext(ctx, "tcp", d.proxyAddress)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to proxy: %w", err)
-	}
-
-	// Create Trojan connection for UDP
-	return &PacketConn{Conn: NewConn(conn, addressInfo, "udp", d.password)}, nil
+	return &PacketConn{Conn: conn}, nil
 }

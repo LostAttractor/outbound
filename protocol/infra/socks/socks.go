@@ -94,6 +94,9 @@ func ReadAddr(r io.Reader) (Addr, error) {
 		if err != nil {
 			return nil, err
 		}
+		if b[1] == 0 {
+			return nil, Errors[8]
+		}
 		_, err = io.ReadFull(r, b[2:2+int(b[1])+2])
 		return b[:1+1+int(b[1])+2], err
 	case ATypIP4:
@@ -116,7 +119,7 @@ func SplitAddr(b []byte) Addr {
 
 	switch b[0] {
 	case ATypDomain:
-		if len(b) < 2 {
+		if len(b) < 2 || b[1] == 0 {
 			return nil
 		}
 		addrLen = 1 + 1 + int(b[1]) + 2
@@ -154,7 +157,7 @@ func ParseAddr(s string) (Addr, error) {
 			copy(addr[1:], ip.To16())
 		}
 	} else {
-		if len(host) > 255 {
+		if len(host) == 0 || len(host) > 255 {
 			return nil, fmt.Errorf("address %v is too long", s)
 		}
 		addr = make([]byte, 1+1+len(host)+2)

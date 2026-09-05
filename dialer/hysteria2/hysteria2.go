@@ -114,12 +114,14 @@ func normalizeCertHash(hash string) string {
 
 // ref: https://v2.hysteria.network/zh/docs/developers/URI-Scheme/
 func ParseHysteria2URL(link string) (*Hysteria2, error) {
-	// TODO: support salamander obfuscation
 	u, err := url.Parse(link)
 	if err != nil {
 		return nil, err
 	}
 	q := u.Query()
+	if q.Get("obfs") != "" || q.Get("obfs-password") != "" {
+		return nil, fmt.Errorf("%w: Hysteria2 obfuscation is not supported", dialer.InvalidParameterErr)
+	}
 	var insecure bool
 	if insecureValue := q.Get("insecure"); insecureValue != "" {
 		insecure, err = strconv.ParseBool(q.Get("insecure"))

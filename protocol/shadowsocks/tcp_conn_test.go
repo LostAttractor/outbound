@@ -2,12 +2,17 @@ package shadowsocks
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha1"
 	"encoding/binary"
 	"errors"
+	"golang.org/x/crypto/hkdf"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +21,7 @@ import (
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
@@ -88,9 +94,8 @@ func (g *fixedSaltGenerator) Get() []byte {
 	copy(salt, g.salt)
 	return salt
 }
-func (g *fixedSaltGenerator) Close() error { return nil }
 
-func TestTCPConnReleasesBufferedPayload(t *testing.T) {
+func TestTCPConnBufferedPayloadLifecycle(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	conn := &TCPConn{
@@ -112,23 +117,15 @@ func TestTCPConnReleasesBufferedPayload(t *testing.T) {
 	if conn.readBuf != nil || conn.readOffset != 0 {
 		t.Fatal("completed read retained its payload")
 	}
-}
-
-func TestTCPConnCloseReleasesBufferedPayload(t *testing.T) {
-	client, server := net.Pipe()
-	defer server.Close()
-	conn := &TCPConn{
-		Conn:       client,
-		readBuf:    pool.GetBuffer(16),
-		readOffset: 4,
-	}
-
+	conn.readBuf = pool.GetBuffer(16)
+	conn.readOffset = 4
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if conn.readBuf != nil || conn.readOffset != 0 {
 		t.Fatal("Close retained its payload")
 	}
+
 }
 
 func TestTCPConnCloseUnblocksRead(t *testing.T) {
@@ -283,5 +280,174 @@ func TestTCPConnSealWritesValidChunks(t *testing.T) {
 	}
 	if !bytes.Equal(plaintext, payload) {
 		t.Fatal("decrypted chunks do not match payload")
+	}
+}
+
+type readStep struct {
+	data []byte
+	err  error
+}
+type interruptedReader struct {
+	shortWriteConn
+	steps []readStep
+	reads int
+}
+
+func (c *interruptedReader) Read(b []byte) (int, error) {
+	c.reads++
+	if len(c.steps) == 0 {
+		return 0, io.EOF
+	}
+	step := c.steps[0]
+	c.steps = c.steps[1:]
+	return copy(b, step.data), step.err
+}
+
+func TestTCPConnPartialSaltTimeoutIsSticky(t *testing.T) {
+	timeout := &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	for _, received := range []int{0, 5} {
+		t.Run(strconv.Itoa(received), func(t *testing.T) {
+			raw := &interruptedReader{steps: []readStep{{make([]byte, received), timeout}}}
+			c := &TCPConn{Conn: raw, cipherConf: ciphers.AeadCiphersConf["aes-128-gcm"]}
+			if _, err := c.Read(make([]byte, 1)); err != timeout {
+				t.Fatal(err)
+			}
+			_, err := c.Read(make([]byte, 1))
+			if received > 0 {
+				if err != timeout || raw.reads != 1 {
+					t.Fatal("partial salt was read twice")
+				}
+			} else if raw.reads != 2 {
+				t.Fatal("zero-byte timeout made aligned reader unusable")
+			}
+		})
+	}
+}
+
+func TestTCPConnPayloadTimeoutAfterLengthIsSticky(t *testing.T) {
+	block, _ := aes.NewCipher(make([]byte, 16))
+	aead, _ := cipher.NewGCM(block)
+	header := aead.Seal(nil, make([]byte, 12), []byte{0, 1}, nil)
+	raw := &interruptedReader{steps: []readStep{{header, nil}, {nil, os.ErrDeadlineExceeded}}}
+	c := &TCPConn{Conn: raw, cipherConf: ciphers.AeadCiphersConf["aes-128-gcm"], cipherRead: aead, nonceRead: make([]byte, 12), onceRead: true}
+	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal(err)
+	}
+	calls := raw.reads
+	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) || raw.reads != calls {
+		t.Fatal("payload timeout retried as a length frame")
+	}
+}
+
+type pipeParent struct{ conn net.Conn }
+
+func (p pipeParent) DialContext(context.Context, string, string) (net.Conn, error) {
+	return p.conn, nil
+}
+func (p pipeParent) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	return nil, errors.New("unused")
+}
+
+func TestDialContextSendsRequestBeforeApplicationWrite(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	done := make(chan error, 1)
+	go func() {
+		salt := make([]byte, 16)
+		if _, err := io.ReadFull(server, salt); err != nil {
+			done <- err
+			return
+		}
+		key := common.EVPBytesToKey("password", 16)
+		subkey := make([]byte, 16)
+		if _, err := io.ReadFull(hkdf.New(sha1.New, key, salt, []byte("ss-subkey")), subkey); err != nil {
+			done <- err
+			return
+		}
+		block, _ := aes.NewCipher(subkey)
+		aead, _ := cipher.NewGCM(block)
+		nonce := make([]byte, 12)
+		encrypted := make([]byte, 18)
+		if _, err := io.ReadFull(server, encrypted); err != nil {
+			done <- err
+			return
+		}
+		length, err := aead.Open(nil, nonce, encrypted, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		encrypted = make([]byte, int(binary.BigEndian.Uint16(length))+16)
+		if _, err := io.ReadFull(server, encrypted); err != nil {
+			done <- err
+			return
+		}
+		nonce[0] = 1
+		plain, err := aead.Open(nil, nonce, encrypted, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		addr, err := socks5.ReadAddrInfo(bytes.NewReader(plain))
+		if err == nil && (addr.Hostname != "example.com" || addr.Port != 443) {
+			err = errors.New("incorrect target")
+		}
+		done <- err
+	}()
+	dialer, err := NewDialer(pipeParent{client}, protocol.Header{Cipher: "aes-128-gcm", Password: "password", ProxyAddress: "proxy:443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := dialer.DialContext(ctx, "tcp", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDialContextCancellationClosesIncompleteRequest(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	dialer, err := NewDialer(pipeParent{client}, protocol.Header{Cipher: "aes-128-gcm", Password: "password", ProxyAddress: "proxy:443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if conn, err := dialer.DialContext(ctx, "tcp", "example.com:443"); conn != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("canceled dial=%v %v", conn, err)
+	}
+	if _, err := client.Write([]byte("retry")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("partial request kept carrier open: %v", err)
+	}
+}
+
+func TestUDPShortCallerBufferStillAuthenticatesWholePacket(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	conf := ciphers.AeadCiphersConf["aes-128-gcm"]
+	key := bytes.Repeat([]byte{5}, 16)
+	salt := bytes.Repeat([]byte{6}, 16)
+	subkey := make([]byte, 16)
+	io.ReadFull(hkdf.New(sha1.New, key, salt, []byte("ss-subkey")), subkey)
+	block, _ := aes.NewCipher(subkey)
+	aead, _ := cipher.NewGCM(block)
+	plaintext := append([]byte{1, 127, 0, 0, 1, 0, 53}, []byte("long answer")...)
+	wire := aead.Seal(append([]byte(nil), salt...), make([]byte, 12), plaintext, nil)
+	done := make(chan error, 1)
+	go func() { _, err := server.Write(wire); done <- err }()
+	c := NewUdpConn(client, conf, key, &fixedSaltGenerator{salt: salt})
+	tiny := make([]byte, 2)
+	if n, addr, err := c.ReadFrom(tiny); err != nil || n != 2 || string(tiny) != "lo" || addr.String() != "127.0.0.1:53" {
+		t.Fatalf("ReadFrom=%d %v %v", n, addr, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

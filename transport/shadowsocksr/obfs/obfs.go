@@ -1,40 +1,24 @@
 package obfs
 
-import (
-	"strings"
-)
-
-type Creator func() IObfs
-
 type constructor struct {
-	New Creator
+	New      func() IObfs
 	Overhead int
 }
 
-var (
-	creatorMap = make(map[string]*constructor)
-)
+var constructors = map[string]constructor{
+	"plain":                  {New: newPlainObfs},
+	"http_simple":            {New: newHttpSimple},
+	"http_post":              {New: newHttpPost},
+	"random_head":            {New: newRandomHead},
+	"tls1.2_ticket_auth":     {New: func() IObfs { return newTLS12TicketAuth(false) }, Overhead: 5},
+	"tls1.2_ticket_fastauth": {New: func() IObfs { return newTLS12TicketAuth(true) }, Overhead: 5},
+}
 
 type IObfs interface {
 	SetServerInfo(s *ServerInfo)
 	GetServerInfo() (s *ServerInfo)
 	Encode(data []byte) (encodedData []byte, err error)
 	Decode(data []byte) (decodedData []byte, needSendBack bool, err error)
-	SetData(data interface{})
-	GetData() interface{}
-}
-
-func register(name string, c *constructor) {
-	creatorMap[name] = c
-}
-
-// NewObfs create an Obfs object by name and return as an IObfs interface
-func NewObfs(name string) *constructor {
-	c, ok := creatorMap[strings.ToLower(name)]
-	if ok {
-		return c
-	}
-	return nil
 }
 
 type ServerInfo struct {

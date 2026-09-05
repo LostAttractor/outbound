@@ -2,6 +2,7 @@ package obfs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -41,14 +42,8 @@ type httpSimplePost struct {
 	rawTransSent     bool
 	rawTransReceived bool
 	userAgentIndex   int
+	responseHeader   bytes.Buffer
 	methodGet        bool // true for get, false for post
-}
-
-func init() {
-	register("http_simple", &constructor{
-		New:      newHttpSimple,
-		Overhead: 0,
-	})
 }
 
 // newHttpSimple create a http_simple object
@@ -71,19 +66,11 @@ func (t *httpSimplePost) GetServerInfo() (s *ServerInfo) {
 	return &t.ServerInfo
 }
 
-func (t *httpSimplePost) SetData(data interface{}) {
-
-}
-
-func (t *httpSimplePost) GetData() interface{} {
-	return nil
-}
-
 var base62table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 func (t *httpSimplePost) boundary() (ret string) {
-	b := pool.Get(32)
-	defer pool.Put(b)
+	b := pool.GetBuffer(32)
+	defer pool.PutBuffer(b)
 	rand.Read(b)
 	for i := 0; i < 32; i++ {
 		b[i] = base62table[b[i]%62]
@@ -94,8 +81,8 @@ func (t *httpSimplePost) boundary() (ret string) {
 const hextable = "0123456789abcdef"
 
 func (t *httpSimplePost) data2URLEncode(data []byte) (ret string) {
-	dst := pool.Get(len(data) * 3)
-	defer pool.Put(dst)
+	dst := pool.GetBuffer(len(data) * 3)
+	defer pool.PutBuffer(dst)
 	for i, j := 0, 0; i < len(data); i, j = i+1, j+3 {
 		dst[j] = '%'
 		dst[j+1] = hextable[data[i]>>4]
@@ -180,11 +167,15 @@ func (t *httpSimplePost) Decode(data []byte) (decodedData []byte, needSendBack b
 		return data, false, nil
 	}
 
-	pos := bytes.Index(data, []byte("\r\n\r\n"))
-	if pos > 0 {
-		decodedData = make([]byte, len(data)-pos-4)
-		copy(decodedData, data[pos+4:])
-		t.rawTransReceived = true
+	t.responseHeader.Write(data)
+	if t.responseHeader.Len() > 64<<10 {
+		return nil, false, errors.New("SSR HTTP response header too large")
 	}
-	return decodedData, false, nil
+	header := t.responseHeader.Bytes()
+	pos := bytes.Index(header, []byte("\r\n\r\n"))
+	if pos < 0 {
+		return nil, false, nil
+	}
+	t.rawTransReceived = true
+	return header[pos+4:], false, nil
 }

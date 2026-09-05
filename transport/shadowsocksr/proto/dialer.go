@@ -2,109 +2,96 @@ package proto
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net"
 
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
 	"github.com/daeuniverse/outbound/protocol/shadowsocks_stream"
 )
 
 type Dialer struct {
-	NextDialer    netproxy.Dialer
-	Protocol      string
-	ProtocolParam string
-	ObfsOverhead  int
-	protocolData  interface{}
+	parent   *shadowsocks_stream.Dialer
+	name     string
+	param    string
+	overhead int
 }
 
-func (d *Dialer) protocolFromInnerConn(conn netproxy.Conn, addr socks.Addr) (proto IProtocol, err error) {
-	proto = NewProtocol(d.Protocol)
-	if proto == nil {
-		return nil, errors.New("unsupported protocol type: " + d.Protocol)
+func NewDialer(parent netproxy.Dialer, name, param string, overhead int) (*Dialer, error) {
+	stream, ok := parent.(*shadowsocks_stream.Dialer)
+	if !ok {
+		return nil, fmt.Errorf("SSR requires a stream cipher dialer, got %T", parent)
 	}
-	proto.SetData(proto.GetData())
-	switch c := conn.(type) {
-	case interface{ Cipher() *ciphers.StreamCipher }:
-		iv, err := c.Cipher().InitEncrypt()
-		if err != nil {
-			return nil, err
-		}
-		key := c.Cipher().Key()
-		if key == nil {
-			return nil, fmt.Errorf("ss conn did not init Key")
-		}
-		proto.InitWithServerInfo(&ServerInfo{
-			Param:    d.ProtocolParam,
-			TcpMss:   1460,
-			IV:       iv,
-			Key:      key,
-			AddrLen:  len(addr),
-			Overhead: proto.GetOverhead() + d.ObfsOverhead,
-		})
-		return proto, nil
-	default:
-		return nil, fmt.Errorf("unsupported conn: %T", conn)
+	if NewProtocol(name) == nil {
+		return nil, fmt.Errorf("unsupported SSR protocol %q", name)
 	}
+	return &Dialer{parent: stream, name: name, param: param, overhead: overhead}, nil
 }
 
-func (d *Dialer) DialContext(ctx context.Context, network, address string) (netproxy.Conn, error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
+func (d *Dialer) newProtocol(cipher *ciphers.StreamCipher, addrLen int) (IProtocol, error) {
+	iv, err := cipher.InitEncrypt()
 	if err != nil {
 		return nil, err
 	}
-	switch magicNetwork.Network {
+	codec := NewProtocol(d.name)
+	codec.InitWithServerInfo(&ServerInfo{Param: d.param, TcpMss: 1460, IV: iv, Key: cipher.Key(), AddrLen: addrLen, Overhead: codec.GetOverhead() + d.overhead})
+	return codec, nil
+}
+
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	switch network {
 	case "tcp":
 		addr, err := socks.ParseAddr(address)
 		if err != nil {
 			return nil, err
 		}
-
-		switch nextDialer := d.NextDialer.(type) {
-		case *shadowsocks_stream.Dialer:
-			transportConn, err := nextDialer.DialTcpTransport(ctx, network)
-			if err != nil {
-				return nil, err
-			}
-			proto, err := d.protocolFromInnerConn(transportConn, addr)
-			if err != nil {
-				return nil, err
-			}
-			conn, err := NewConn(transportConn, proto)
-			if err != nil {
-				return nil, err
-			}
-			if _, err = conn.Write(addr); err != nil {
-				return nil, fmt.Errorf("failed to write target: %w", err)
-			}
-			return conn, nil
-		default:
-			return nil, fmt.Errorf("unsupported next dialer: %T", d.NextDialer)
-		}
-	case "udp":
-		addr, err := socks.ParseAddr(address)
+		conn, err := d.parent.DialTCPTransport(ctx)
 		if err != nil {
 			return nil, err
 		}
-
-		switch nextDialer := d.NextDialer.(type) {
-		case *shadowsocks_stream.Dialer:
-			c, err := nextDialer.DialUdpTransport(ctx, network)
-			if err != nil {
-				return nil, err
-			}
-
-			proto, err := d.protocolFromInnerConn(c, addr)
-			if err != nil {
-				return nil, err
-			}
-
-			return NewPacketConn(c, proto, address)
-		default:
-			return nil, fmt.Errorf("unsupported inner dialer: %T", nextDialer)
+		codec, err := d.newProtocol(conn.Cipher(), len(addr))
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
 		}
+		c := &Conn{Conn: conn, codec: codec}
+		if err := protocol.Handshake(ctx, c, func() error {
+			if _, err := c.Write(addr); err != nil {
+				return err
+			}
+			if obfs, ok := conn.Conn.(interface{ Handshake() error }); ok {
+				return obfs.Handshake()
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return c, nil
+	case "udp":
+		if _, err := socks.ParseAddr(address); err != nil {
+			return nil, err
+		}
+		conn, err := d.ListenPacket(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return &netproxy.BindPacketConn{PacketConn: conn, Address: netproxy.NewAddr("udp", address)}, nil
 	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
+		return nil, fmt.Errorf("%w: SSR+%s", netproxy.UnsupportedTunnelTypeError, network)
 	}
+}
+
+func (d *Dialer) ListenPacket(ctx context.Context, _ string) (net.PacketConn, error) {
+	conn, err := d.parent.DialUDPTransport(ctx)
+	if err != nil {
+		return nil, err
+	}
+	codec, err := d.newProtocol(conn.Cipher(), 0)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return &PacketConn{Conn: conn, codec: codec}, nil
 }

@@ -14,296 +14,249 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/cert"
 	proto "github.com/daeuniverse/outbound/pkg/gun_proto"
-	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
-	"google.golang.org/grpc/status"
 )
 
 type ClientConn struct {
-	tun       proto.GunService_TunClient
-	closer    context.CancelFunc
-	muReading sync.Mutex // muReading protects reading
-	muWriting sync.Mutex // muWriting protects writing
-	muRecv    sync.Mutex // muReading protects recv
-	muSend    sync.Mutex // muWriting protects send
-	buf       []byte
-	offset    int
-
-	deadlineMu    sync.Mutex
-	readDeadline  *time.Timer
-	writeDeadline *time.Timer
-
-	ctxRead     context.Context
-	cancelRead  func()
-	ctxWrite    context.Context
-	cancelWrite func()
-	ctx         context.Context
-	cancel      func()
+	lease           *netproxy.Lease
+	tun             proto.Tunnel
+	cancel          context.CancelFunc
+	read, receive   net.Conn
+	readMu          sync.Mutex
+	readErr         error
+	closeOnce       sync.Once
+	workers         sync.WaitGroup
+	done            chan struct{}
+	writeGate       chan struct{}
+	writes          chan sendRequest
+	deadlineMu      sync.Mutex
+	writeDeadline   time.Time
+	deadlineChanged chan struct{}
+	writeClosed     bool // owned by sendLoop
+	sendErr         error
 }
 
-func NewClientConn(tun proto.GunService_TunClient, closer context.CancelFunc) *ClientConn {
-	ctx, cancel := context.WithCancel(context.Background())
-	ctxRead, cancelRead := context.WithCancel(context.Background())
-	ctxWrite, cancelWrite := context.WithCancel(context.Background())
-	return &ClientConn{
-		tun:         tun,
-		closer:      closer,
-		ctx:         ctx,
-		cancel:      cancel,
-		ctxRead:     ctxRead,
-		cancelRead:  cancelRead,
-		ctxWrite:    ctxWrite,
-		cancelWrite: cancelWrite,
-	}
+type sendRequest struct {
+	hunk   *proto.Hunk
+	fin    bool
+	result chan error
 }
 
-type RecvResp struct {
-	hunk *proto.Hunk
-	err  error
+// cancel must cancel the RPC backing tun, unblocking both Send and Recv.
+func NewClientConn(tun proto.Tunnel, cancel context.CancelFunc) *ClientConn {
+	read, receive := net.Pipe()
+	c := &ClientConn{tun: tun, cancel: cancel, read: read, receive: receive,
+		done: make(chan struct{}), writeGate: make(chan struct{}, 1), writes: make(chan sendRequest), deadlineChanged: make(chan struct{})}
+	c.writeGate <- struct{}{}
+	c.workers.Go(c.receiveLoop)
+	c.workers.Go(c.sendLoop)
+	return c
 }
 
-func (c *ClientConn) Read(p []byte) (n int, err error) {
-	select {
-	case <-c.ctxRead.Done():
-		return 0, os.ErrDeadlineExceeded
-	case <-c.ctx.Done():
-		return 0, io.EOF
-	default:
-	}
-
-	c.muReading.Lock()
-	defer c.muReading.Unlock()
-	if c.buf != nil {
-		n = copy(p, c.buf[c.offset:])
-		c.offset += n
-		if c.offset == len(c.buf) {
-			pool.PutBuffer(c.buf)
-			c.buf = nil
+// One receive owns each decoded message until the application consumes it.
+// A read deadline only interrupts the application's net.Pipe read; it cannot
+// discard a message that arrives after that deadline.
+func (c *ClientConn) receiveLoop() {
+	defer c.receive.Close()
+	for {
+		hunk, err := c.tun.Recv()
+		if err == nil && len(hunk.Data) != 0 {
+			_, err = c.receive.Write(hunk.Data)
 		}
-		return n, nil
-	}
-	// set 1 to avoid channel leak
-	readDone := make(chan RecvResp, 1)
-	// pass channel to the function to avoid closure leak
-	go func(readDone chan RecvResp) {
-		// FIXME: not really abort the send so there is some problems when recover
-		c.muRecv.Lock()
-		defer c.muRecv.Unlock()
-		recv, e := c.tun.Recv()
-		readDone <- RecvResp{
-			hunk: recv,
-			err:  e,
-		}
-	}(readDone)
-	select {
-	case <-c.ctxRead.Done():
-		return 0, os.ErrDeadlineExceeded
-	case <-c.ctx.Done():
-		return 0, io.EOF
-	case recvResp := <-readDone:
-		err = recvResp.err
 		if err != nil {
-			if code := status.Code(err); code == codes.Unavailable || status.Code(err) == codes.OutOfRange {
-				err = io.EOF
-			}
-			return 0, err
+			c.readMu.Lock()
+			c.readErr = err
+			c.readMu.Unlock()
+			return
 		}
-		n = copy(p, recvResp.hunk.Data)
-		c.buf = pool.GetBuffer(len(recvResp.hunk.Data) - n)
-		copy(c.buf, recvResp.hunk.Data[n:])
-		c.offset = 0
-		return n, nil
 	}
 }
-
-func (c *ClientConn) Write(p []byte) (n int, err error) {
+func (c *ClientConn) Read(p []byte) (int, error) {
 	select {
-	case <-c.ctxWrite.Done():
-		return 0, os.ErrDeadlineExceeded
-	case <-c.ctx.Done():
-		return 0, io.EOF
+	case <-c.done:
+		return 0, c.failure(net.ErrClosed, netproxy.OpRead)
 	default:
 	}
-
-	c.muWriting.Lock()
-	defer c.muWriting.Unlock()
-	// set 1 to avoid channel leak
-	sendDone := make(chan error, 1)
-	// pass channel to the function to avoid closure leak
-	go func(sendDone chan error) {
-		// FIXME: not really abort the send so there is some problems when recover
-		c.muSend.Lock()
-		defer c.muSend.Unlock()
-		e := c.tun.Send(&proto.Hunk{Data: p})
-		sendDone <- e
-	}(sendDone)
-	select {
-	case <-c.ctxWrite.Done():
-		return 0, os.ErrDeadlineExceeded
-	case <-c.ctx.Done():
-		return 0, io.EOF
-	case err = <-sendDone:
-		if code := status.Code(err); code == codes.Unavailable || status.Code(err) == codes.OutOfRange {
-			err = io.EOF
-		}
-		return len(p), err
+	n, err := c.read.Read(p)
+	if err == io.EOF {
+		c.readMu.Lock()
+		err = c.readErr
+		c.readMu.Unlock()
 	}
+	return n, c.failure(err, netproxy.OpRead)
 }
 
+// Admission bounds the queue to one owned payload. Hunk data stays immutable:
+// gRPC permits tracing/stats handlers to retain the message after Send returns.
+func (c *ClientConn) sendLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case request := <-c.writes:
+			var err error
+			select {
+			case <-c.done:
+				c.sendErr = net.ErrClosed
+			default:
+			}
+			if c.sendErr != nil {
+				err = c.sendErr
+			} else if c.writeClosed {
+				if !request.fin {
+					err = io.ErrClosedPipe
+				}
+			} else if request.fin {
+				c.writeClosed = true
+				err = c.tun.CloseSend()
+			} else {
+				err = c.tun.Send(request.hunk)
+			}
+			if err != nil {
+				c.sendErr = err
+			}
+			request.result <- err
+			c.writeGate <- struct{}{}
+		}
+	}
+}
+func (c *ClientConn) send(p []byte, fin bool) error {
+	request := sendRequest{fin: fin, result: make(chan error, 1)}
+	admitted, sent := false, false
+	defer func() {
+		if admitted && !sent {
+			c.writeGate <- struct{}{}
+		}
+	}()
+	for {
+		select {
+		case <-c.done:
+			return net.ErrClosed
+		default:
+		}
+		c.deadlineMu.Lock()
+		deadline, changed := c.writeDeadline, c.deadlineChanged
+		c.deadlineMu.Unlock()
+		if !deadline.IsZero() && !deadline.After(time.Now()) {
+			if sent {
+				_ = c.Close()
+			}
+			return os.ErrDeadlineExceeded
+		}
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			timeout = timer.C
+		}
+		var gate <-chan struct{}
+		var submit chan sendRequest
+		if !admitted {
+			gate = c.writeGate
+		} else if !sent {
+			submit = c.writes
+		}
+		select {
+		case <-gate:
+			admitted = true
+			request.hunk = &proto.Hunk{Data: append([]byte(nil), p...)}
+		case submit <- request:
+			sent = true
+		case err := <-request.result:
+			if timer != nil {
+				timer.Stop()
+			}
+			return err
+		case <-c.done:
+			if timer != nil {
+				timer.Stop()
+			}
+			return net.ErrClosed
+		case <-changed:
+		case <-timeout:
+			if sent {
+				_ = c.Close()
+			}
+			return os.ErrDeadlineExceeded
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+}
+func (c *ClientConn) Write(p []byte) (int, error) {
+	err := c.failure(c.send(p, false), netproxy.OpWrite)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+func (c *ClientConn) CloseWrite() error { return c.failure(c.send(nil, true), netproxy.OpCloseWrite) }
 func (c *ClientConn) Close() error {
-	select {
-	case <-c.ctx.Done():
-	default:
+	c.closeOnce.Do(func() {
+		close(c.done)
 		c.cancel()
-	}
-	c.closer()
+		_ = c.read.Close()
+		_ = c.receive.Close()
+		if c.lease != nil {
+			c.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Scope: netproxy.ScopeStream, Layer: netproxy.LayerGRPC, Origin: netproxy.OriginLocalCleanup}))
+		}
+	})
+	c.workers.Wait()
 	return nil
 }
-func (c *ClientConn) CloseWrite() error {
-	return c.tun.CloseSend()
-}
-
 func (c *ClientConn) SetDeadline(t time.Time) error {
-	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxRead.Done():
-			c.ctxRead, c.cancelRead = context.WithCancel(context.Background())
-
-		default:
-		}
-		select {
-		case <-c.ctxWrite.Done():
-			c.ctxWrite, c.cancelWrite = context.WithCancel(context.Background())
-		default:
-		}
-		// reset the deadline timer
-		if c.readDeadline != nil {
-			c.readDeadline.Stop()
-		}
-		c.readDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxRead.Done():
-			default:
-				c.cancelRead()
-			}
-		})
-		if c.writeDeadline != nil {
-			c.writeDeadline.Stop()
-		}
-		c.writeDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxWrite.Done():
-			default:
-				c.cancelWrite()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxRead.Done():
-		default:
-			c.cancelRead()
-		}
-		select {
-		case <-c.ctxWrite.Done():
-		default:
-			c.cancelWrite()
-		}
-	}
-	return nil
+	_ = c.SetWriteDeadline(t)
+	return c.SetReadDeadline(t)
 }
-
-func (c *ClientConn) SetReadDeadline(t time.Time) error {
-	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxRead.Done():
-			c.ctxRead, c.cancelRead = context.WithCancel(context.Background())
-		default:
-		}
-		// reset the deadline timer
-		if c.readDeadline != nil {
-			c.readDeadline.Stop()
-		}
-		c.readDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxRead.Done():
-			default:
-				c.cancelRead()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxRead.Done():
-		default:
-			c.cancelRead()
-		}
-	}
-	return nil
-}
-
+func (c *ClientConn) SetReadDeadline(t time.Time) error { return c.read.SetReadDeadline(t) }
 func (c *ClientConn) SetWriteDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	if now := time.Now(); t.After(now) {
-		// refresh the deadline if the deadline has been exceeded
-		select {
-		case <-c.ctxWrite.Done():
-			c.ctxWrite, c.cancelWrite = context.WithCancel(context.Background())
-		default:
-		}
-		if c.writeDeadline != nil {
-			c.writeDeadline.Stop()
-		}
-		c.writeDeadline = time.AfterFunc(t.Sub(now), func() {
-			c.deadlineMu.Lock()
-			defer c.deadlineMu.Unlock()
-			select {
-			case <-c.ctxWrite.Done():
-			default:
-				c.cancelWrite()
-			}
-		})
-	} else {
-		select {
-		case <-c.ctxWrite.Done():
-		default:
-			c.cancelWrite()
-		}
+	c.writeDeadline = t
+	close(c.deadlineChanged)
+	c.deadlineChanged = make(chan struct{})
+	c.deadlineMu.Unlock()
+	return nil
+}
+func (c *ClientConn) DependencyLease() *netproxy.Lease { return c.lease }
+func (c *ClientConn) failure(err error, phase netproxy.Operation) error {
+	if err == nil || phase == netproxy.OpRead && err == io.EOF {
+		return err
 	}
-	return nil
+	fact := netproxy.ClassifyFailure(err)
+	fact.Layer, fact.Phase = netproxy.LayerGRPC, phase
+	if fact.Scope == netproxy.ScopeUnknown {
+		fact.Scope = netproxy.ScopeStream
+	}
+	select {
+	case <-c.done:
+		if err == net.ErrClosed || err == io.ErrClosedPipe || err == context.Canceled {
+			fact.Origin = netproxy.OriginLocalCleanup
+		}
+	default:
+	}
+	if c.lease != nil {
+		fact.Stream = c.lease.Stream()
+	}
+	wrapped := netproxy.WrapFailure(err, fact)
+	if c.lease != nil && fact.Scope == netproxy.ScopeStream {
+		c.lease.Invalidate(wrapped)
+	}
+	return wrapped
 }
-
-func (c *ClientConn) LocalAddr() net.Addr {
-	return nil
-}
-
-func (c *ClientConn) RemoteAddr() net.Addr {
-	return nil
-}
+func (c *ClientConn) LocalAddr() net.Addr  { return nil }
+func (c *ClientConn) RemoteAddr() net.Addr { return nil }
 
 type Dialer struct {
-	protocol.StatelessDialer
-	ServiceName   string
-	ServerName    string
-	Address       string
-	AllowInsecure bool
+	ParentDialer netproxy.Dialer
+	ServiceName  string
+	Address      string
+	TLSConfig    *tls.Config // nil uses plaintext HTTP/2
 
 	initOnce  sync.Once
 	lifecycle *netproxy.SingleSession[*grpc.ClientConn]
@@ -312,6 +265,7 @@ type Dialer struct {
 func (d *Dialer) session() *netproxy.SingleSession[*grpc.ClientConn] {
 	d.initOnce.Do(func() {
 		d.lifecycle = netproxy.NewSingleSession(netproxy.SingleSessionConfig[*grpc.ClientConn]{
+			Layer: netproxy.LayerGRPC, RecoveryExecutor: netproxy.RecoveryLibraryManaged, LogicalChannel: true,
 			Establish:   d.establish,
 			IsConnected: func(cc *grpc.ClientConn) bool { return cc.GetState() == connectivity.Ready },
 			Recover:     d.recover,
@@ -331,18 +285,26 @@ func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
 }
 
 func (d *Dialer) dialOptions() ([]grpc.DialOption, error) {
-	roots, err := cert.GetSystemCertPool()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get system certificate pool: %w", err)
+	var transportCredentials credentials.TransportCredentials = insecure.NewCredentials()
+	if d.TLSConfig != nil {
+		config := d.TLSConfig.Clone()
+		if config.RootCAs == nil && !config.InsecureSkipVerify {
+			roots, err := cert.GetSystemCertPool()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get system certificate pool: %w", err)
+			}
+			config.RootCAs = roots
+		}
+		transportCredentials = credentials.NewTLS(config)
 	}
 	return []grpc.DialOption{
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-			ServerName:         d.ServerName,
-			RootCAs:            roots,
-			InsecureSkipVerify: d.AllowInsecure,
-		})),
+		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
-			return d.ParentDialer.DialContext(ctx, "tcp", address)
+			conn, err := d.ParentDialer.DialContext(ctx, "tcp", address)
+			if err == nil {
+				netproxy.CaptureDependency(ctx, conn)
+			}
+			return conn, err
 		}),
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
@@ -420,26 +382,30 @@ func (d *Dialer) observe(ctx context.Context, handle *netproxy.SingleSessionHand
 func (d *Dialer) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {
 	switch network {
 	case "tcp":
-		cc, err := d.session().Current()
+		handle, err := d.session().CurrentHandle()
 		if err != nil {
 			return nil, err
 		}
-		client := proto.NewGunServiceClient(cc)
-
-		clientX := client.(proto.GunServiceClientX)
-		serviceName := d.ServiceName
-		if serviceName == "" {
-			serviceName = "GunService"
+		lease := handle.NewStreamLease()
+		if !lease.Valid() {
+			return nil, netproxy.ErrNotConnected
 		}
 		// ctx is the lifetime of the tun
 		ctxStream, streamCloser := context.WithCancel(context.Background())
-		tun, err := common.Invoke(ctx, func() (proto.GunService_TunClient, error) {
-			return clientX.TunCustomName(ctxStream, serviceName)
+		tun, err := common.Invoke(ctx, func() (proto.Tunnel, error) {
+			return proto.Open(ctxStream, handle.Resource(), d.ServiceName)
 		}, streamCloser)
 		if err != nil {
-			return nil, err
+			lease.Invalidate(err)
+			return nil, netproxy.WrapFailure(err, netproxy.Failure{Layer: netproxy.LayerGRPC, Scope: netproxy.ScopeStream, Phase: netproxy.OpOpenStream, Stream: lease.Stream()})
 		}
-		return NewClientConn(tun, streamCloser), nil
+		conn := NewClientConn(tun, streamCloser)
+		conn.lease = lease
+		if !lease.Valid() {
+			_ = conn.Close()
+			return nil, netproxy.ErrNotConnected
+		}
+		return conn, nil
 	case "udp":
 		return nil, fmt.Errorf("%w: grpc+udp", netproxy.UnsupportedTunnelTypeError)
 	default:

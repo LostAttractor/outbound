@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
-	"sync/atomic"
 )
 
 const CheckMark = -1
@@ -27,25 +26,12 @@ var (
 	}
 )
 
-var DefaultPaddingFactory atomic.Value
+var defaultPadding = NewPaddingFactory(defaultPaddingScheme)
 
 type paddingFactory struct {
-	scheme    map[string]string
-	RawScheme []byte
-	Stop      uint32
-	Md5       string
-}
-
-func init() {
-	updatePaddingScheme(defaultPaddingScheme)
-}
-
-func updatePaddingScheme(rawScheme []byte) bool {
-	if p := NewPaddingFactory(rawScheme); p != nil {
-		DefaultPaddingFactory.Store(p)
-		return true
-	}
-	return false
+	scheme map[string]string
+	Stop   uint32
+	Md5    string
 }
 
 func stringMapFromBytes(b []byte) map[string]string {
@@ -62,14 +48,13 @@ func stringMapFromBytes(b []byte) map[string]string {
 
 func NewPaddingFactory(rawScheme []byte) *paddingFactory {
 	p := &paddingFactory{
-		RawScheme: rawScheme,
-		Md5:       fmt.Sprintf("%x", md5.Sum(rawScheme)),
+		Md5: fmt.Sprintf("%x", md5.Sum(rawScheme)),
 	}
 	scheme := stringMapFromBytes(rawScheme)
 	if len(scheme) == 0 {
 		return nil
 	}
-	if stop, err := strconv.Atoi(scheme["stop"]); err == nil {
+	if stop, err := strconv.ParseUint(scheme["stop"], 10, 32); err == nil {
 		p.Stop = uint32(stop)
 	} else {
 		return nil
@@ -93,7 +78,7 @@ func (p *paddingFactory) GenerateRecordPayloadSizes(pkt uint32) (pktSizes []int)
 					continue
 				}
 				_min, _max = min(_min, _max), max(_min, _max)
-				if _min <= 0 || _max <= 0 {
+				if _min <= 0 || _max > 65535 {
 					continue
 				}
 				if _min == _max {

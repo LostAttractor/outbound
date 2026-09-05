@@ -12,13 +12,7 @@ import (
 
 	"github.com/daeuniverse/outbound/common"
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
-	"github.com/daeuniverse/outbound/pool"
-	swBytes "github.com/daeuniverse/outbound/pool/bytes"
 )
-
-func init() {
-	register("auth_aes128_md5", NewAuthAES128MD5)
-}
 
 func NewAuthAES128MD5() IProtocol {
 	a := &authAES128{
@@ -28,7 +22,6 @@ func NewAuthAES128MD5() IProtocol {
 		packID:     1,
 		recvInfo: recvInfo{
 			recvID: 1,
-			buffer: new(swBytes.Buffer),
 		},
 	}
 	return a
@@ -36,13 +29,12 @@ func NewAuthAES128MD5() IProtocol {
 
 type recvInfo struct {
 	recvID uint32
-	buffer *swBytes.Buffer
 }
 
 type authAES128 struct {
 	*ServerInfo
 	recvInfo
-	data          *AuthData
+	data          AuthData
 	hasSentHeader bool
 	packID        uint32
 	userKey       []byte
@@ -55,19 +47,6 @@ type authAES128 struct {
 func (a *authAES128) InitWithServerInfo(s *ServerInfo) {
 	a.ServerInfo = s
 	a.initUser()
-}
-
-func (a *authAES128) SetData(data interface{}) {
-	if auth, ok := data.(*AuthData); ok {
-		a.data = auth
-	}
-}
-
-func (a *authAES128) GetData() interface{} {
-	if a.data == nil {
-		a.data = &AuthData{}
-	}
-	return a.data
 }
 
 func (a *authAES128) packData(data []byte) (outData []byte) {
@@ -199,24 +178,23 @@ func (a *authAES128) packAuthData(data []byte) (outData []byte) {
 	return
 }
 
-func (a *authAES128) EncodePkt(buf *swBytes.Buffer) (err error) {
+func (a *authAES128) EncodePkt(buf *bytes.Buffer) (err error) {
 	buf.Write(a.uid[:])
 	buf.Write(a.hmac(a.userKey, buf.Bytes())[:4])
 	return nil
 }
 
-func (a *authAES128) DecodePkt(in []byte) (out pool.Bytes, err error) {
+func (a *authAES128) DecodePkt(in []byte) (out []byte, err error) {
 	if len(in) < 4 {
 		return nil, ErrAuthAES128DataLengthError
 	}
 	if !bytes.Equal(a.hmac(a.Key, in[:len(in)-4])[:4], in[len(in)-4:]) {
 		return nil, ErrAuthAES128IncorrectChecksum
 	}
-	return pool.B(in[:len(in)-4]), nil
+	return in[:len(in)-4], nil
 }
 
-func (a *authAES128) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+func (a *authAES128) Encode(plainData []byte, dst *bytes.Buffer) error {
 	dataLength := len(plainData)
 	offset := 0
 	if dataLength > 0 && !a.hasSentHeader {
@@ -225,24 +203,23 @@ func (a *authAES128) Encode(plainData []byte) (outData []byte, err error) {
 			authLength = 1200
 		}
 		a.hasSentHeader = true
-		a.buffer.Write(a.packAuthData(plainData[:authLength]))
+		dst.Write(a.packAuthData(plainData[:authLength]))
 		dataLength -= authLength
 		offset += authLength
 	}
 	const blockSize = 4096
 	for dataLength > blockSize {
-		a.buffer.Write(a.packData(plainData[offset : offset+blockSize]))
+		dst.Write(a.packData(plainData[offset : offset+blockSize]))
 		dataLength -= blockSize
 		offset += blockSize
 	}
 	if dataLength > 0 {
-		a.buffer.Write(a.packData(plainData[offset:]))
+		dst.Write(a.packData(plainData[offset:]))
 	}
-	return a.buffer.Bytes(), nil
+	return nil
 }
 
-func (a *authAES128) Decode(plainData []byte) ([]byte, int, error) {
-	a.buffer.Reset()
+func (a *authAES128) Decode(plainData []byte, dst *bytes.Buffer) (int, error) {
 	plainLength := len(plainData)
 	readlenth := 0
 	key := make([]byte, len(a.userKey)+4)
@@ -252,18 +229,18 @@ func (a *authAES128) Decode(plainData []byte) ([]byte, int, error) {
 
 		h := a.hmac(key, plainData[0:2])
 		if h[0] != plainData[2] || h[1] != plainData[3] {
-			return nil, 0, ErrAuthAES128IncorrectHMAC
+			return 0, ErrAuthAES128IncorrectHMAC
 		}
 		length := int(binary.LittleEndian.Uint16(plainData[0:2]))
 		if length >= 8192 || length < 7 {
-			return nil, 0, ErrAuthAES128DataLengthError
+			return 0, ErrAuthAES128DataLengthError
 		}
 		if length > plainLength {
 			break
 		}
 		h = a.hmac(key, plainData[:length-4])
 		if !bytes.Equal(h[:4], plainData[length-4:length]) {
-			return nil, 0, ErrAuthAES128IncorrectChecksum
+			return 0, ErrAuthAES128IncorrectChecksum
 		}
 		a.recvID++
 		pos := int(plainData[4])
@@ -272,15 +249,15 @@ func (a *authAES128) Decode(plainData []byte) ([]byte, int, error) {
 		} else {
 			pos = int(binary.LittleEndian.Uint16(plainData[5:7])) + 4
 		}
-		if pos > length-4 {
-			return nil, 0, ErrAuthAES128PosOutOfRange
+		if pos < 5 || pos > length-4 {
+			return 0, ErrAuthAES128PosOutOfRange
 		}
-		a.buffer.Write(plainData[pos : length-4])
+		dst.Write(plainData[pos : length-4])
 		plainData = plainData[length:]
 		plainLength -= length
 		readlenth += length
 	}
-	return a.buffer.Bytes(), readlenth, nil
+	return readlenth, nil
 }
 
 func (a *authAES128) GetOverhead() int {

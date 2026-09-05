@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
@@ -31,9 +31,10 @@ func init() {
 }
 
 type Dialer struct {
-	protocol.StatelessDialer
+	ParentDialer netproxy.Dialer
 	proxyAddress string
 	key          []byte
+	padding      atomic.Pointer[paddingFactory]
 	tlsConfig    *tls.Config
 
 	idleSessionLock sync.Mutex
@@ -46,15 +47,20 @@ type Dialer struct {
 	closeOnce       sync.Once
 	closeErr        error
 
+	desired      int
+	lastCause    error
+	connecting   bool
 	connectToken chan struct{}
 	state        *netproxy.StateBroadcaster
+	poolRef      netproxy.ResourceRef
+	episode      uint64
 }
 
 func NewDialer(ParentDialer netproxy.Dialer, header protocol.Header) (*Dialer, error) {
 	sum := sha256.Sum256([]byte(header.Password))
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Dialer{
-		ParentDialer: ParentDialer,
+	d := &Dialer{
+		poolRef: netproxy.NewResourceRef(), ParentDialer: ParentDialer,
 		proxyAddress: header.ProxyAddress,
 		key:          sum[:],
 		tlsConfig:    header.TlsConfig,
@@ -64,10 +70,24 @@ func NewDialer(ParentDialer netproxy.Dialer, header protocol.Header) (*Dialer, e
 		state:        netproxy.NewStateBroadcaster(netproxy.SessionDisconnected),
 		ctx:          ctx,
 		cancel:       cancel,
-	}, nil
+	}
+	d.padding.Store(defaultPadding)
+	initial := d.state.Snapshot()
+	initial.Resource = d.poolRef
+	initial.Layer = netproxy.LayerAnyTLS
+	initial.RecoveryExecutor = netproxy.RecoveryDaemon
+	d.state.Publish(initial)
+	return d, nil
 }
 
-func (d *Dialer) Snapshot() netproxy.StateEvent { return d.state.Snapshot() }
+func (d *Dialer) Snapshot() netproxy.StateEvent {
+	d.idleSessionLock.Lock()
+	defer d.idleSessionLock.Unlock()
+	if d.ctx.Err() == nil {
+		d.publishStateLocked(nil)
+	}
+	return d.state.Snapshot()
+}
 
 func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
 	return d.state.WatchState(ctx)
@@ -121,7 +141,8 @@ func (d *Dialer) Connect(ctx context.Context) error {
 		d.idleSessionLock.Unlock()
 		return net.ErrClosed
 	}
-	if d.state.Snapshot().State == netproxy.SessionConnected {
+	d.publishStateLocked(nil)
+	if d.state.Snapshot().State == netproxy.SessionConnected && !d.state.Snapshot().RecoveryRequired {
 		if ctx.Err() != nil {
 			d.idleSessionLock.Unlock()
 			return d.contextError(ctx)
@@ -129,8 +150,17 @@ func (d *Dialer) Connect(ctx context.Context) error {
 		d.idleSessionLock.Unlock()
 		return nil
 	}
-	d.state.Transition(netproxy.SessionConnecting, nil)
+	d.connecting = true
+	d.publishStateLocked(nil)
 	d.idleSessionLock.Unlock()
+	defer func() {
+		d.idleSessionLock.Lock()
+		d.connecting = false
+		if d.ctx.Err() == nil {
+			d.publishStateLocked(nil)
+		}
+		d.idleSessionLock.Unlock()
+	}()
 	dialCtx, cancel := netproxy.NewDialTimeoutContextFrom(ctx)
 	s, err := d.createSession(dialCtx)
 	cancel()
@@ -166,9 +196,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		if err != nil {
 			return nil, err
 		}
-		return d.openContext(ctx,
-			func() (net.Conn, error) { return s.newStream(addr) },
-			func() { _ = s.Close() })
+		return d.openStream(ctx, s, addr)
 	case "udp":
 		conn, err := d.listenPacket(ctx, addr)
 		if err != nil {
@@ -201,65 +229,85 @@ func (d *Dialer) listenPacket(ctx context.Context, addr string) (net.PacketConn,
 	if err != nil {
 		return nil, err
 	}
-	return d.openContext(ctx,
-		func() (net.PacketConn, error) {
-			return s.newPacketStream(net.JoinHostPort("sp.v2.udp-over-tcp.arpa", port), addr)
-		},
-		func() { _ = s.Close() })
+
+	stream, err := d.openStream(ctx, s, net.JoinHostPort("sp.v2.udp-over-tcp.arpa", port))
+	if err != nil {
+		return nil, err
+	}
+	return &packetStream{stream: stream, addr: addr}, nil
 }
 
-func (d *Dialer) openContext[T interface{ Close() error }](ctx context.Context, open func() (T, error), abort func()) (T, error) {
+// An opening stream may already be writing a shared TLS record when its
+// caller cancels. The owner tracks that worker until its carrier write exits;
+// cancellation never closes the carrier merely to interrupt one stream.
+func (d *Dialer) openStream(ctx context.Context, s *session, target string) (*stream, error) {
 	type result struct {
-		value T
-		err   error
+		stream *stream
+		err    error
 	}
 	results := make(chan result)
 	d.workers.Go(func() {
-		value, err := open()
+		stream, err := s.newStreamContext(ctx, target)
 		select {
-		case results <- result{value: value, err: err}:
+		case results <- result{stream, err}:
 		case <-ctx.Done():
-			if err == nil {
-				_ = value.Close()
+			if stream != nil {
+				_ = stream.Close()
 			}
 		}
 	})
 	select {
 	case result := <-results:
-		if result.err != nil {
-			abort()
-			var zero T
-			return zero, result.err
-		}
 		if err := ctx.Err(); err != nil {
-			_ = result.value.Close()
-			var zero T
-			return zero, err
+			if result.stream != nil {
+				_ = result.stream.Close()
+			}
+			return nil, errors.Join(result.err, err)
 		}
-		return result.value, nil
+		return result.stream, result.err
 	case <-ctx.Done():
-		abort()
-		var zero T
-		return zero, ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
 func (d *Dialer) getSession(ctx context.Context) (*session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := netproxy.RequireConnected(d); err != nil {
 		return nil, err
 	}
 	d.idleSessionLock.Lock()
+	defer d.idleSessionLock.Unlock()
 	for s := range d.idleSessions {
 		delete(d.idleSessions, s)
-		if s.closed.Load() {
+		if !s.closed.Load() && s.lease.Valid() {
+			return s, nil
+		}
+	}
+	var best *session
+	load, capacity := 0, 0
+	for s := range d.sessions {
+		if s.closed.Load() || !s.lease.Valid() {
 			continue
 		}
-		d.idleSessionLock.Unlock()
-		return s, nil
+		capacity++
+		s.streamLock.RLock()
+		current := len(s.streams)
+		s.streamLock.RUnlock()
+		if best == nil || current < load {
+			best, load = s, current
+		}
 	}
-	d.idleSessionLock.Unlock()
-
-	return d.createSession(ctx)
+	if best == nil {
+		d.publishStateLocked(nil)
+		return nil, netproxy.ErrNotConnected
+	}
+	// Existing AnyTLS sessions multiplex concurrent streams. Busy pools request
+	// one extra ready session, while this operation uses current healthy capacity.
+	d.desired = max(d.desired, capacity+1)
+	d.publishStateLocked(nil)
+	return best, nil
 }
 
 func (d *Dialer) createSession(ctx context.Context) (*session, error) {
@@ -268,29 +316,51 @@ func (d *Dialer) createSession(ctx context.Context) (*session, error) {
 		return nil, err
 	}
 
+	netproxy.CaptureDependency(ctx, conn)
 	tlsConn := tls.Client(conn, d.tlsConfig)
-	stopClose := context.AfterFunc(ctx, func() { _ = tlsConn.Close() })
-	defer stopClose()
 
-	buf := pool.GetBuffer(len(d.key) + 2)
-	defer pool.PutBuffer(buf)
-	copy(buf, d.key)
-	binary.BigEndian.PutUint16(buf[len(d.key):], uint16(0))
-	if _, err := tlsConn.Write(buf); err != nil {
-		tlsConn.Close()
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	_, _ = buf.Write(d.key)
+	padding := 0
+	if sizes := d.padding.Load().GenerateRecordPayloadSizes(0); len(sizes) > 0 {
+		padding = max(0, sizes[0])
+	}
+	_ = buf.WriteByte(byte(padding >> 8))
+	_ = buf.WriteByte(byte(padding))
+	_, _ = buf.Write(make([]byte, padding))
+	if err := protocol.Handshake(ctx, tlsConn, func() error { _, err := tlsConn.Write(buf.Bytes()); return err }); err != nil {
 		return nil, err
 	}
 
-	s := newSession(tlsConn, d.sessionIdle)
+	s := newSession(tlsConn, d.sessionIdle, netproxy.DependencyOf(conn))
+	s.padding = &d.padding
+	if !s.lease.Valid() {
+		_ = s.Close()
+		return nil, netproxy.ErrDependencyInvalid
+	}
 	d.idleSessionLock.Lock()
 	if d.ctx.Err() != nil {
 		d.idleSessionLock.Unlock()
 		_ = s.Close()
 		return nil, net.ErrClosed
 	}
+	if !s.lease.Valid() {
+		d.idleSessionLock.Unlock()
+		_ = s.Close()
+		return nil, netproxy.ErrDependencyInvalid
+	}
 	d.sessions[s] = struct{}{}
-	d.state.Transition(netproxy.SessionConnected, nil)
+	d.publishStateLocked(nil)
 	d.idleSessionLock.Unlock()
+	d.workers.Go(func() {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-s.lease.Done():
+		}
+		_ = s.Close()
+	})
 	d.workers.Go(func() {
 		err := s.run()
 		d.sessionClosed(s, err)
@@ -309,11 +379,19 @@ func (d *Dialer) sessionIdle(s *session) {
 
 func (d *Dialer) sessionClosed(s *session, cause error) {
 	d.idleSessionLock.Lock()
+	_, member := d.sessions[s]
+	if member && d.ctx.Err() == nil {
+		for _, failure := range netproxy.Failures(cause) {
+			if failure.Scope == netproxy.ScopeSharedResource && failure.Origin != netproxy.OriginLocalCleanup {
+				d.episode++
+				break
+			}
+		}
+	}
 	delete(d.idleSessions, s)
 	delete(d.sessions, s)
-	disconnected := len(d.sessions) == 0 && d.ctx.Err() == nil
-	if disconnected {
-		d.state.Transition(netproxy.SessionDisconnected, cause)
+	if d.ctx.Err() == nil {
+		d.publishStateLocked(cause)
 	}
 	d.idleSessionLock.Unlock()
 }
@@ -324,9 +402,7 @@ func (d *Dialer) sessionError(cause error) error {
 	if d.ctx.Err() != nil {
 		return net.ErrClosed
 	}
-	if len(d.sessions) == 0 {
-		d.state.Transition(netproxy.SessionDisconnected, cause)
-	}
+	d.publishStateLocked(cause)
 	return cause
 }
 
@@ -349,4 +425,46 @@ func (d *Dialer) Close() error {
 		d.workers.Wait()
 	})
 	return d.closeErr
+}
+
+func (d *Dialer) publishStateLocked(cause error) {
+	capacity := 0
+	for s := range d.sessions {
+		if !s.closed.Load() && s.lease.Valid() {
+			capacity++
+		}
+	}
+	event := d.state.Snapshot()
+	state := netproxy.SessionDisconnected
+	if capacity > 0 {
+		state = netproxy.SessionConnected
+	} else if d.connecting {
+		state = netproxy.SessionConnecting
+	}
+	required := capacity > 0 && capacity < max(1, d.desired)
+	if cause != nil && d.lastCause == nil {
+		d.lastCause = cause
+	}
+	if required || capacity == 0 {
+		cause = d.lastCause
+	} else {
+		d.lastCause = nil
+		cause = nil
+	}
+	if event.State == state && event.UsableCapacity == capacity && event.RecoveryRequired == required && event.Resource == d.poolRef && event.EpisodeID == d.episode && (cause == nil || event.Cause == cause) {
+		return
+	}
+	event.State, event.Accepting, event.UsableCapacity, event.Cause = state, capacity > 0, capacity, cause
+	event.Layer, event.RecoveryExecutor = netproxy.LayerAnyTLS, netproxy.RecoveryDaemon
+	event.RecoveryRequired = required
+	event.Resource, event.EpisodeID = d.poolRef, d.episode
+	switch state {
+	case netproxy.SessionConnected:
+		event.RecoveryPhase = "ready"
+	case netproxy.SessionConnecting:
+		event.RecoveryPhase = "connecting"
+	default:
+		event.RecoveryPhase = "queued"
+	}
+	d.state.Publish(event)
 }

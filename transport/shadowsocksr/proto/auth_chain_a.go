@@ -17,13 +17,8 @@ import (
 	"github.com/daeuniverse/outbound/common"
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
-	swBytes "github.com/daeuniverse/outbound/pool/bytes"
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto"
 )
-
-func init() {
-	register("auth_chain_a", NewAuthChainA)
-}
 
 type authChainA struct {
 	*ServerInfo
@@ -38,7 +33,7 @@ type authChainA struct {
 	userKeyLen     int
 	uid            [4]byte
 	salt           string
-	data           *AuthData
+	data           AuthData
 	hmac           hmacMethod
 	hashDigest     hashDigestMethod
 	rnd            rndMethod
@@ -57,7 +52,6 @@ func NewAuthChainA() IProtocol {
 		rndPkt:     authChainAPktGetRandLen,
 		recvInfo: recvInfo{
 			recvID: 1,
-			buffer: new(swBytes.Buffer),
 		},
 	}
 	return a
@@ -87,19 +81,6 @@ func (a *authChainA) InitWithServerInfo(s *ServerInfo) {
 		a.authChainBInitDataSize()
 	}
 	a.initUser()
-}
-
-func (a *authChainA) SetData(data interface{}) {
-	if auth, ok := data.(*AuthData); ok {
-		a.data = auth
-	}
-}
-
-func (a *authChainA) GetData() interface{} {
-	if a.data == nil {
-		a.data = &AuthData{}
-	}
-	return a.data
 }
 
 func authChainAGetRandLen(dataLength int, random *crypto.Shift128plusContext, lastHash []byte, dataSizeList, dataSizeList2 []int, overhead int) int {
@@ -252,9 +233,9 @@ func authChainAPktGetRandLen(ctx *crypto.Shift128plusContext, lastHash []byte) i
 	return int(ctx.Next() % 127)
 }
 
-func (a *authChainA) EncodePkt(buf *swBytes.Buffer) (err error) {
-	authData := pool.Get(3)
-	defer pool.Put(authData)
+func (a *authChainA) EncodePkt(buf *bytes.Buffer) (err error) {
+	authData := pool.GetBuffer(3)
+	defer pool.PutBuffer(authData)
 	rand.Read(authData)
 
 	md5Data := a.hmac(a.Key, authData)
@@ -268,7 +249,7 @@ func (a *authChainA) EncodePkt(buf *swBytes.Buffer) (err error) {
 	}
 	rc4Cipher.XORKeyStream(buf.Bytes(), buf.Bytes())
 
-	buf.Extend(randDataLength)
+	buf.Write(make([]byte, randDataLength))
 	rand.Read(buf.Bytes()[buf.Len()-randDataLength:])
 	buf.Write(authData)
 	binary.Write(buf, binary.LittleEndian, binary.LittleEndian.Uint32(a.uid[:])^binary.LittleEndian.Uint32(md5Data[:4]))
@@ -276,7 +257,7 @@ func (a *authChainA) EncodePkt(buf *swBytes.Buffer) (err error) {
 	return nil
 }
 
-func (a *authChainA) DecodePkt(in []byte) (out pool.Bytes, err error) {
+func (a *authChainA) DecodePkt(in []byte) (out []byte, err error) {
 	if len(in) < 9 {
 		return nil, ErrAuthChainDataLengthError
 	}
@@ -292,13 +273,15 @@ func (a *authChainA) DecodePkt(in []byte) (out pool.Bytes, err error) {
 	if err != nil {
 		return nil, err
 	}
+	if randDataLength > len(in)-8 {
+		return nil, ErrAuthChainDataLengthError
+	}
 	data := in[:len(in)-8-randDataLength]
 	rc4Cipher.XORKeyStream(data, data)
-	return pool.B(data), nil
+	return data, nil
 }
 
-func (a *authChainA) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+func (a *authChainA) Encode(plainData []byte, dst *bytes.Buffer) error {
 	dataLength := len(plainData)
 	offset := 0
 	if dataLength > 0 && !a.hasSentHeader {
@@ -306,7 +289,7 @@ func (a *authChainA) Encode(plainData []byte) (outData []byte, err error) {
 		if headSize > dataLength {
 			headSize = dataLength
 		}
-		a.buffer.Write(a.packAuthData(plainData[:headSize]))
+		dst.Write(a.packAuthData(plainData[:headSize]))
 		offset += headSize
 		dataLength -= headSize
 		a.hasSentHeader = true
@@ -316,7 +299,7 @@ func (a *authChainA) Encode(plainData []byte) (outData []byte, err error) {
 		dataLen, randLength := a.packedDataLen(plainData[offset : offset+unitSize])
 		b := make([]byte, dataLen)
 		a.packData(b, plainData[offset:offset+unitSize], randLength)
-		a.buffer.Write(b)
+		dst.Write(b)
 		dataLength -= unitSize
 		offset += unitSize
 	}
@@ -324,13 +307,12 @@ func (a *authChainA) Encode(plainData []byte) (outData []byte, err error) {
 		dataLen, randLength := a.packedDataLen(plainData[offset:])
 		b := make([]byte, dataLen)
 		a.packData(b, plainData[offset:], randLength)
-		a.buffer.Write(b)
+		dst.Write(b)
 	}
-	return a.buffer.Bytes(), nil
+	return nil
 }
 
-func (a *authChainA) Decode(plainData []byte) (outData []byte, n int, err error) {
-	a.buffer.Reset()
+func (a *authChainA) Decode(plainData []byte, dst *bytes.Buffer) (int, error) {
 	key := make([]byte, len(a.userKey)+4)
 	readlenth := 0
 	copy(key, a.userKey)
@@ -340,7 +322,7 @@ func (a *authChainA) Decode(plainData []byte) (outData []byte, n int, err error)
 		randLen := a.getServerRandLen(dataLen, a.Overhead)
 		length := randLen + dataLen
 		if length >= 4096 {
-			return nil, 0, ErrAuthChainDataLengthError
+			return 0, ErrAuthChainDataLengthError
 		}
 		length += 4
 		if length > len(plainData) {
@@ -349,7 +331,7 @@ func (a *authChainA) Decode(plainData []byte) (outData []byte, n int, err error)
 
 		hash := a.hmac(key, plainData[:length-2])
 		if !bytes.Equal(hash[:2], plainData[length-2:length]) {
-			return nil, 0, ErrAuthChainIncorrectHMAC
+			return 0, ErrAuthChainIncorrectHMAC
 		}
 		var dataPos int
 		if dataLen > 0 && randLen > 0 {
@@ -359,17 +341,24 @@ func (a *authChainA) Decode(plainData []byte) (outData []byte, n int, err error)
 		}
 		b := make([]byte, dataLen)
 		a.cipher.Decrypt(b, plainData[dataPos:dataPos+dataLen])
-		a.buffer.Write(b)
 		if a.recvID == 1 {
-			a.TcpMss = int(binary.LittleEndian.Uint16(a.buffer.Next(2)))
+			if len(b) < 2 {
+				return 0, ErrAuthChainDataLengthError
+			}
+			a.TcpMss = int(binary.LittleEndian.Uint16(b[:2]))
+			if a.TcpMss <= a.Overhead {
+				return 0, ErrAuthChainDataLengthError
+			}
+			b = b[2:]
 		}
+		dst.Write(b)
 		a.lastServerHash = hash
 		a.recvID++
 		plainData = plainData[length:]
 		readlenth += length
 
 	}
-	return a.buffer.Bytes(), readlenth, nil
+	return readlenth, nil
 }
 
 func (a *authChainA) GetOverhead() int {

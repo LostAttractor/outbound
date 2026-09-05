@@ -3,8 +3,8 @@ package common
 import (
 	"net"
 	"sync"
-	"time"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/quic-go"
 )
 
@@ -14,20 +14,39 @@ type safeStreamConn struct {
 	lAddr net.Addr
 	rAddr net.Addr
 
-	closeDeferFn func()
-
 	closeOnce sync.Once
 	closeErr  error
+	lease     *netproxy.Lease
+	fail      func(error)
+}
+
+func (q *safeStreamConn) BindRecovery(lease *netproxy.Lease, fail func(error)) {
+	q.lease, q.fail = lease, fail
+}
+func (q *safeStreamConn) DependencyLease() *netproxy.Lease { return q.lease }
+func (q *safeStreamConn) wrap(err error, op netproxy.Operation) error {
+	if q.lease == nil {
+		return err
+	}
+	return WrapQUICError(err, q.lease.Resource(), q.lease, op, q.fail)
+}
+func (q *safeStreamConn) Read(p []byte) (int, error) {
+	n, err := q.Stream.Read(p)
+	return n, q.wrap(err, netproxy.OpRead)
 }
 
 func (q *safeStreamConn) Write(p []byte) (n int, err error) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
-	return q.Stream.Write(p)
+	n, err = q.Stream.Write(p)
+	return n, q.wrap(err, netproxy.OpWrite)
 }
 
 func (q *safeStreamConn) Close() error {
 	q.closeOnce.Do(func() {
+		if q.lease != nil {
+			q.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: q.lease.Resource(), Stream: q.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerQUIC, Phase: netproxy.OpClose, Origin: netproxy.OriginLocalCleanup, Reason: netproxy.ReasonClosed}))
+		}
 		q.closeErr = q.close()
 	})
 	return q.closeErr
@@ -41,26 +60,13 @@ func (s *safeStreamConn) CloseWrite() error {
 	// It prevents further writes, which in turn will result in an EOF signal being sent the other side of stream when
 	// reading.
 	// We can still read from this stream.
-	return s.Stream.Close()
+	return s.wrap(s.Stream.Close(), netproxy.OpCloseWrite)
 }
 
 func (q *safeStreamConn) close() error {
-	if q.closeDeferFn != nil {
-		defer q.closeDeferFn()
-	}
-
-	// https://github.com/cloudflare/cloudflared/commit/ed2bac026db46b239699ac5ce4fcf122d7cab2cd
-	// Make sure a possible writer does not block the lock forever. We need it, so we can close the writer
-	// side of the stream safely.
-	_ = q.Stream.SetWriteDeadline(time.Now())
-
-	// This lock is eventually acquired despite Write also acquiring it, because we set a deadline to writes.
-	q.lock.Lock()
-	defer q.lock.Unlock()
-
-	// We have to clean up the receiving stream ourselves since the Close in the bottom does not handle that.
 	q.Stream.CancelRead(0)
-	return q.Stream.Close()
+	q.Stream.CancelWrite(0)
+	return nil
 }
 
 func (q *safeStreamConn) LocalAddr() net.Addr {
@@ -71,6 +77,6 @@ func (q *safeStreamConn) RemoteAddr() net.Addr {
 	return q.rAddr
 }
 
-func NewSafeStreamConn(stream *quic.Stream, lAddr, rAddr net.Addr, closeDeferFn func()) *safeStreamConn {
-	return &safeStreamConn{Stream: stream, lAddr: lAddr, rAddr: rAddr, closeDeferFn: closeDeferFn}
+func NewSafeStreamConn(stream *quic.Stream, lAddr, rAddr net.Addr) *safeStreamConn {
+	return &safeStreamConn{Stream: stream, lAddr: lAddr, rAddr: rAddr}
 }

@@ -4,22 +4,16 @@ import (
 	"encoding/binary"
 	"time"
 
+	"bytes"
 	"github.com/daeuniverse/outbound/common"
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
-	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/pool/bytes"
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto"
 )
 
-func init() {
-	register("auth_sha1_v4", NewAuthSHA1v4)
-}
-
 type authSHA1v4 struct {
 	*ServerInfo
-	data          *AuthData
+	data          AuthData
 	hasSentHeader bool
-	buffer        bytes.Buffer
 }
 
 func NewAuthSHA1v4() IProtocol {
@@ -29,19 +23,6 @@ func NewAuthSHA1v4() IProtocol {
 
 func (a *authSHA1v4) InitWithServerInfo(s *ServerInfo) {
 	a.ServerInfo = s
-}
-
-func (a *authSHA1v4) SetData(data interface{}) {
-	if auth, ok := data.(*AuthData); ok {
-		a.data = auth
-	}
-}
-
-func (a *authSHA1v4) GetData() interface{} {
-	if a.data == nil {
-		a.data = &AuthData{}
-	}
-	return a.data
 }
 
 func (a *authSHA1v4) packData(data []byte) (outData []byte) {
@@ -153,12 +134,11 @@ func (a *authSHA1v4) EncodePkt(buf *bytes.Buffer) (err error) {
 	return nil
 }
 
-func (a *authSHA1v4) DecodePkt(in []byte) (out pool.Bytes, err error) {
-	return pool.B(in), nil
+func (a *authSHA1v4) DecodePkt(in []byte) (out []byte, err error) {
+	return in, nil
 }
 
-func (a *authSHA1v4) Encode(plainData []byte) (outData []byte, err error) {
-	a.buffer.Reset()
+func (a *authSHA1v4) Encode(plainData []byte, dst *bytes.Buffer) error {
 	dataLength := len(plainData)
 	offset := 0
 	if !a.hasSentHeader && dataLength > 0 {
@@ -166,40 +146,39 @@ func (a *authSHA1v4) Encode(plainData []byte) (outData []byte, err error) {
 		if headSize > dataLength {
 			headSize = dataLength
 		}
-		a.buffer.Write(a.packAuthData(plainData[:headSize]))
+		dst.Write(a.packAuthData(plainData[:headSize]))
 		offset += headSize
 		dataLength -= headSize
 		a.hasSentHeader = true
 	}
 	const blockSize = 4096
 	for dataLength > blockSize {
-		a.buffer.Write(a.packData(plainData[offset : offset+blockSize]))
+		dst.Write(a.packData(plainData[offset : offset+blockSize]))
 		offset += blockSize
 		dataLength -= blockSize
 	}
 	if dataLength > 0 {
-		a.buffer.Write(a.packData(plainData[offset:]))
+		dst.Write(a.packData(plainData[offset:]))
 	}
 
-	return a.buffer.Bytes(), nil
+	return nil
 }
 
-func (a *authSHA1v4) Decode(plainData []byte) (outData []byte, n int, err error) {
-	a.buffer.Reset()
+func (a *authSHA1v4) Decode(plainData []byte, dst *bytes.Buffer) (int, error) {
 	dataLength := len(plainData)
 	plainLength := dataLength
 	for dataLength > 4 {
 		crc32 := crypto.CalcCRC32(plainData, 2, 0xFFFFFFFF)
 		if binary.LittleEndian.Uint16(plainData[2:4]) != uint16(crc32&0xFFFF) {
 			//common.Error("auth_sha1_v4 post decrypt data crc32 error")
-			return nil, 0, ErrAuthSHA1v4CRC32Error
+			return 0, ErrAuthSHA1v4CRC32Error
 		}
 		length := int(binary.BigEndian.Uint16(plainData[0:2]))
 		if length >= 8192 || length < 8 {
 			//common.Error("auth_sha1_v4 post decrypt data length error")
 			dataLength = 0
 			plainData = nil
-			return nil, 0, ErrAuthSHA1v4DataLengthError
+			return 0, ErrAuthSHA1v4DataLengthError
 		}
 		if length > dataLength {
 			break
@@ -212,18 +191,21 @@ func (a *authSHA1v4) Decode(plainData []byte) (outData []byte, n int, err error)
 			} else {
 				pos = int(binary.BigEndian.Uint16(plainData[5:5+2])) + 4
 			}
+			if pos < 5 || pos > length-4 {
+				return 0, ErrAuthSHA1v4DataLengthError
+			}
 			outLength := length - pos - 4
-			a.buffer.Write(plainData[pos : pos+outLength])
+			dst.Write(plainData[pos : pos+outLength])
 			dataLength -= length
 			plainData = plainData[length:]
 		} else {
 			//common.Error("auth_sha1_v4 post decrypt incorrect checksum")
 			dataLength = 0
 			plainData = nil
-			return nil, 0, ErrAuthSHA1v4IncorrectChecksum
+			return 0, ErrAuthSHA1v4IncorrectChecksum
 		}
 	}
-	return a.buffer.Bytes(), plainLength - dataLength, nil
+	return plainLength - dataLength, nil
 }
 
 func (a *authSHA1v4) GetOverhead() int {

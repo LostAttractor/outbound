@@ -3,109 +3,132 @@ package vless
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 	"github.com/daeuniverse/outbound/protocol/vless/vision"
-	"github.com/daeuniverse/outbound/protocol/vmess"
 )
 
-const (
-	XRV = "xtls-rprx-vision"
-)
+const XRV = "xtls-rprx-vision"
 
-func init() {
-	protocol.Register("vless", NewDialer)
-}
+func init() { protocol.Register("vless", NewDialer) }
 
 type Dialer struct {
-	proxyAddress string
-	nextDialer   netproxy.Dialer
-	metadata     protocol.Metadata
-	flow         string
-	xudp         bool
-	key          []byte
+	ParentDialer  netproxy.Dialer
+	address, flow string
+	key           []byte
 }
 
-func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
-	metadata := protocol.Metadata{
-		IsClient: header.IsClient,
-	}
-	//log.Trace("vless.NewDialer: metadata: %v, password: %v", metadata, password)
-	id, err := Password2Key(header.Password)
+func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+	key, err := Password2Key(header.Password)
 	if err != nil {
 		return nil, err
 	}
-	flow := header.Feature1
-	switch flow {
-	case XRV:
-		if !metadata.IsClient {
-			return nil, fmt.Errorf("unsupported server mode xtls flow type: %v", flow)
+	flow := ""
+	if header.Feature1 != nil {
+		var ok bool
+		flow, ok = header.Feature1.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid VLESS flow type")
 		}
-	case "":
+	}
+	if flow != "" && flow != XRV {
+		return nil, fmt.Errorf("unsupported VLESS flow: %s", flow)
+	}
+	return &Dialer{ParentDialer: parent, address: header.ProxyAddress, flow: flow, key: key}, nil
+}
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	switch network {
+	case "tcp":
+		return d.open(ctx, network, address)
+	case "udp":
+		c, err := d.ListenPacket(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return &netproxy.BindPacketConn{PacketConn: c, Address: netproxy.NewAddr("udp", address)}, nil
 	default:
-		return nil, fmt.Errorf("unsupported xtls flow type: %v", flow)
+		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, network)
 	}
-	return &Dialer{
-		proxyAddress: header.ProxyAddress,
-		nextDialer:   nextDialer,
-		metadata:     metadata,
-		flow:         flow.(string),
-		// xudp:         header.Flags&protocol.Flags_VMess_UsePacketAddr == 0,
-		xudp: true && flow == XRV,
-		key:  id,
-	}, nil
 }
-
-func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
-	return d.DialContext(ctx, "tcp", addr)
-}
-
-func (d *Dialer) DialUdp(ctx context.Context, addr string) (c netproxy.PacketConn, err error) {
-	pktConn, err := d.DialContext(ctx, "udp", addr)
+func (d *Dialer) open(ctx context.Context, network, address string) (net.Conn, error) {
+	target, err := socks5.AddressFromString(address)
 	if err != nil {
 		return nil, err
 	}
-	return pktConn.(netproxy.PacketConn), nil
-}
-
-func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c netproxy.Conn, err error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
-	if err != nil {
-		return nil, err
+	if len(target.Hostname) > 255 {
+		return nil, fmt.Errorf("VLESS hostname exceeds 255 bytes")
 	}
-	switch magicNetwork.Network {
-	case "tcp", "udp":
-		mdata, err := protocol.ParseMetadata(addr)
-		if err != nil {
-			return nil, err
-		}
-		mdata.IsClient = d.metadata.IsClient
-
-		tcpNetwork := netproxy.MagicNetwork{
-			Network: "tcp",
-			Mark:    magicNetwork.Mark,
-		}.Encode()
-		conn, err := d.nextDialer.DialContext(ctx, tcpNetwork, d.proxyAddress)
-		if err != nil {
-			return nil, err
-		}
-		conn, err = NewConn(conn, Metadata{
-			Metadata: vmess.Metadata{Metadata: mdata, Network: magicNetwork.Network},
-			Flow:     d.flow,
-			Mux:      magicNetwork.Network == "udp" && d.xudp,
-		}, d.key)
-		if err != nil {
-			return nil, err
-		}
+	header := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(header)
+	header.WriteByte(0)
+	header.Write(d.key)
+	if d.flow != "" {
+		header.WriteByte(byte(2 + len(d.flow)))
+		header.WriteByte(10)
+		header.WriteByte(byte(len(d.flow)))
+		header.WriteString(d.flow)
+	} else {
+		header.WriteByte(0)
+	}
+	command := byte(1)
+	if network == "udp" {
+		command = 2
 		if d.flow == XRV {
-			if d.xudp {
-				return vision.NewPacketConn(conn, d.key, magicNetwork.Network, addr)
-			}
-			return vision.NewConn(conn, d.key)
+			command = 3
 		}
-		return conn, nil
-	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, magicNetwork.Network)
 	}
+	header.WriteByte(command)
+	if command != 3 {
+		header.WriteByte(byte(target.Port >> 8))
+		header.WriteByte(byte(target.Port))
+		switch target.Type {
+		case socks5.AddressTypeIPv4:
+			header.WriteByte(1)
+			header.Write(target.IP.AsSlice())
+		case socks5.AddressTypeIPv6:
+			header.WriteByte(3)
+			header.Write(target.IP.AsSlice())
+		case socks5.AddressTypeDomain:
+			header.WriteByte(2)
+			header.WriteByte(byte(len(target.Hostname)))
+			header.WriteString(target.Hostname)
+		}
+	}
+	parent, err := d.ParentDialer.DialContext(ctx, "tcp", d.address)
+	if err != nil {
+		return nil, err
+	}
+	netproxy.CaptureDependency(ctx, parent)
+	conn := &Conn{Conn: parent}
+	var result net.Conn = conn
+	err = protocol.Handshake(ctx, parent, func() error {
+		if d.flow == XRV {
+			var err error
+			result, err = vision.NewConn(conn, d.key)
+			if err != nil {
+				return err
+			}
+		}
+		_, err := conn.Write(header.Bytes())
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+func (d *Dialer) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	conn, err := d.open(ctx, "udp", address)
+	if err != nil {
+		return nil, err
+	}
+	target := netproxy.NewAddr("udp", address)
+	if d.flow == XRV {
+		return vision.NewPacketConn(conn.(*vision.Conn), target), nil
+	}
+	return newPacketConn(conn, target), nil
 }

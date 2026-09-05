@@ -3,17 +3,21 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/samber/oops"
 
-	"github.com/daeuniverse/outbound/common"
+	"errors"
 	"github.com/daeuniverse/outbound/netproxy"
+	P "github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/utils"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/udphop"
+	tuiccommon "github.com/daeuniverse/outbound/protocol/tuic/common"
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion"
 
 	"github.com/daeuniverse/quic-go"
@@ -24,11 +28,6 @@ const (
 	closeErrCodeProtocolError = 0x101 // HTTP3 ErrCodeGeneralProtocolError
 )
 
-type HandshakeInfo struct {
-	UDPEnabled bool
-	Tx         uint64 // 0 if using BBR
-}
-
 type Client struct {
 	config    *Config
 	lifecycle *netproxy.SingleSession[*clientResource]
@@ -36,6 +35,7 @@ type Client struct {
 
 type clientResource struct {
 	pktConn net.PacketConn
+	http    *http3.Transport
 	conn    *quic.Conn
 	udpSM   *udpSessionManager
 	ctx     context.Context
@@ -46,13 +46,20 @@ func (r *clientResource) close() error {
 	if r.cancel != nil {
 		r.cancel()
 	}
+	var err error
+	if r.http != nil {
+		err = errors.Join(err, r.http.Close())
+	}
 	if r.conn != nil {
-		_ = r.conn.CloseWithError(closeErrCodeProtocolError, "")
+		err = errors.Join(err, r.conn.CloseWithError(closeErrCodeProtocolError, ""))
 	}
 	if r.pktConn != nil {
-		_ = r.pktConn.Close()
+		err = errors.Join(err, r.pktConn.Close())
 	}
-	return nil
+	if r.udpSM != nil && r.udpSM.done != nil {
+		<-r.udpSM.done
+	}
+	return err
 }
 
 func NewClient(config *Config) (*Client, error) {
@@ -61,6 +68,7 @@ func NewClient(config *Config) (*Client, error) {
 	}
 	c := &Client{config: config}
 	c.lifecycle = netproxy.NewSingleSession(netproxy.SingleSessionConfig[*clientResource]{
+		Layer:     netproxy.LayerQUIC,
 		Establish: c.establish,
 		IsConnected: func(resource *clientResource) bool {
 			return resource.conn != nil && resource.conn.Context().Err() == nil &&
@@ -84,29 +92,35 @@ func (c *Client) currentResource() (*clientResource, error) {
 	return c.lifecycle.Current()
 }
 
-// openStream wraps the stream with QStream, which handles Close() properly
-func (c *Client) OpenStream(ctx context.Context) (*utils.QStream, error) {
-	resource, err := c.currentResource()
+func (c *Client) openStream(ctx context.Context, resource *clientResource) (*utils.QStream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	handle, err := c.lifecycle.CurrentHandle()
 	if err != nil {
 		return nil, err
 	}
-	return c.openStream(ctx, resource)
-}
-
-func (c *Client) openStream(ctx context.Context, resource *clientResource) (*utils.QStream, error) {
-	stream, err := resource.conn.OpenStreamSync(ctx)
+	if handle.Resource() != resource {
+		return nil, netproxy.ErrNotConnected
+	}
+	fail := func(err error) { handle.Invalidate(err) }
+	stream, err := resource.conn.OpenStream()
 	if err != nil {
-		return nil, err
+		return nil, tuiccommon.WrapQUICError(err, handle.Ref(), nil, netproxy.OpOpenStream, fail)
+	}
+	lease := handle.NewStreamLease()
+	if !lease.Valid() {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		return nil, lease.Cause()
 	}
 	return &utils.QStream{
-		Stream:     stream,
-		LocalAddr:  resource.conn.LocalAddr(),
-		RemoteAddr: resource.conn.RemoteAddr(),
+		Stream: stream,
+		LAddr:  resource.conn.LocalAddr(),
+		RAddr:  resource.conn.RemoteAddr(),
+		Lease:  lease,
+		Fail:   fail,
 	}, nil
-}
-
-func (c *Client) DialConn(stream *utils.QStream, addr string) (net.Conn, error) {
-	return c.dialConn(stream, addr)
 }
 
 func (c *Client) dialConn(stream *utils.QStream, addr string) (net.Conn, error) {
@@ -121,28 +135,31 @@ func (c *Client) dialConn(stream *utils.QStream, addr string) (net.Conn, error) 
 		// to the first Read() call.
 		return &tcpConn{
 			Orig:             stream,
-			PseudoLocalAddr:  stream.LocalAddr,
-			PseudoRemoteAddr: stream.RemoteAddr,
+			PseudoLocalAddr:  stream.LocalAddr(),
+			PseudoRemoteAddr: stream.RemoteAddr(),
 			Established:      false,
 		}, nil
 	}
 	// Read response
 	ok, msg, err := protocol.ReadTCPResponse(stream)
 	if err != nil {
-		return nil, err
+		return nil, responseError(stream, err)
 	}
 	if !ok {
-		return nil, oops.In("Hysteria2").Errorf("from remote: %v", msg)
+		return nil, targetDialError(stream, msg)
 	}
 	return &tcpConn{
 		Orig:             stream,
-		PseudoLocalAddr:  stream.LocalAddr,
-		PseudoRemoteAddr: stream.RemoteAddr,
+		PseudoLocalAddr:  stream.LocalAddr(),
+		PseudoRemoteAddr: stream.RemoteAddr(),
 		Established:      true,
 	}, nil
 }
 
-func (c *Client) ListenPacket(_ context.Context, _ string) (net.PacketConn, error) {
+func (c *Client) ListenPacket(ctx context.Context, _ string) (net.PacketConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	resource, err := c.currentResource()
 	if err != nil {
 		return nil, err
@@ -150,37 +167,44 @@ func (c *Client) ListenPacket(_ context.Context, _ string) (net.PacketConn, erro
 	if resource.udpSM == nil {
 		return nil, oops.In("Hysteria2").Errorf("%w: UDP not enabled", netproxy.UnsupportedTunnelTypeError)
 	}
-	return resource.udpSM.NewUDP()
+	handle, err := c.lifecycle.CurrentHandle()
+	if err != nil {
+		return nil, err
+	}
+	if handle.Resource() != resource {
+		return nil, netproxy.ErrNotConnected
+	}
+	return resource.udpSM.NewUDP(handle.NewStreamLease(), func(err error) { handle.Invalidate(err) })
 }
 
-func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	switch network {
-	case "tcp":
-		resource, err := c.currentResource()
+func (c *Client) DialContext(ctx context.Context, network, address string) (conn net.Conn, err error) {
+	if network == "udp" {
+		packet, err := c.ListenPacket(ctx, address)
 		if err != nil {
 			return nil, err
 		}
-		stream, err := c.openStream(ctx, resource)
-		if err != nil {
-			return nil, err
-		}
-		return common.Invoke(ctx, func() (net.Conn, error) {
-			return c.dialConn(stream, address)
-		}, func() {
-			stream.Close()
-		})
-	case "udp":
-		conn, err := c.ListenPacket(ctx, address)
-		if err != nil {
-			return nil, err
-		}
-		return &netproxy.BindPacketConn{
-			PacketConn: conn,
-			Address:    netproxy.NewAddr("udp", address),
-		}, nil
-	default:
-		return nil, oops.Errorf("unsupported network: %s", network)
+		return &netproxy.BindPacketConn{PacketConn: packet, Address: netproxy.NewAddr("udp", address)}, nil
 	}
+	if network != "tcp" {
+		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, network)
+	}
+	resource, err := c.currentResource()
+	if err != nil {
+		return nil, err
+	}
+	stream, err := c.openStream(ctx, resource)
+	if err != nil {
+		return nil, err
+	}
+	err = P.Handshake(ctx, stream, func() error {
+		var exchangeErr error
+		conn, exchangeErr = c.dialConn(stream, address)
+		return exchangeErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -199,21 +223,13 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 	if c.config.Addr.Network() == "udphop" {
 		// NextDialer.ListenPacket have to get a new lAddr every time.
 		// Otherwise port hopping will not work.
-		initialDial := make(chan struct{})
-		dialFunc := func(addr net.Addr) (net.Conn, error) {
-			dialCtx := resource.ctx
-			select {
-			case <-initialDial:
-			default:
-				dialCtx = ctx
-			}
+		dialFunc := func(dialCtx context.Context, addr net.Addr) (net.Conn, error) {
 			return c.config.NextDialer.DialContext(dialCtx, "udp", addr.String())
 		}
-		pktConn, err := udphop.NewUDPHopPacketConn(c.config.Addr.(*udphop.UDPHopAddr), c.config.UDPHopInterval, dialFunc)
+		pktConn, err := udphop.NewUDPHopPacketConn(ctx, c.config.Addr.(*udphop.UDPHopAddr), c.config.UDPHopInterval, dialFunc)
 		if err != nil {
 			return nil, err
 		}
-		close(initialDial)
 		resource.pktConn = pktConn
 	} else {
 		pktConn, err := c.config.NextDialer.ListenPacket(ctx, c.config.Addr.String())
@@ -222,6 +238,7 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 		}
 		resource.pktConn = pktConn
 	}
+	netproxy.CaptureDependency(ctx, resource.pktConn)
 
 	// Prepare Transport
 	rt := &http3.Transport{
@@ -236,6 +253,7 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 			return qc, nil
 		},
 	}
+	resource.http = rt
 	// Send auth HTTP request
 	u := &url.URL{
 		Scheme: "https",
@@ -261,7 +279,14 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != protocol.StatusAuthOK {
-		err = oops.Errorf("authentication error, HTTP status code: %v", resp.StatusCode)
+		reason := netproxy.ReasonRejected
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			reason = netproxy.ReasonAuth
+		}
+		err = netproxy.WrapFailure(fmt.Errorf("Hysteria authentication endpoint returned HTTP status %d", resp.StatusCode), netproxy.Failure{
+			Scope: netproxy.ScopeOperation, Layer: netproxy.LayerH3, Phase: netproxy.OpHandshake,
+			Origin: netproxy.OriginPeer, Reason: reason, Code: strconv.Itoa(resp.StatusCode),
+		})
 		return nil, oops.In("HTTP3 Handshake").Wrap(err)
 	}
 	// Auth OK
@@ -297,16 +322,25 @@ func (c *Client) observe(ctx context.Context, handle *netproxy.SingleSessionHand
 	if resource.udpSM != nil {
 		udpDone = resource.udpSM.ctx.Done()
 	}
+	var cause error
 	select {
 	case <-ctx.Done():
 		return
 	case <-resource.conn.Context().Done():
+		cause = context.Cause(resource.conn.Context())
 	case <-udpDone:
+		cause = context.Cause(resource.udpSM.ctx)
 	}
-	cause := context.Cause(resource.conn.Context())
+	if ctx.Err() != nil {
+		return
+	}
 	if cause == nil {
 		cause = net.ErrClosed
 	}
+	cause = tuiccommon.WrapQUICError(cause, handle.Ref(), nil, netproxy.OpRead, nil)
+	failure := netproxy.ClassifyFailure(cause)
+	failure.Scope = netproxy.ScopeSharedResource
+	cause = netproxy.WrapFailure(cause, failure)
 	handle.Disconnect(cause)
 }
 

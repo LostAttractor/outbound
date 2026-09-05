@@ -7,72 +7,55 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
 type Dialer struct {
-	nextDialer netproxy.Dialer
-	url        string
-	transport  *http.Transport
-	ctx        context.Context
-	cancel     context.CancelFunc
-	mu         sync.Mutex
-	workers    sync.WaitGroup
-	closeOnce  sync.Once
+	url       string
+	transport *http.Transport
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	workers   sync.WaitGroup
+	closeOnce sync.Once
 }
 
-var _ netproxy.Dialer = (*Dialer)(nil)
+type Config struct {
+	URL string
+	// Nil uses the HTTPS endpoint's hostname and the default HTTP/2 ALPN.
+	TLSConfig *tls.Config
+}
 
-func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
-	u, err := url.Parse(s)
-	if err != nil {
-		return nil, fmt.Errorf("NewMeek: %w", err)
-	}
-
-	m := &Dialer{nextDialer: d}
-
-	query := u.Query()
-	m.url = query.Get("url")
-	if m.url == "" {
+func NewDialer(parent netproxy.Dialer, config Config) (*Dialer, error) {
+	if config.URL == "" {
 		return nil, fmt.Errorf("NewMeek: url is empty")
 	}
-
-	meekUrl, err := url.Parse(m.url)
+	u, err := url.Parse(config.URL)
 	if err != nil {
 		return nil, fmt.Errorf("NewMeek: %w", err)
 	}
-	if meekUrl.Scheme != "https" {
+	if u.Scheme != "https" {
 		return nil, fmt.Errorf("NewMeek: unimplemented backdrop")
 	}
 
-	skipVerify := query.Get("allowInsecure") == "true" || query.Get("allowInsecure") == "1" ||
-		query.Get("skipVerify") == "true" || query.Get("skipVerify") == "1"
-	alpn := []string{"h2", "http/1.1"}
-	if query.Get("alpn") != "" {
-		alpn = strings.Split(query.Get("alpn"), ",")
+	tlsConfig := new(tls.Config)
+	if config.TLSConfig != nil {
+		tlsConfig = config.TLSConfig.Clone()
 	}
-	serverName := query.Get("serverName")
-	if serverName == "" {
-		serverName = meekUrl.Hostname()
+	if tlsConfig.ServerName == "" {
+		tlsConfig.ServerName = u.Hostname()
 	}
-	tlsConfig := &tls.Config{
-		ServerName:         serverName,
-		InsecureSkipVerify: skipVerify,
-		NextProtos:         alpn,
+	if len(tlsConfig.NextProtos) == 0 {
+		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 	}
+	m := &Dialer{url: config.URL}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.transport = &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := m.nextDialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, fmt.Errorf("[Meek]: dial to %s: %w", addr, err)
-			}
-			return conn, nil
-		},
-		TLSClientConfig: tlsConfig,
+		ForceAttemptHTTP2: true,
+		DialContext:       parent.DialContext,
+		TLSClientConfig:   tlsConfig,
 	}
 
 	return m, nil
@@ -89,25 +72,7 @@ func (m *Dialer) DialContext(ctx context.Context, network, addr string) (c net.C
 	}
 	switch network {
 	case "tcp":
-		tripper := &httpTripperClient{
-			url:          m.url,
-			roundTripper: m.transport,
-		}
-
-		clientConfig := &config{
-			MaxWriteSize:             65536,
-			WaitSubsequentWriteMs:    10,
-			InitialPollingIntervalMs: 100,
-			MaxPollingIntervalMs:     1000,
-			MinPollingIntervalMs:     10,
-			BackoffFactor:            1.5,
-			FailedRetryIntervalMs:    1000,
-		}
-
-		session, err := newClientSession(m.ctx, tripper, clientConfig, &m.workers)
-		if err != nil {
-			return nil, err
-		}
+		session := newClientSession(m.ctx, m.transport, m.url, &m.workers)
 		if err := ctx.Err(); err != nil {
 			_ = session.Close()
 			return nil, err

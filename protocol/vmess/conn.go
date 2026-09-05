@@ -1,512 +1,249 @@
 package vmess
 
 import (
-	"bytes"
+	"bufio"
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
-	"strconv"
 	"sync"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
 )
 
-const (
-	MaxChunkSize = 1 << 14
-	MaxUDPSize   = 1 << 11
-)
+const MaxChunkSize = 1 << 14
 
+// Conn owns one VMess request stream. Shared transports remain owned by their dialer.
 type Conn struct {
-	netproxy.Conn
-	initRead        sync.Once
-	initWrite       sync.Once
-	metadata        Metadata
-	cmdKey          []byte
-	dialTgt         string
-	dialTgtAddrPort netip.AddrPort // lazy resolve
-
-	NewAEAD func(key []byte) (cipher.AEAD, error)
-
-	writeMutex            sync.Mutex
-	writeBodyCipher       cipher.AEAD
-	writeNonceGenerator   BytesGenerator
-	writeChunkSizeParser  ChunkSizeEncoder
-	writePaddingGenerator PaddingLengthGenerator
-
-	readBodyCipher       cipher.AEAD
-	readNonceGenerator   BytesGenerator
-	readChunkSizeParser  ChunkSizeDecoder
-	readPaddingGenerator PaddingLengthGenerator
-
-	requestBodyKey [16]byte
-	requestBodyIV  [16]byte
-	requestOptions byte
-
-	responseBodyKey [16]byte
-	responseBodyIV  [16]byte
-	responseAuth    byte
-
-	readMutex   sync.Mutex
-	leftToRead  []byte
-	indexToRead int
+	net.Conn
+	readMu, writeMu         sync.Mutex
+	reader                  *bufio.Reader
+	writeCipher, readCipher cipher.AEAD
+	writeSize, readSize     *ShakeSizeParser
+	writeIV, readIV         [16]byte
+	responseKey             [16]byte
+	responseAuth            byte
+	responseLength          int
+	responseReady           bool
+	writeCount, readCount   uint32
+	wantChunk, padding      int
+	pending                 []byte
+	readErr, writeErr       error
 }
 
-func NewConn(conn netproxy.Conn, metadata Metadata, dialTgt string, cmdKey []byte) (c *Conn, err error) {
-	// DO NOT use pool here because Close() cannot interrupt the reading or writing, which will modify the value of the pool buffer.
-	key := make([]byte, len(cmdKey))
-	copy(key, cmdKey)
-	c = &Conn{
-		Conn:     conn,
-		metadata: metadata,
-		cmdKey:   key,
-		dialTgt:  dialTgt,
+func newConn(parent net.Conn, request request, key []byte) (*Conn, error) {
+	instruction := ReqInstructionDataFromPool(request)
+	defer pool.PutBuffer(instruction)
+	c := &Conn{Conn: parent, reader: bufio.NewReaderSize(parent, MaxChunkSize), responseAuth: instruction[33]}
+	copy(c.writeIV[:], instruction[1:17])
+	readIV := sha256.Sum256(c.writeIV[:])
+	copy(c.readIV[:], readIV[:16])
+	readKey := sha256.Sum256(instruction[17:33])
+	copy(c.responseKey[:], readKey[:16])
+	newCipher, ok := NewCipherMapper[request.cipher]
+	if !ok {
+		return nil, fmt.Errorf("unsupported VMess cipher: %s", request.cipher)
 	}
-	if metadata.IsClient {
-		if err = c.WriteReqHeader(); err != nil {
-			return nil, err
-		}
+	var err error
+	c.writeCipher, err = newCipher(instruction[17:33])
+	if err != nil {
+		return nil, err
+	}
+	c.readCipher, err = newCipher(c.responseKey[:])
+	if err != nil {
+		return nil, err
+	}
+	c.writeSize = NewShakeSizeParser(c.writeIV[:])
+	c.readSize = NewShakeSizeParser(c.readIV[:])
+	header, err := EncryptReqHeaderFromPool(instruction, key)
+	if err != nil {
+		return nil, err
+	}
+	defer pool.PutBuffer(header)
+	n, err := parent.Write(header)
+	if err == nil && n != len(header) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return nil, err
 	}
 	return c, nil
 }
+func (c *Conn) DependencyLease() *netproxy.Lease { return netproxy.DependencyOf(c.Conn) }
 
-func (c *Conn) Close() error {
-	return c.Conn.Close()
+func chunkNonce(iv [16]byte, count uint32, size int) []byte {
+	binary.BigEndian.PutUint16(iv[:2], uint16(count))
+	return iv[:size]
+}
+func protocolError(message string) error {
+	return netproxy.WrapFailure(fmt.Errorf("vmess: %s", message), netproxy.Failure{Scope: netproxy.ScopeStream, Layer: netproxy.LayerProxy, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonProtocol, Phase: netproxy.OpRead})
 }
 
-func (c *Conn) chunks(size int) (payloadSize int, numChunks int) {
-	payloadSize = MaxChunkSize - c.writeBodyCipher.Overhead() - int(c.writeChunkSizeParser.SizeBytes()) - int(c.writePaddingGenerator.MaxPaddingLen())
-	if size%payloadSize == 0 {
-		return payloadSize, size / payloadSize
+func (c *Conn) writeChunk(p []byte) error {
+	if c.writeErr != nil {
+		return c.writeErr
 	}
-	return payloadSize, size/payloadSize + 1
-}
-
-func GenerateChunkNonce(nonce []byte, size uint32) BytesGenerator {
-	c := make([]byte, size)
-	copy(c[2:], nonce[2:])
-	count := uint16(0)
-	return func() []byte {
-		binary.BigEndian.PutUint16(c, count)
-		count++
-		return c[:size]
+	if c.writeCount > 65535 {
+		c.writeErr = netproxy.WrapFailure(fmt.Errorf("VMess request nonce exhausted"), netproxy.Failure{Scope: netproxy.ScopeStream, Layer: netproxy.LayerProxy, Origin: netproxy.OriginLocalProtocol, Reason: netproxy.ReasonProtocol, Phase: netproxy.OpWrite})
+		return c.writeErr
 	}
+	padding := int(c.writeSize.NextPaddingLen())
+	size := len(p) + c.writeCipher.Overhead() + padding
+	data := pool.GetBuffer(2 + size)
+	defer pool.PutBuffer(data)
+	c.writeSize.Encode(uint16(size), data)
+	c.writeCipher.Seal(data[2:2], chunkNonce(c.writeIV, c.writeCount, c.writeCipher.NonceSize()), p, nil)
+	c.writeCount++
+	fastrand.Read(data[len(data)-padding:])
+	n, err := c.Conn.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		c.writeErr = err
+	}
+	return err
 }
-
-// seal packs the b. The overhead is sizeParser.SizeBytes() + auth.Overhead() + paddingSize(no more than maxPadding).
-func (c *Conn) sealFromPool(b []byte) (data []byte) {
-	sizeSize := c.writeChunkSizeParser.SizeBytes()
-	encryptedSize := int32(len(b) + c.writeBodyCipher.Overhead())
-	paddingSize := int32(c.writePaddingGenerator.NextPaddingLen())
-
-	data = pool.Get(int(sizeSize + encryptedSize + paddingSize))
-	c.writeChunkSizeParser.Encode(uint16(encryptedSize+paddingSize), data)
-
-	c.writeBodyCipher.Seal(data[sizeSize:sizeSize], c.writeNonceGenerator(), b, nil)
-	fastrand.Read(data[len(data)-int(paddingSize):])
-	//log.Warn("write: size: %v, padding: %v", encryptedSize+paddingSize, paddingSize)
-	return data
-}
-
-// writeStream splits mb into multiple FIXED size (payloadSize) chunks.
-// Then seal the chunks and write separately.
-// If the sum size of mb less than one payloadSize, seal and write it directly.
-func (c *Conn) writeStream(b []byte, preWrite []byte) (n int, err error) {
-	payloadSize, numChunks := c.chunks(len(b))
-	var start = 0
-	if preWrite != nil {
-		start++
-		data := c.sealFromPool(b[n:common.Min(n+payloadSize, len(b))])
-		defer pool.Put(data)
-		if _, err = c.Conn.Write(bytes.Join([][]byte{preWrite, data}, nil)); err != nil {
-			return 0, err
+func (c *Conn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	written := 0
+	size := MaxChunkSize - 2 - c.writeCipher.Overhead() - int(c.writeSize.MaxPaddingLen())
+	for written < len(p) {
+		n := min(size, len(p)-written)
+		if err := c.writeChunk(p[written : written+n]); err != nil {
+			return written, err
 		}
-		n += payloadSize
+		written += n
 	}
-	for i := start; i < numChunks; i++ {
-		data := c.sealFromPool(b[n:common.Min(n+payloadSize, len(b))])
-		if _, err = c.Conn.Write(data); err != nil {
-			return n, err
-		}
-		pool.Put(data)
-		n += payloadSize
-	}
-	if n > len(b) {
-		n = len(b)
-	}
-	return n, nil
+	return written, nil
 }
-
-// writePacket simply seal every buffer of mb and write.
-func (c *Conn) writePacket(b []byte, preWrite []byte) (n int, err error) {
-	data := c.sealFromPool(b)
-	defer pool.Put(data)
-	if preWrite != nil {
-		if _, err = c.Conn.Write(bytes.Join([][]byte{preWrite, data}, nil)); err != nil {
-			return 0, err
-		}
-	} else {
-		if _, err = c.Conn.Write(data); err != nil {
-			return 0, err
-		}
+func (c *Conn) CloseWrite() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeErr != nil {
+		return c.writeErr
 	}
-	return len(b), nil
-}
-
-func (c *Conn) InitContext(instructionData []byte) error {
-	c.responseAuth = instructionData[33]
-	copy(c.requestBodyIV[:], instructionData[1:])
-	copy(c.requestBodyKey[:], instructionData[17:])
-	tmp := sha256.Sum256(c.requestBodyIV[:])
-	copy(c.responseBodyIV[:], tmp[:16])
-	tmp = sha256.Sum256(c.requestBodyKey[:])
-	copy(c.responseBodyKey[:], tmp[:16])
-	if c.metadata.Cipher == "" {
-		ciph, err := ParseCipherFromSecurity(instructionData[35] & 0xf)
-		if err != nil {
-			return err
-		}
-		c.metadata.Cipher = string(ciph)
+	if err := c.writeChunk(nil); err != nil {
+		return err
 	}
-	newAEAD, ok := NewCipherMapper[Cipher(c.metadata.Cipher)]
-	if !ok {
-		return fmt.Errorf("unexpected cipher: %v", c.metadata.Cipher)
-	}
-	c.NewAEAD = newAEAD
-	c.requestOptions = instructionData[34]
+	c.writeErr = net.ErrClosed
+	// The authenticated empty frame terminates this direction without closing
+	// the parent carrier or requiring a transport-specific half-close.
 	return nil
 }
 
-func (c *Conn) WriteReqHeader() (err error) {
-	c.initWrite.Do(func() {
-		instructionData := ReqInstructionDataFromPool(c.metadata)
-		defer pool.Put(instructionData)
-
-		if err = c.InitContext(instructionData); err != nil {
-			return
-		}
-
-		var header []byte
-		if header, err = EncryptReqHeaderFromPool(instructionData, c.cmdKey); err != nil {
-			return
-		}
-		defer pool.Put(header)
-		if c.writeBodyCipher, err = c.NewAEAD(c.requestBodyKey[:]); err != nil {
-			return
-		}
-
-		if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-			c.writeChunkSizeParser = NewShakeSizeParser(c.requestBodyIV[:])
-			if ContainOption(c.requestOptions, OptionGlobalPadding) {
-				c.writePaddingGenerator = c.writeChunkSizeParser.(PaddingLengthGenerator)
-			}
-		} else {
-			c.writeChunkSizeParser = PlainChunkSizeParser{}
-		}
-		if c.writePaddingGenerator == nil {
-			c.writePaddingGenerator = PlainPaddingGenerator{}
-		}
-		c.writeNonceGenerator = GenerateChunkNonce(c.requestBodyIV[:], uint32(c.writeBodyCipher.NonceSize()))
-		_, err = c.Conn.Write(header)
-	})
-	return err
-}
-
-func (c *Conn) Write(b []byte) (n int, err error) {
-	if c.metadata.IsPacketAddr() {
-		if !c.dialTgtAddrPort.IsValid() {
-			tgt, err := common.ResolveUDPAddr(c.dialTgt)
-			if err != nil {
-				return 0, err
-			}
-			c.dialTgtAddrPort = tgt.AddrPort()
-		}
-		return c.WriteTo(b, c.dialTgtAddrPort.String())
-	} else {
-		return c.write(b)
+func (c *Conn) readResponse() error {
+	if c.responseReady {
+		return nil
 	}
-}
-
-// Writes data to the connection. Empty b should be written before closing the connection to indicate the terminal.
-func (c *Conn) write(b []byte) (n int, err error) {
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	var encRespHeader []byte
-	c.initWrite.Do(func() {
-		if !c.metadata.IsClient {
-			header := RespHeaderFromPool(c.responseAuth)
-			defer pool.Put(header)
-			encRespHeader, err = c.EncryptRespHeaderFromPool(header)
-			if err != nil {
-				return
-			}
-			if c.writeBodyCipher, err = c.NewAEAD(c.responseBodyKey[:]); err != nil {
-				return
-			}
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.writeChunkSizeParser = NewShakeSizeParser(c.responseBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.writePaddingGenerator = c.writeChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.writeChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.writePaddingGenerator == nil {
-				c.writePaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.writeNonceGenerator = GenerateChunkNonce(c.responseBodyIV[:], uint32(c.writeBodyCipher.NonceSize()))
+	if c.responseLength == 0 {
+		data, err := c.reader.Peek(18)
+		if err != nil {
+			return err
 		}
-	})
-	if len(encRespHeader) != 0 {
-		defer pool.Put(encRespHeader)
+		aead, err := NewAesGcm(KDF(c.responseKey[:], []byte(KDFSaltConstAEADRespHeaderLenKey))[:16])
+		if err != nil {
+			return err
+		}
+		var size [2]byte
+		plain, err := aead.Open(size[:0], KDF(c.readIV[:], []byte(KDFSaltConstAEADRespHeaderLenIV))[:12], data, nil)
+		if err != nil {
+			c.readErr = protocolError("invalid response length authentication")
+			return c.readErr
+		}
+		c.responseLength = int(binary.BigEndian.Uint16(plain))
+		if c.responseLength < 4 || c.responseLength > 1024 {
+			c.readErr = protocolError("invalid response header length")
+			return c.readErr
+		}
+		_, _ = c.reader.Discard(18)
 	}
+	data, err := c.reader.Peek(c.responseLength + 16)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if len(b) == 0 {
-		data := c.sealFromPool(nil)
-		defer pool.Put(data)
-		_, err = c.Conn.Write(data)
-		return 0, err
+	aead, err := NewAesGcm(KDF(c.responseKey[:], []byte(KDFSaltConstAEADRespHeaderPayloadKey))[:16])
+	if err != nil {
+		return err
 	}
-	//log.Trace("vmess: write len(b)=%v", len(b))
-	switch c.metadata.Network {
-	case "tcp":
-		return c.writeStream(b, encRespHeader)
-	case "udp":
-		return c.writePacket(b, encRespHeader)
-	default:
-		return 0, fmt.Errorf("unsupported network (instruction cmd): %v", c.metadata.Network)
+	plain, err := aead.Open(data[:0], KDF(c.readIV[:], []byte(KDFSaltConstAEADRespHeaderPayloadIV))[:12], data, nil)
+	if err != nil {
+		c.readErr = protocolError("invalid response authentication")
+		return c.readErr
 	}
+	if plain[0] != c.responseAuth || plain[2] != 0 {
+		c.readErr = protocolError("invalid response auth or unsupported command")
+		return c.readErr
+	}
+	_, _ = c.reader.Discard(c.responseLength + 16)
+	c.responseReady = true
+	return nil
 }
-
-func (c *Conn) Read(b []byte) (n int, err error) {
-	if c.metadata.IsPacketAddr() {
-		n, _, err = c.ReadFrom(b)
-		return n, err
-	} else {
-		return c.read(b)
+func (c *Conn) readChunk() ([]byte, error) {
+	if c.readErr != nil {
+		return nil, c.readErr
 	}
-}
-
-func (c *Conn) read(b []byte) (n int, err error) {
-	c.readMutex.Lock()
-	defer c.readMutex.Unlock()
-	c.initRead.Do(func() {
-		if c.metadata.IsClient {
-			bufSize := pool.Get(18) // 2+16
-			defer pool.Put(bufSize)
-			if _, err = io.ReadFull(c.Conn, bufSize); err != nil {
-				err = fmt.Errorf("failed to read response header length: %w", err)
-				return
-			}
-			var ciph cipher.AEAD
-			if ciph, err = NewAesGcm(KDF(c.responseBodyKey[:], []byte(KDFSaltConstAEADRespHeaderLenKey))[:16]); err != nil {
-				return
-			}
-			if _, err = ciph.Open(bufSize[:0], KDF(c.responseBodyIV[:], []byte(KDFSaltConstAEADRespHeaderLenIV))[:12], bufSize, nil); err != nil {
-				err = fmt.Errorf("failed to decrypt response header length: %w", err)
-				return
-			}
-			headerSize := binary.BigEndian.Uint16(bufSize[:2])
-			buf := pool.Get(int(headerSize) + 16)
-			defer pool.Put(buf)
-			if _, err = io.ReadFull(c.Conn, buf); err != nil {
-				err = fmt.Errorf("failed to read response header: %w", err)
-				return
-			}
-			if ciph, err = NewAesGcm(KDF(c.responseBodyKey[:], []byte(KDFSaltConstAEADRespHeaderPayloadKey))[:16]); err != nil {
-				return
-			}
-			if _, err = ciph.Open(buf[:0], KDF(c.responseBodyIV[:], []byte(KDFSaltConstAEADRespHeaderPayloadIV))[:12], buf, nil); err != nil {
-				err = fmt.Errorf("failed to decrypt response header: %w", err)
-				return
-			}
-			if buf[0] != c.responseAuth {
-				err = fmt.Errorf("unexpected response auth: %v, expect %v", buf[0], c.responseAuth)
-				return
-			}
-			respCmd := buf[2]
-			if respCmd != 0 {
-				err = fmt.Errorf("unexpected response command: %v", respCmd)
-				return
-			}
-			if c.readBodyCipher, err = c.NewAEAD(c.responseBodyKey[:]); err != nil {
-				return
-			}
-
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.readChunkSizeParser = NewShakeSizeParser(c.responseBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.readPaddingGenerator = c.readChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.readChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.readPaddingGenerator == nil {
-				c.readPaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.readNonceGenerator = GenerateChunkNonce(c.responseBodyIV[:], uint32(c.readBodyCipher.NonceSize()))
-		} else {
-			// assume that EAuthID has been read
-			buf := pool.Get(26) // len(2) + tag(16) + connection_nonce(8)
-			defer pool.Put(buf)
-			if _, err = io.ReadFull(c.Conn, buf); err != nil {
-				err = fmt.Errorf("failed to read ALength and ConnectionNonce: %w", err)
-				return
-			}
-			connectionNonce := buf[18:26]
-			c.cmdKey = c.metadata.authedCmdKey[:]
-			var ciph cipher.AEAD
-			if ciph, err = NewAesGcm(KDF(c.cmdKey, []byte(KDFSaltConstVMessHeaderPayloadLengthAEADKey), c.metadata.authedEAuthID[:], connectionNonce)[:16]); err != nil {
-				return
-			}
-			if _, err = ciph.Open(buf[:0], KDF(c.cmdKey, []byte(KDFSaltConstVMessHeaderPayloadLengthAEADIV), c.metadata.authedEAuthID[:], connectionNonce)[:12], buf[:18], c.metadata.authedEAuthID[:]); err != nil {
-				err = fmt.Errorf("failed to decrypt request header length: %w", err)
-				return
-			}
-			lenInstruction := binary.BigEndian.Uint16(buf)
-
-			instructionData := pool.Get(int(lenInstruction) + 16)
-			defer pool.Put(instructionData)
-			if _, err = io.ReadFull(c.Conn, instructionData); err != nil {
-				err = fmt.Errorf("failed to read instruction data: %w", err)
-				return
-			}
-			if ciph, err = NewAesGcm(KDF(c.cmdKey, []byte(KDFSaltConstVMessHeaderPayloadAEADKey), c.metadata.authedEAuthID[:], connectionNonce)[:16]); err != nil {
-				return
-			}
-			if _, err = ciph.Open(instructionData[:0], KDF(c.cmdKey, []byte(KDFSaltConstVMessHeaderPayloadAEADIV), c.metadata.authedEAuthID[:], connectionNonce)[:12], instructionData, c.metadata.authedEAuthID[:]); err != nil {
-				err = fmt.Errorf("failed to decrypt request header: %w", err)
-				return
-			}
-			if err = c.InitContext(instructionData[:lenInstruction]); err != nil {
-				return
-			}
-			if err = c.metadata.CompleteFromInstructionData(instructionData[:lenInstruction]); err != nil {
-				return
-			}
-			c.dialTgt = net.JoinHostPort(c.metadata.Hostname, strconv.Itoa(int(c.metadata.Port)))
-
-			if c.readBodyCipher, err = c.NewAEAD(c.requestBodyKey[:]); err != nil {
-				return
-			}
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.readChunkSizeParser = NewShakeSizeParser(c.requestBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.readPaddingGenerator = c.readChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.readChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.readPaddingGenerator == nil {
-				c.readPaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.readNonceGenerator = GenerateChunkNonce(c.requestBodyIV[:], uint32(c.readBodyCipher.NonceSize()))
+	if err := c.readResponse(); err != nil {
+		return nil, err
+	}
+	if c.wantChunk == 0 {
+		data, err := c.reader.Peek(2)
+		if err != nil {
+			return nil, err
 		}
-	})
-	if err != nil {
-		return 0, err
-	}
-	if b == nil {
-		return 0, nil
-	}
-	if c.readNonceGenerator == nil {
-		// did not initiate successfully
-		return 0, net.ErrClosed
-	}
-
-	// dump unread data
-	if c.indexToRead < len(c.leftToRead) {
-		n = copy(b, c.leftToRead[c.indexToRead:])
-		c.indexToRead += n
-		if c.indexToRead >= len(c.leftToRead) {
-			// put the buf back
-			pool.Put(c.leftToRead)
+		c.padding = int(c.readSize.NextPaddingLen())
+		size, _ := c.readSize.Decode(data)
+		c.wantChunk = int(size)
+		if c.wantChunk < c.padding+c.readCipher.Overhead() || c.wantChunk > MaxChunkSize-2 {
+			c.readErr = protocolError("invalid chunk length")
+			return nil, c.readErr
 		}
-		return n, nil
+		_, _ = c.reader.Discard(2)
 	}
-
-	chunk, err := c.readChunkFromPool()
-	if err != nil {
-		return 0, err
-	}
-	//log.Trace("vmess: read len(chunk)=%v", len(chunk))
-	n = copy(b, chunk)
-	if n < len(chunk) {
-		// wait for the next read
-		c.leftToRead = chunk
-		c.indexToRead = n
-	} else {
-		// full reading. put the buf back
-		pool.Put(chunk)
-	}
-	return n, nil
-}
-
-func (c *Conn) Metadata() Metadata {
-	return c.metadata
-}
-
-// readSize reads the size and padding from Conn. size=encryptedSize+padding
-func (c *Conn) readSize() (size uint16, padding uint16, err error) {
-	buf := pool.Get(int(c.readChunkSizeParser.SizeBytes()))
-	defer pool.Put(buf)
-	if _, err := io.ReadFull(c.Conn, buf); err != nil {
-		return 0, 0, err
-	}
-	padding = c.readPaddingGenerator.NextPaddingLen()
-	size, err = c.readChunkSizeParser.Decode(buf)
-	if err != nil {
-		return size, padding, err
-	}
-	//log.Warn("read: size: %v, padding: %v", size, padding)
-	return size, padding, nil
-}
-
-func (c *Conn) readChunkFromPool() (b []byte, err error) {
-	size, padding, err := c.readSize()
+	data, err := c.reader.Peek(c.wantChunk)
 	if err != nil {
 		return nil, err
 	}
-	// terminal signal
-	if size == uint16(c.readBodyCipher.Overhead())+padding {
+	if c.readCount > 65535 {
+		c.readErr = protocolError("response nonce exhausted")
+		return nil, c.readErr
+	}
+	plain, err := c.readCipher.Open(data[:0], chunkNonce(c.readIV, c.readCount, c.readCipher.NonceSize()), data[:c.wantChunk-c.padding], nil)
+	if err != nil {
+		c.readErr = protocolError("invalid chunk authentication")
+		return nil, c.readErr
+	}
+	c.readCount++
+	_, _ = c.reader.Discard(c.wantChunk)
+	c.wantChunk = 0
+	if len(plain) == 0 {
+		c.readErr = io.EOF
 		return nil, io.EOF
 	}
-	b = pool.Get(int(size))
-	if _, err = io.ReadFull(c.Conn, b); err != nil {
-		pool.Put(b)
-		return nil, err
-	}
-	return c.readBodyCipher.Open(b[:0], c.readNonceGenerator(), b[:len(b)-int(padding)], nil)
+	return plain, nil
 }
-
-func (c *Conn) EncryptRespHeaderFromPool(header []byte) (b []byte, err error) {
-	buf := pool.Get(34 + len(header)) // length(2) + tag(16) + len(header) + tag(16)
-
-	ciph, err := NewAesGcm(KDF(c.responseBodyKey[:], []byte(KDFSaltConstAEADRespHeaderLenKey))[:16])
-	if err != nil {
-		pool.Put(buf)
-		return
+func (c *Conn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
 	}
-	binary.BigEndian.PutUint16(buf, uint16(len(header)))
-	ciph.Seal(buf[:0], KDF(c.responseBodyIV[:], []byte(KDFSaltConstAEADRespHeaderLenIV))[:12], buf[:2], nil)
-
-	ciph, err = NewAesGcm(KDF(c.responseBodyKey[:], []byte(KDFSaltConstAEADRespHeaderPayloadKey))[:16])
-	if err != nil {
-		pool.Put(buf)
-		return
+	if len(c.pending) == 0 {
+		var err error
+		c.pending, err = c.readChunk()
+		if err != nil {
+			return 0, err
+		}
 	}
-	ciph.Seal(buf[18:18], KDF(c.responseBodyIV[:], []byte(KDFSaltConstAEADRespHeaderPayloadIV))[:12], header, nil)
-
-	return buf, nil
+	n := copy(p, c.pending)
+	c.pending = c.pending[n:]
+	return n, nil
 }

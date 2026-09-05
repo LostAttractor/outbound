@@ -5,26 +5,13 @@ import (
 	"github.com/daeuniverse/outbound/pool"
 )
 
-type SaltGenerator interface {
-	Get() []byte
-	Close() error
-}
-type RandomSaltGenerator struct {
-	saltSize int
-}
+type SaltGenerator interface{ Get() []byte }
 
-func NewRandomSaltGenerator(saltSize int) (*RandomSaltGenerator, error) {
-	return &RandomSaltGenerator{
-		saltSize: saltSize,
-	}, nil
-}
+// RandomSaltGenerator is the number of random bytes in each pooled salt.
+type RandomSaltGenerator int
 
-func (g *RandomSaltGenerator) Get() []byte {
-	salt := pool.GetBuffer(g.saltSize)
+func (size RandomSaltGenerator) Get() []byte {
+	salt := pool.GetBuffer(int(size))
 	fastrand.Read(salt)
 	return salt
-}
-
-func (g *RandomSaltGenerator) Close() error {
-	return nil
 }

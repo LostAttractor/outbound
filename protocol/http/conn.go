@@ -2,9 +2,7 @@ package http
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,493 +10,218 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol"
 	"golang.org/x/net/http2"
 )
 
-type Conn struct {
-	nextDialer netproxy.Dialer
-	ctx        context.Context
-	cancel     context.CancelFunc
-	muConn     sync.RWMutex
-	conn       net.Conn
-	closeOnce  sync.Once
-	closeErr   error
-
-	proxy        *HttpProxy
-	magicNetwork string
-	tgt          string
-
-	ctxShakeFinished    context.Context
-	cancelShakeFinished func()
-	muShake             sync.Mutex
-	muFinishShakeFuncs  sync.Mutex
-	finishShakeFuncs    []func(conn net.Conn)
-
-	isH2 bool
-}
-
-func (c *Conn) SetDeadline(t time.Time) error {
-	return c.setDeadline(t, net.Conn.SetDeadline)
-}
-
-func (c *Conn) SetReadDeadline(t time.Time) error {
-	return c.setDeadline(t, net.Conn.SetReadDeadline)
-}
-
-func (c *Conn) SetWriteDeadline(t time.Time) error {
-	return c.setDeadline(t, net.Conn.SetWriteDeadline)
-}
-
-func (c *Conn) setDeadline(t time.Time, set func(net.Conn, time.Time) error) error {
-	c.muFinishShakeFuncs.Lock()
-	defer c.muFinishShakeFuncs.Unlock()
-	select {
-	case <-c.ctxShakeFinished.Done():
-		conn, isH2 := c.currentConn()
-		if conn == nil {
-			return io.EOF
-		}
-		if isH2 {
-			return nil
-		}
-		return set(conn, t)
-	default:
-		c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn net.Conn) {
-			if !c.isH2 {
-				_ = set(conn, t)
-			}
-		})
-		return nil
+// A proxy always opens a byte tunnel before returning the connection. The
+// application payload is never inspected or consumed as an HTTP request.
+func (p *HttpProxy) request(ctx context.Context, target string) *http.Request {
+	request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Host: target}, Host: target, Header: make(http.Header)}
+	if p.transport {
+		request.Method = http.MethodPut
+		request.URL.Scheme = "http"
+		request.URL.Path = p.Path
+		request.Host = "www.example.com"
 	}
-}
-
-func NewConn(nextDialer netproxy.Dialer, proxy *HttpProxy, addr string, network string) *Conn {
-	ctxShakeFinished, cancelShakeFinished := context.WithCancel(context.Background())
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Conn{
-		nextDialer:          nextDialer,
-		ctx:                 ctx,
-		cancel:              cancel,
-		proxy:               proxy,
-		tgt:                 addr,
-		magicNetwork:        network,
-		ctxShakeFinished:    ctxShakeFinished,
-		cancelShakeFinished: cancelShakeFinished,
+	if p.Host != "" {
+		request.Host = p.Host
 	}
+	if p.HaveAuth {
+		request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(p.Username+":"+p.Password)))
+	}
+	return request.WithContext(ctx)
 }
-
-func (c *Conn) Write(b []byte) (n int, err error) {
-	c.muShake.Lock()
-	defer c.muShake.Unlock()
-	defer func() {
-		if err == nil {
-			c.muFinishShakeFuncs.Lock()
-			defer c.muFinishShakeFuncs.Unlock()
-			// SetDeadline after c.conn filled.
-			for _, f := range c.finishShakeFuncs {
-				f(c.conn)
-			}
+func proxyStatus(response *http.Response, scope netproxy.FailureScope) error {
+	reason := netproxy.ReasonRejected
+	if response.StatusCode == http.StatusProxyAuthRequired {
+		reason = netproxy.ReasonAuth
+	}
+	return netproxy.WrapFailure(fmt.Errorf("proxy responded with status %s", response.Status), netproxy.Failure{Scope: scope, Layer: netproxy.LayerProxy, Origin: netproxy.OriginPeer, Phase: netproxy.OpHandshake, Reason: reason, Code: fmt.Sprint(response.StatusCode)})
+}
+func (p *HttpProxy) connectHTTP1(ctx context.Context, raw net.Conn, target string) (net.Conn, error) {
+	reader := bufio.NewReader(raw)
+	request := p.request(ctx, target)
+	err := protocol.Handshake(ctx, raw, func() error {
+		if err := request.WriteProxy(raw); err != nil {
+			return err
 		}
-	}()
-	select {
-	case <-c.ctxShakeFinished.Done():
-		conn, _ := c.currentConn()
-		if conn == nil {
-			return 0, io.EOF
-		}
-		return conn.Write(b)
-	default:
-		// Handshake
-		defer c.cancelShakeFinished()
-		_, firstLine, _ := bufio.ScanLines(b, true)
-		isHttpReq := regexp.MustCompile(`^\S+ \S+ HTTP/[\d.]+$`).Match(firstLine)
-
-		var req *http.Request
-		if isHttpReq && !c.proxy.https {
-			// HTTP Request
-
-			req, err = http.ReadRequest(bufio.NewReader(bytes.NewReader(b)))
-			if err != nil {
-				if errors.Is(err, io.ErrUnexpectedEOF) {
-					// Request more data.
-					return len(b), nil
-				}
-				// Error
-				return 0, err
-			}
-
-			req.URL.Scheme = "http"
-			req.URL.Host = c.tgt
-		} else {
-			// Arbitrary TCP
-
-			// HACK. http.ReadRequest also does this.
-			reqURL, err := url.Parse("http://" + c.tgt)
-			if err != nil {
-				return 0, err
-			}
-			method := "CONNECT"
-			if !c.proxy.transport {
-				reqURL.Scheme = ""
-			} else {
-				method = "PUT"
-			}
-
-			req, err = http.NewRequest(method, reqURL.String(), nil)
-			if err != nil {
-				return 0, err
-			}
-		}
-		if c.proxy.Host != "" {
-			req.Host = c.proxy.Host
-		} else if c.proxy.transport {
-			req.Host = "www.example.com"
-		}
-		if c.proxy.transport {
-			req.URL.Path = c.proxy.Path
-		}
-		req.Close = false
-		if c.proxy.HaveAuth {
-			req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.proxy.Username+":"+c.proxy.Password)))
-		}
-		req = req.WithContext(c.ctx)
-		// https://www.rfc-editor.org/rfc/rfc7230#appendix-A.1.2
-		// As a result, clients are encouraged not to send the Proxy-Connection header field in any requests.
-		if len(req.Header.Values("Proxy-Connection")) > 0 {
-			req.Header.Del("Proxy-Connection")
-		}
-
-		connectHttp1 := func(rawConn net.Conn) (n int, err error) {
-			stopClose := context.AfterFunc(c.ctx, func() { _ = rawConn.Close() })
-			defer stopClose()
-			defer func() {
-				if err != nil {
-					_ = rawConn.Close()
-				}
-			}()
-			err = req.WriteProxy(rawConn)
-			if err != nil {
-				return 0, err
-			}
-
-			if isHttpReq {
-				// Allow read here to void race.
-				return len(b), nil
-			} else {
-				// We should read tcp connection here, and we will be guaranteed higher priority by chShakeFinished.
-				resp, err := http.ReadResponse(bufio.NewReader(rawConn), req)
-				if err != nil {
-					if resp != nil {
-						resp.Body.Close()
-					}
-					return 0, err
-				}
-				resp.Body.Close()
-				if resp.StatusCode != 200 {
-					err = fmt.Errorf("connect server using proxy error, StatusCode [%d]", resp.StatusCode)
-					return 0, err
-				}
-				return rawConn.Write(b)
-			}
-		}
-
-		// Thanks to v2fly/v2ray-core.
-		connectHttp2 := func(rawConn net.Conn, h2clientConn *http2.ClientConn, req *http.Request) (conn *http2Conn, n int, err error) {
-			pr, pw := io.Pipe()
-			req.Body = pr
-
-			var pErr error
-			var done = make(chan struct{}, 1)
-
-			go func() {
-				_, pErr = pw.Write(b)
-				done <- struct{}{}
-			}()
-
-			resp, err := h2clientConn.RoundTrip(req) // nolint: bodyclose
-			if err != nil {
-				_ = pw.CloseWithError(err)
-				_ = pr.CloseWithError(err)
-				return nil, 0, err
-			}
-
-			select {
-			case <-done:
-			case <-c.ctx.Done():
-				_ = resp.Body.Close()
-				return nil, 0, c.ctx.Err()
-			}
-			if pErr != nil {
-				_ = resp.Body.Close()
-				return nil, 0, pErr
-			}
-
-			if resp.StatusCode != http.StatusOK {
-				_ = resp.Body.Close()
-				return nil, 0, fmt.Errorf("proxy responded with non 200 code: %v", resp.Status)
-			}
-			return newHTTP2Conn(rawConn, pw, resp.Body), len(b), nil
-		}
-
-		if !c.proxy.https {
-			ctx, cancel := netproxy.NewDialTimeoutContextFrom(c.ctx)
-			defer cancel()
-			conn, err := c.nextDialer.DialContext(ctx, c.magicNetwork, c.proxy.Addr)
-			if err != nil {
-				return 0, err
-			}
-			if !c.installConn(conn, false) {
-				return 0, net.ErrClosed
-			}
-			return connectHttp1(conn)
-		}
-
-		rawConn, h2Conn, err := c.proxy.pool.getConn(c.ctx, false)
+		response, err := http.ReadResponse(reader, request)
 		if err != nil {
-			return 0, err
+			return err
 		}
-		if h2Conn != nil {
-			proxyConn, n, err := connectHttp2(rawConn, h2Conn, req)
-			if err != nil {
-				return 0, err
-			}
-			if !c.installConn(proxyConn, true) {
-				return 0, net.ErrClosed
-			}
-			return n, nil
-		} else {
-			if !c.installConn(rawConn, false) {
-				return 0, net.ErrClosed
-			}
-			return connectHttp1(rawConn)
+		if response.StatusCode != http.StatusOK {
+			return proxyStatus(response, netproxy.ScopeOperation)
 		}
-	}
-}
-
-func (c *Conn) Read(b []byte) (n int, err error) {
-	<-c.ctxShakeFinished.Done()
-	conn, _ := c.currentConn()
-	if conn == nil {
-		return 0, io.EOF
-	}
-	return conn.Read(b)
-}
-
-func (c *Conn) Close() error {
-	c.closeOnce.Do(func() {
-		c.cancel()
-		c.muConn.Lock()
-		conn := c.conn
-		c.muConn.Unlock()
-		if conn != nil {
-			c.closeErr = conn.Close()
-		}
-		c.cancelShakeFinished()
-		c.muShake.Lock()
-		c.muShake.Unlock()
+		// Successful CONNECT hands all following bytes to the tunnel, including
+		// read-ahead retained by reader. Closing response.Body would drain them.
+		return nil
 	})
-	return c.closeErr
-}
-
-func (c *Conn) LocalAddr() net.Addr {
-	conn, _ := c.currentConn()
-	if conn == nil {
-		return nil
+	if err != nil {
+		return nil, err
 	}
-	return conn.LocalAddr()
-}
-
-func (c *Conn) RemoteAddr() net.Addr {
-	conn, _ := c.currentConn()
-	if conn == nil {
-		return nil
+	tunnel := &bufferedHTTPConn{Conn: raw, reader: reader}
+	if writer, ok := raw.(netproxy.CloseWriter); ok {
+		return &netproxy.CloseWriteConn{Conn: tunnel, CloseWriter: writer}, nil
 	}
-	return conn.RemoteAddr()
+	return tunnel, nil
 }
 
-func (c *Conn) installConn(conn net.Conn, isH2 bool) bool {
-	c.muConn.Lock()
-	if c.ctx.Err() != nil {
-		c.muConn.Unlock()
-		_ = conn.Close()
-		return false
+func (p *HttpProxy) connectHTTP2(ctx context.Context, raw net.Conn, client *http2.ClientConn, target string) (net.Conn, error) {
+	slot := raw.(*h2ObservedConn).slot
+	lease := slot.lease.NewStream()
+	lifetime, cancel := context.WithCancel(context.Background())
+	stop := context.AfterFunc(ctx, cancel)
+	requestBody, in := net.Pipe()
+	request := p.request(lifetime, target)
+	request.Body = requestBody
+	response, err := client.RoundTrip(request)
+	stop()
+	if cause := ctx.Err(); cause != nil {
+		err = errors.Join(err, cause)
 	}
-	c.conn = conn
-	c.isH2 = isH2
-	c.muConn.Unlock()
-	return true
-}
-
-func (c *Conn) currentConn() (net.Conn, bool) {
-	c.muConn.RLock()
-	defer c.muConn.RUnlock()
-	return c.conn, c.isH2
-}
-
-func newHTTP2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadCloser) *http2Conn {
-	return &http2Conn{Conn: c, in: pipedReqBody, out: respBody}
+	if err == nil && !lease.Valid() {
+		err = lease.Cause()
+	}
+	if err == nil && response.StatusCode != http.StatusOK {
+		err = proxyStatus(response, netproxy.ScopeStream)
+	}
+	if err != nil {
+		cancel()
+		_ = in.Close()
+		_ = requestBody.Close()
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		err = wrapH2StreamError(err, slot, lease, netproxy.OpHandshake, false)
+		lease.Invalidate(err)
+		return nil, err
+	}
+	read, receive := net.Pipe()
+	tunnel := &http2Conn{Conn: raw, in: in, read: read, receive: receive, out: response.Body, cancel: cancel, slot: slot, lease: lease}
+	go tunnel.receiveLoop()
+	return tunnel, nil
 }
 
 type http2Conn struct {
-	net.Conn
-	in  *io.PipeWriter
-	out io.ReadCloser
+	net.Conn          // addresses only; deadlines and closure belong to this stream
+	in, read, receive net.Conn
+	out               io.ReadCloser
+	cancel            context.CancelFunc
+	slot              *h2Conn
+	lease             *netproxy.Lease
+	readMu            sync.Mutex
+	readErr           error
+	closeOnce         sync.Once
+	closed            atomic.Bool
+	closeErr          error
 }
 
+func (h *http2Conn) receiveLoop() {
+	_, err := io.Copy(h.receive, h.out)
+	if err == nil {
+		err = io.EOF
+	}
+	h.readMu.Lock()
+	h.readErr = err
+	h.readMu.Unlock()
+	_ = h.receive.Close()
+}
+func (h *http2Conn) DependencyLease() *netproxy.Lease { return h.lease }
 func (h *http2Conn) Read(p []byte) (n int, err error) {
-	return h.out.Read(p)
+	n, err = h.read.Read(p)
+	if err == io.EOF {
+		h.readMu.Lock()
+		err = h.readErr
+		h.readMu.Unlock()
+	}
+	return n, wrapH2StreamError(err, h.slot, h.lease, netproxy.OpRead, h.closed.Load())
 }
-
 func (h *http2Conn) Write(p []byte) (n int, err error) {
-	return h.in.Write(p)
+	n, err = h.in.Write(p)
+	return n, wrapH2StreamError(err, h.slot, h.lease, netproxy.OpWrite, h.closed.Load())
 }
-
+func (h *http2Conn) CloseWrite() error {
+	return wrapH2StreamError(h.in.Close(), h.slot, h.lease, netproxy.OpCloseWrite, h.closed.Load())
+}
+func (h *http2Conn) SetDeadline(t time.Time) error {
+	return errors.Join(h.SetReadDeadline(t), h.SetWriteDeadline(t))
+}
+func (h *http2Conn) SetReadDeadline(t time.Time) error  { return h.read.SetReadDeadline(t) }
+func (h *http2Conn) SetWriteDeadline(t time.Time) error { return h.in.SetWriteDeadline(t) }
 func (h *http2Conn) Close() error {
-	h.in.Close()
-	return h.out.Close()
-}
-
-type h2Conn struct {
-	raw net.Conn
-	h2  *http2.ClientConn
-}
-
-type h2ConnsPool struct {
-	mu         sync.Mutex
-	conns      []*h2Conn
-	dialer     netproxy.Dialer
-	addr       string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	operations sync.WaitGroup
-	closeOnce  sync.Once
-	closeErr   error
-}
-
-func newH2ConnsPool(dialer netproxy.Dialer, addr string) *h2ConnsPool {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &h2ConnsPool{
-		dialer: dialer,
-		addr:   addr,
-		ctx:    ctx,
-		cancel: cancel,
-	}
-}
-
-func (p *h2ConnsPool) getConn(ctx context.Context, reserve bool) (net.Conn, *http2.ClientConn, error) {
-	p.mu.Lock()
-	if p.ctx.Err() != nil {
-		p.mu.Unlock()
-		return nil, nil, net.ErrClosed
-	}
-	p.operations.Add(1)
-	defer p.operations.Done()
-	for _, conn := range p.conns {
-		available := conn.h2.CanTakeNewRequest()
-		if reserve {
-			available = conn.h2.ReserveNewRequest()
-		}
-		if available {
-			p.mu.Unlock()
-			return conn.raw, conn.h2, nil
-		}
-	}
-	p.mu.Unlock()
-
-	dialCtx, cancel := netproxy.NewDialTimeoutContextFrom(ctx)
-	stopClose := context.AfterFunc(p.ctx, cancel)
-	defer stopClose()
-	defer cancel()
-	rawConn, err := p.dialer.DialContext(dialCtx, "tcp", p.addr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("h2ConnsPool.getConn: %w", err)
-	}
-	nextProto := ""
-	if tlsConn, ok := rawConn.(*tls.Conn); ok {
-		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
-			_ = rawConn.Close()
-			return nil, nil, err
-		}
-		nextProto = tlsConn.ConnectionState().NegotiatedProtocol
-	}
-
-	switch nextProto {
-	case "", "http/1.1":
-		if p.ctx.Err() != nil {
-			_ = rawConn.Close()
-			return nil, nil, net.ErrClosed
-		}
-		return rawConn, nil, nil
-	case "h2":
-		t := http2.Transport{ConnPool: p}
-		h2clientConn, err := t.NewClientConn(rawConn)
-		if err != nil {
-			_ = rawConn.Close()
-			return nil, nil, err
-		}
-		if reserve && !h2clientConn.ReserveNewRequest() {
-			_ = rawConn.Close()
-			return nil, nil, http2.ErrNoCachedConn
-		}
-		p.mu.Lock()
-		if p.ctx.Err() != nil {
-			p.mu.Unlock()
-			_ = rawConn.Close()
-			return nil, nil, net.ErrClosed
-		}
-		p.conns = append(p.conns, &h2Conn{raw: rawConn, h2: h2clientConn})
-		p.mu.Unlock()
-		return rawConn, h2clientConn, nil
-	default:
-		_ = rawConn.Close()
-		return nil, nil, fmt.Errorf("negotiated unsupported application layer protocol: %v", nextProto)
-	}
-}
-
-func (p *h2ConnsPool) GetClientConn(req *http.Request, _ string) (*http2.ClientConn, error) {
-	_, h2Conn, err := p.getConn(req.Context(), true)
-	return h2Conn, err
-}
-
-func (p *h2ConnsPool) MarkDead(h2c *http2.ClientConn) {
-	p.mu.Lock()
-	var rawConn net.Conn
-	for i, conn := range p.conns {
-		if conn.h2 == h2c {
-			rawConn = conn.raw
-			p.conns = append(p.conns[:i], p.conns[i+1:]...)
-			break
-		}
-	}
-	p.mu.Unlock()
-	if rawConn != nil {
-		_ = rawConn.Close()
-	}
-}
-
-func (p *h2ConnsPool) Close() error {
-	p.closeOnce.Do(func() {
-		p.mu.Lock()
-		p.cancel()
-		p.mu.Unlock()
-		p.operations.Wait()
-
-		p.mu.Lock()
-		conns := make([]net.Conn, len(p.conns))
-		for i, conn := range p.conns {
-			conns[i] = conn.raw
-		}
-		p.conns = nil
-		p.mu.Unlock()
-
-		for _, conn := range conns {
-			p.closeErr = errors.Join(p.closeErr, conn.Close())
-		}
+	h.closeOnce.Do(func() {
+		h.closed.Store(true)
+		h.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: h.lease.Resource(), Stream: h.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerH2, Origin: netproxy.OriginLocalCleanup, Reason: netproxy.ReasonClosed}))
+		h.cancel()
+		h.closeErr = errors.Join(h.in.Close(), h.read.Close(), h.receive.Close(), h.out.Close())
 	})
-	return p.closeErr
+	return h.closeErr
 }
+func wrapH2StreamError(err error, slot *h2Conn, lease *netproxy.Lease, op netproxy.Operation, localClosed bool) error {
+	if err == nil || err == io.EOF {
+		return err
+	}
+	if !localClosed {
+		slot.pool.refineFailure(slot, err, op)
+	}
+	var causes []error
+	// The HTTP/2 library can replace a socket failure with its own error.
+	// Retain the concrete owner's independent evidence of resource failure.
+	if !localClosed && !slot.lease.Valid() {
+		cause := slot.lease.Cause()
+		if terminal := slot.terminal.Load(); terminal != nil {
+			cause = terminal.cause
+		}
+		if cause != nil && errors.Is(cause, err) {
+			f := netproxy.ClassifyFailure(cause)
+			f.Stream, f.Phase = lease.Stream(), op
+			return netproxy.WrapFailure(err, f)
+		}
+		if cause != nil && !errors.Is(err, cause) {
+			for _, f := range netproxy.Failures(cause) {
+				if f.Scope == netproxy.ScopeSharedResource {
+					causes = append(causes, cause)
+					break
+				}
+			}
+		}
+	}
+	for _, failure := range netproxy.Failures(err) {
+		if failure.Scope == netproxy.ScopeUnknown || failure.Scope == "" {
+			failure.Scope = netproxy.ScopeStream
+			if localClosed {
+				failure.Origin, failure.Reason = netproxy.OriginLocalCleanup, netproxy.ReasonClosed
+			}
+		}
+		if failure.Layer == netproxy.LayerUnknown || failure.Layer == "" {
+			failure.Layer = netproxy.LayerH2
+		}
+		failure.Resource, failure.Stream, failure.Phase = slot.ref, lease.Stream(), op
+		wrapped := netproxy.WrapFailure(failure.Cause, failure)
+		if failure.Scope == netproxy.ScopeSharedResource {
+			slot.pool.failSlot(slot, wrapped, op)
+		} else if failure.Scope == netproxy.ScopeStream {
+			lease.Invalidate(wrapped)
+		}
+		causes = append(causes, wrapped)
+	}
+	if len(causes) == 1 {
+		return causes[0]
+	}
+	return errors.Join(causes...)
+}
+
+// bufferedHTTPConn retains bytes read past the CONNECT response headers.
+type bufferedHTTPConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedHTTPConn) Read(p []byte) (int, error)       { return c.reader.Read(p) }
+func (c *bufferedHTTPConn) DependencyLease() *netproxy.Lease { return netproxy.DependencyOf(c.Conn) }

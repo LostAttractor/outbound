@@ -4,11 +4,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
@@ -17,7 +18,6 @@ import (
 )
 
 func init() {
-	dialer.FromLinkRegister("shadowsocksr", NewShadowsocksR)
 	dialer.FromLinkRegister("ssr", NewShadowsocksR)
 }
 
@@ -48,6 +48,9 @@ func NewShadowsocksR(link string) (dialer.Builder, *dialer.Property, error) {
 }
 
 func (s *ShadowsocksR) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
+	if s.Port < 1 || s.Port > 65535 || s.Server == "" {
+		return netproxy.Layer{}, fmt.Errorf("%w: invalid SSR proxy address", dialer.InvalidParameterErr)
+	}
 	layer := netproxy.Layer{Data: upstream}
 	obfsDialer, err := obfs.NewDialer(layer.Data, &obfs.ObfsParam{
 		ObfsHost:  s.Server,
@@ -63,103 +66,99 @@ func (s *ShadowsocksR) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (n
 		ProxyAddress: net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
 		Cipher:       s.Cipher,
 		Password:     s.Password,
-		IsClient:     true,
 	}))
 	if err != nil {
 		return netproxy.Layer{}, err
 	}
-	layer.Data = &proto.Dialer{
-		NextDialer:    layer.Data,
-		Protocol:      s.Proto,
-		ProtocolParam: s.ProtoParam,
-		ObfsOverhead:  obfsDialer.ObfsOverhead(),
+	layer.Data, err = proto.NewDialer(layer.Data, s.Proto, s.ProtoParam, obfsDialer.ObfsOverhead())
+	if err != nil {
+		return netproxy.Layer{}, err
 	}
 	return layer, nil
 }
 
-func ParseSSRURL(u string) (data *ShadowsocksR, err error) {
-	// parse attempts to parse ss:// links
-	parse := func(content string) (v ShadowsocksR, ok bool) {
-		arr := strings.Split(content, "/?")
-		if strings.Contains(content, ":") && len(arr) < 2 {
-			content += "/?remarks=&protoparam=&obfsparam="
-			arr = strings.Split(content, "/?")
-		} else if len(arr) != 2 {
-			return v, false
-		}
-		pre := strings.Split(arr[0], ":")
-		if len(pre) > 6 {
-			//if the length is more than 6, it means that the host contains the characters:,
-			//re-merge the first few groups into the host
-			pre[len(pre)-6] = strings.Join(pre[:len(pre)-5], ":")
-			pre = pre[len(pre)-6:]
-		} else if len(pre) < 6 {
-			return v, false
-		}
-		q, err := url.ParseQuery(arr[1])
-		if err != nil {
-			return v, false
-		}
-		pswd, _ := common.Base64UrlDecode(pre[5])
-		add, _ := common.Base64UrlDecode(pre[0])
-		remarks, _ := common.Base64UrlDecode(q.Get("remarks"))
-		protoparam, _ := common.Base64UrlDecode(q.Get("protoparam"))
-		obfsparam, _ := common.Base64UrlDecode(q.Get("obfsparam"))
-		port, err := strconv.Atoi(pre[1])
-		if err != nil {
-			return v, false
-		}
-		v = ShadowsocksR{
-			Name:       remarks,
-			Server:     add,
-			Port:       port,
-			Password:   pswd,
-			Cipher:     pre[3],
-			Proto:      pre[2],
-			ProtoParam: protoparam,
-			Obfs:       pre[4],
-			ObfsParam:  obfsparam,
-			Protocol:   "shadowsocksr",
-		}
-		return v, true
+// ParseSSRURL accepts the standard ssr:// URL-safe Base64 payload.
+// The server inside that payload is plain text, including IPv6.
+func ParseSSRURL(link string) (*ShadowsocksR, error) {
+	scheme, encoded, ok := strings.Cut(link, "://")
+	if !ok || scheme != "ssr" {
+		return nil, fmt.Errorf("%w: expected ssr:// link", dialer.InvalidParameterErr)
 	}
-	content := u[6:]
-	var (
-		info ShadowsocksR
-		ok   bool
-	)
-	// try parsing the ssr:// link, if it fails, base64 decode first
-	if info, ok = parse(content); !ok {
-		// perform base64 decoding and parse again
-		content, err = common.Base64StdDecode(content)
-		if err != nil {
-			content, err = common.Base64UrlDecode(content)
-			if err != nil {
-				return
-			}
+	content, err := decodeURLBase64(encoded, "payload")
+	if err != nil {
+		return nil, err
+	}
+	address, query, _ := strings.Cut(content, "/?")
+	// Read the five fixed fields from the right; IPv6 colons belong to server.
+	fields := [6]string{}
+	for i := 5; i > 0; i-- {
+		split := strings.LastIndexByte(address, ':')
+		if split < 0 {
+			return nil, fmt.Errorf("%w: SSR requires server, port, protocol, cipher, obfuscation and password", dialer.InvalidParameterErr)
 		}
-		info, ok = parse(content)
+		fields[i] = address[split+1:]
+		address = address[:split]
 	}
-	if !ok {
-		err = fmt.Errorf("%w: unrecognized ssr address", dialer.InvalidParameterErr)
-		return
+	fields[0] = address
+	if strings.HasPrefix(address, "[") {
+		if !strings.HasSuffix(address, "]") || !strings.Contains(address, ":") {
+			return nil, fmt.Errorf("%w: invalid SSR bracketed IPv6 server", dialer.InvalidParameterErr)
+		}
+		fields[0] = address[1 : len(address)-1]
 	}
-	return &info, nil
+	if fields[0] == "" || strings.ContainsAny(fields[0], "/?#@[]") || strings.ContainsFunc(fields[0], unicode.IsSpace) {
+		return nil, fmt.Errorf("%w: invalid SSR server", dialer.InvalidParameterErr)
+	}
+	if strings.Contains(fields[0], ":") {
+		if _, err := netip.ParseAddr(fields[0]); err != nil {
+			return nil, fmt.Errorf("%w: invalid SSR IPv6 server", dialer.InvalidParameterErr)
+		}
+	}
+	port, err := strconv.ParseUint(fields[1], 10, 16)
+	if err != nil || port == 0 {
+		return nil, fmt.Errorf("%w: SSR port must be 1..65535", dialer.InvalidParameterErr)
+	}
+	if fields[2] == "" || fields[3] == "" || fields[4] == "" {
+		return nil, fmt.Errorf("%w: empty SSR protocol, cipher or obfuscation", dialer.InvalidParameterErr)
+	}
+	password, err := decodeURLBase64(fields[5], "password")
+	if err != nil {
+		return nil, err
+	}
+	params, err := url.ParseQuery(query)
+	if err != nil {
+		return nil, fmt.Errorf("%w: SSR query: %w", dialer.InvalidParameterErr, err)
+	}
+	result := &ShadowsocksR{Server: fields[0], Port: int(port), Proto: fields[2], Cipher: fields[3], Obfs: fields[4], Password: password, Protocol: "shadowsocksr"}
+	for _, field := range []struct {
+		name   string
+		target *string
+	}{{"remarks", &result.Name}, {"protoparam", &result.ProtoParam}, {"obfsparam", &result.ObfsParam}} {
+		value, err := decodeURLBase64(params.Get(field.name), field.name)
+		if err != nil {
+			return nil, err
+		}
+		*field.target = value
+	}
+	return result, nil
 }
-
+func decodeURLBase64(value, field string) (string, error) {
+	if strings.ContainsFunc(value, unicode.IsSpace) {
+		return "", fmt.Errorf("%w: whitespace in SSR %s encoding", dialer.InvalidParameterErr, field)
+	}
+	encoding := base64.RawURLEncoding.Strict()
+	if strings.Contains(value, "=") {
+		encoding = base64.URLEncoding.Strict()
+	}
+	decoded, err := encoding.DecodeString(value)
+	if err != nil {
+		return "", fmt.Errorf("%w: SSR %s encoding: %w", dialer.InvalidParameterErr, field, err)
+	}
+	return string(decoded), nil
+}
 func (s *ShadowsocksR) ExportToURL() string {
-	/* ssr://server:port:proto:method:obfs:URLBASE64(password)/?remarks=URLBASE64(remarks)&protoparam=URLBASE64(protoparam)&obfsparam=URLBASE64(obfsparam)) */
-	return fmt.Sprintf("ssr://%v", strings.TrimSuffix(base64.URLEncoding.EncodeToString([]byte(
-		fmt.Sprintf(
-			"%v:%v:%v:%v:%v/?remarks=%v&protoparam=%v&obfsparam=%v",
-			net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
-			s.Proto,
-			s.Cipher,
-			s.Obfs,
-			base64.URLEncoding.EncodeToString([]byte(s.Password)),
-			base64.URLEncoding.EncodeToString([]byte(s.Name)),
-			base64.URLEncoding.EncodeToString([]byte(s.ProtoParam)),
-			base64.URLEncoding.EncodeToString([]byte(s.ObfsParam)),
-		),
-	)), "="))
+	encode := func(value string) string { return base64.RawURLEncoding.EncodeToString([]byte(value)) }
+	query := url.Values{"remarks": {encode(s.Name)}, "protoparam": {encode(s.ProtoParam)}, "obfsparam": {encode(s.ObfsParam)}}
+	content := strings.Join([]string{s.Server, strconv.Itoa(s.Port), s.Proto, s.Cipher, s.Obfs, encode(s.Password)}, ":") + "/?" + query.Encode()
+	return "ssr://" + encode(content)
 }

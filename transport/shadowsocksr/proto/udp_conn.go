@@ -1,92 +1,76 @@
 package proto
 
 import (
-	"fmt"
-	"net/netip"
+	"errors"
+	"io"
+	"net"
+	"sync"
 
-	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/pool/bytes"
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
-	"github.com/daeuniverse/outbound/protocol/shadowsocks_stream"
 )
 
 type PacketConn struct {
-	netproxy.PacketConn
-	Protocol IProtocol
-	tgt      string
+	net.Conn
+	codec   IProtocol
+	codecMu sync.Mutex
 }
 
-func NewPacketConn(c netproxy.PacketConn, proto IProtocol, tgt string) (*PacketConn, error) {
-	return &PacketConn{
-		PacketConn: c,
-		Protocol:   proto,
-		tgt:        tgt,
-	}, nil
-}
+func (c *PacketConn) DependencyLease() *netproxy.Lease { return netproxy.DependencyOf(c.Conn) }
 
-func (c *PacketConn) InnerCipher() *ciphers.StreamCipher {
-	switch innerConn := c.PacketConn.(type) {
-	case *shadowsocks_stream.UdpConn:
-		return innerConn.Cipher()
-	default:
-		return nil
-	}
-}
-
-func (c *PacketConn) Read(b []byte) (n int, err error) {
-	n, _, err = c.ReadFrom(b)
-	return n, err
-}
-
-func (c *PacketConn) Write(b []byte) (n int, err error) {
-	return c.WriteTo(b, c.tgt)
-}
-
-func (c *PacketConn) ReadFrom(b []byte) (n int, from netip.AddrPort, err error) {
-	n, err = c.PacketConn.Read(b)
+func (c *PacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	buf := pool.GetBuffer(65535)
+	defer pool.PutBuffer(buf)
+	n, err := c.Conn.Read(buf)
 	if err != nil {
-		return n, netip.AddrPort{}, err
+		return 0, nil, err
 	}
-	decoded, err := c.Protocol.DecodePkt(b[:n])
+	c.codecMu.Lock()
+	decoded, err := c.codec.DecodePkt(buf[:n])
+	c.codecMu.Unlock()
 	if err != nil {
-		return n, netip.AddrPort{}, err
+		return 0, nil, err
 	}
-	defer decoded.Put()
-
-	addr := socks.SplitAddr(decoded.Bytes())
-	if addr == nil {
-		return 0, netip.AddrPort{}, fmt.Errorf("no addr present")
+	address := socks.SplitAddr(decoded)
+	if address == nil {
+		return 0, nil, errors.New("SSR packet has no target address")
 	}
-
-	from, err = netip.ParseAddrPort(addr.String())
-	if err != nil {
-		return 0, netip.AddrPort{}, fmt.Errorf("bad addr: %w", err)
+	payload := decoded[len(address):]
+	n = copy(p, payload)
+	if n < len(payload) {
+		err = io.ErrShortBuffer
 	}
-
-	//if len(b) < len(decoded.Bytes())-len(addr) {
-	//	return 0, netip.AddrPort{}, fmt.Errorf("buffer is not enough to read")
-	//}
-	n = copy(b, decoded.Bytes()[len(addr):])
-	return n, from, nil
+	return n, netproxy.NewAddr("udp", address.String()), err
 }
 
-func (c *PacketConn) WriteTo(b []byte, to string) (n int, err error) {
-	addr, err := socks.ParseAddr(to)
+func (c *PacketConn) WriteTo(p []byte, target net.Addr) (int, error) {
+	if target == nil {
+		return 0, errors.New("SSR packet has no target address")
+	}
+	address, err := socks.ParseAddr(target.String())
 	if err != nil {
 		return 0, err
 	}
-	pb := pool.GetMustBigger(len(addr) + len(b))
-	copy(pb, addr)
-	copy(pb[len(addr):], b)
-	buf := bytes.NewBuffer(pb)
-	if err = c.Protocol.EncodePkt(buf); err != nil {
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	buf.Write(address)
+	buf.Write(p)
+	c.codecMu.Lock()
+	err = c.codec.EncodePkt(buf)
+	c.codecMu.Unlock()
+	if err != nil {
 		return 0, err
 	}
-	if _, err = c.PacketConn.Write(buf.Bytes()); err != nil {
-		return 0, err
+	if buf.Len() > 65507 {
+		return 0, errors.New("SSR packet exceeds maximum size")
 	}
-
-	return len(b), err
+	n, err := c.Conn.Write(buf.Bytes())
+	if n == buf.Len() {
+		return len(p), err
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	return 0, err
 }

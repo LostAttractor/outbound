@@ -2,59 +2,62 @@ package vmess
 
 import (
 	"fmt"
-	"net/netip"
+	"io"
+	"net"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/pool"
 )
 
-func (c *Conn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
-	buf := pool.Get(MaxUDPSize)
-	defer pool.Put(buf)
-	n, err = c.read(buf)
-	if err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-
-	if c.metadata.IsPacketAddr() {
-		addrTyp, address, err := ExtractPacketAddr(buf)
-		addrLen := PacketAddrLength(addrTyp)
-		if n < addrLen {
-			return 0, netip.AddrPort{}, fmt.Errorf("not enough data to read for PacketAddr")
-		}
-		copy(p, buf[addrLen:n])
-		return n - addrLen, address, err
-	} else {
-		if !c.dialTgtAddrPort.IsValid() {
-			tgt, err := common.ResolveUDPAddr(c.dialTgt)
-			if err != nil {
-				return 0, netip.AddrPort{}, err
-			}
-			c.dialTgtAddrPort = tgt.AddrPort()
-		}
-		copy(p, buf[:n])
-		return n, c.dialTgtAddrPort, err
-	}
+type PacketConn struct {
+	*Conn
+	target     net.Addr
+	packetAddr bool
 }
 
-func (c *Conn) WriteTo(p []byte, addr string) (n int, err error) {
-	if c.metadata.IsPacketAddr() {
-		// VMess packet addr does not support domain.
-		address, err := common.ResolveUDPAddr(addr)
-		if err != nil {
-			return 0, err
-		}
-		packetAddrLen := UDPAddrToPacketAddrLength(address)
-		buf := pool.Get(packetAddrLen + len(p))
-		defer pool.Put(buf)
-
-		err = PutPacketAddr(buf, address)
-		if err != nil {
-			return 0, err
-		}
-		copy(buf[packetAddrLen:], p)
-		return c.write(buf)
+func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if !c.packetAddr && len(p) == 0 {
+		return 0, fmt.Errorf("empty VMess UDP payload is reserved for the end marker")
 	}
-
-	return c.write(p)
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	if c.packetAddr {
+		var header [19]byte
+		address, err := appendPacketAddress(header[:0], addr)
+		if err != nil {
+			return 0, err
+		}
+		buf.Write(address)
+	} else if addr == nil || addr.String() != c.target.String() {
+		return 0, fmt.Errorf("VMess UDP stream is bound to %s", c.target)
+	}
+	buf.Write(p)
+	if buf.Len() > MaxChunkSize-2-c.writeCipher.Overhead()-int(c.writeSize.MaxPaddingLen()) {
+		return 0, fmt.Errorf("VMess datagram too large: %d", len(p))
+	}
+	if err := c.writeChunk(buf.Bytes()); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+func (c *PacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	data, err := c.readChunk()
+	if err != nil {
+		return 0, nil, err
+	}
+	addr := c.target
+	if c.packetAddr {
+		addr, data, err = extractPacketAddress(data)
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+	n := copy(p, data)
+	if n < len(data) {
+		return n, addr, io.ErrShortBuffer
+	}
+	return n, addr, nil
 }

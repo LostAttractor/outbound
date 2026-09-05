@@ -5,50 +5,13 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"sync"
-
-	"github.com/daeuniverse/outbound/common"
 )
 
 type Metadata struct {
 	Type     MetadataType
 	Hostname string
 	Port     uint16
-	// Cmd is valid only if Type is MetadataTypeMsg.
-	Cmd      MetadataCmd
-	Cipher   string
-	IsClient bool
 }
-
-func (m *Metadata) DomainIpMapping(cache *sync.Map) (addrPort netip.AddrPort, err error) {
-	if m.Type == MetadataTypeDomain {
-		if _addr, ok := cache.Load(m.Hostname); ok {
-			addrPort = netip.AddrPortFrom(_addr.(netip.Addr), m.Port)
-		} else {
-			uAddr, err := common.ResolveUDPAddr(net.JoinHostPort(m.Hostname, strconv.Itoa(int(m.Port))))
-			if err != nil {
-				return netip.AddrPort{}, err
-			}
-			addrPort = uAddr.AddrPort()
-			if _addr, ok = cache.LoadOrStore(m.Hostname, addrPort.Addr()); ok {
-				addrPort = netip.AddrPortFrom(_addr.(netip.Addr), m.Port)
-			}
-		}
-	} else {
-		if addrPort, err = m.AddrPort(); err != nil {
-			return netip.AddrPort{}, fmt.Errorf("ReadFrom AddrPort: %w", err)
-		}
-	}
-	return addrPort, nil
-}
-
-type MetadataCmd uint8
-
-const (
-	MetadataCmdPing MetadataCmd = iota
-	MetadataCmdSyncPassages
-	MetadataCmdResponse
-)
 
 type MetadataType int
 
@@ -56,8 +19,6 @@ const (
 	MetadataTypeIPv4 MetadataType = iota
 	MetadataTypeIPv6
 	MetadataTypeDomain
-	MetadataTypeMsg
-	MetadataTypeInvalid
 )
 
 func ParseMetadata(tgt string) (mdata Metadata, err error) {
@@ -65,9 +26,12 @@ func ParseMetadata(tgt string) (mdata Metadata, err error) {
 	if err != nil {
 		return mdata, fmt.Errorf("SplitHostPort: %w", err)
 	}
-	port, err := strconv.Atoi(strPort)
+	port, err := strconv.ParseUint(strPort, 10, 16)
 	if err != nil {
 		return mdata, fmt.Errorf("failed to parse port: %w", err)
+	}
+	if host == "" || len(host) > 255 {
+		return mdata, fmt.Errorf("invalid destination host %q", host)
 	}
 	tgtIP, err := netip.ParseAddr(host)
 	var typ MetadataType
@@ -83,17 +47,4 @@ func ParseMetadata(tgt string) (mdata Metadata, err error) {
 		Hostname: host,
 		Port:     uint16(port),
 	}, nil
-}
-
-func (m *Metadata) AddrPort() (netip.AddrPort, error) {
-	switch m.Type {
-	case MetadataTypeIPv4, MetadataTypeIPv6:
-		ip, err := netip.ParseAddr(m.Hostname)
-		if err != nil {
-			return netip.AddrPort{}, err
-		}
-		return netip.AddrPortFrom(ip, m.Port), nil
-	default:
-		return netip.AddrPort{}, fmt.Errorf("bad metadata type: %v; should be ip", m.Type)
-	}
 }

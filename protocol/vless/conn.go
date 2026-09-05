@@ -1,232 +1,88 @@
-// protocol spec:
-// https://trojan-gfw.github.io/trojan/protocol
-
 package vless
 
 import (
-	"crypto/subtle"
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
-	"strconv"
 	"sync"
-	"time"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol/vmess"
-	"google.golang.org/protobuf/proto"
 )
 
-var (
-	FailAuthErr = fmt.Errorf("incorrect UUID")
-)
-
-type Metadata struct {
-	vmess.Metadata
-	Flow string
-	Mux  bool
-}
-
+// Conn removes the one client response header without buffering payload bytes.
+// Exact reads let Vision safely hand its TLS carrier over to direct mode.
 type Conn struct {
-	netproxy.Conn
-	metadata            Metadata
-	cmdKey              []byte
-	cachedProxyAddrIpIP netip.AddrPort
-
-	writeMutex sync.Mutex
-	readMutex  sync.Mutex
-	onceWrite  bool
-	onceRead   sync.Once
-
-	addonsBytes []byte
+	net.Conn
+	readMu, writeMu   sync.Mutex
+	response          [257]byte
+	responseUsed      int
+	ready             bool
+	readErr, writeErr error
 }
 
-func NewConn(conn netproxy.Conn, metadata Metadata, cmdKey []byte) (c *Conn, err error) {
-
-	// DO NOT use pool here because Close() cannot interrupt the reading or writing, which will modify the value of the pool buffer.
-	key := make([]byte, len(cmdKey))
-	copy(key, cmdKey)
-	c = &Conn{
-		Conn:     conn,
-		metadata: metadata,
-		cmdKey:   key,
+func (c *Conn) DependencyLease() *netproxy.Lease { return netproxy.DependencyOf(c.Conn) }
+func (c *Conn) TLSConn() net.Conn {
+	if provider, ok := c.Conn.(interface{ TLSConn() net.Conn }); ok {
+		return provider.TLSConn()
 	}
-	if metadata.Network == "udp" {
-		proxyAddrIp, err := common.ResolveUDPAddr(net.JoinHostPort(c.metadata.Hostname, strconv.Itoa(int(c.metadata.Port))))
-		if err != nil {
-			return nil, err
-		}
-		c.cachedProxyAddrIpIP = proxyAddrIp.AddrPort()
-	}
-	if metadata.Network == "tcp" && metadata.IsClient {
-		time.AfterFunc(100*time.Millisecond, func() {
-			// avoid the situation where the server sends messages first
-			if _, err = c.Write(nil); err != nil {
-				return
-			}
-		})
-	}
-	if metadata.Flow != "" {
-		c.addonsBytes, err = proto.Marshal(&Addons{
-			Flow: metadata.Flow,
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c, nil
-}
-
-func (c *Conn) IntrinsicConn() netproxy.Conn {
 	return c.Conn
 }
-
-func (c *Conn) reqHeaderFromPool(payload []byte) (buf []byte) {
-	addrLen := c.metadata.AddrLen()
-	if !c.metadata.Mux {
-		buf = pool.Get(1 + 16 + len(c.addonsBytes) + 1 + 1 + 2 + 1 + addrLen + len(payload))
-	} else {
-		buf = pool.Get(1 + 16 + len(c.addonsBytes) + 1 + 1 + len(payload))
+func (c *Conn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
 	}
-	start := 0
-	buf[start] = 0 // version
-	start += 1
-	copy(buf[start:], c.cmdKey)
-	start += 16
-	buf[start] = byte(len(c.addonsBytes)) // length of addons
-	start += 1
-	copy(buf[start:], c.addonsBytes)
-	start += len(c.addonsBytes)
-	if !c.metadata.Mux {
-		buf[start] = vmess.NetworkToByte(c.metadata.Network) // inst
-		start += 1
-		binary.BigEndian.PutUint16(buf[start:], c.metadata.Port) // port
-		start += 2
-		buf[start] = vmess.MetadataTypeToByte(c.metadata.Type) // addr type
-		start += 1
-		c.metadata.PutAddr(buf[start:])
-		start += addrLen
-	} else {
-		buf[start] = vmess.NetworkToByte("mux") // inst
-		start += 1
+	if c.readErr != nil {
+		return 0, c.readErr
 	}
-	copy(buf[start:], payload)
-	return buf
-}
-
-func (c *Conn) Write(b []byte) (n int, err error) {
-	// logrus.Println("VLESS CONN WRITE", hex.EncodeToString(b))
-	c.writeMutex.Lock()
-	defer c.writeMutex.Unlock()
-	if c.metadata.Network == "udp" && c.metadata.Flow != XRV {
-		// logrus.Println("!!!", "UDP, write")
-		bLen := pool.Get(2)
-		defer pool.Put(bLen)
-		binary.BigEndian.PutUint16(bLen, uint16(len(b)))
-		if _, err = c.write(bLen); err != nil {
+	if !c.ready {
+		if c.responseUsed < 2 {
+			n, err := io.ReadFull(c.Conn, c.response[c.responseUsed:2])
+			c.responseUsed += n
+			if err != nil {
+				return 0, err
+			}
+		}
+		if c.response[0] != 0 {
+			c.readErr = netproxy.WrapFailure(fmt.Errorf("unsupported VLESS response version: %d", c.response[0]), netproxy.Failure{Scope: netproxy.ScopeStream, Layer: netproxy.LayerProxy, Reason: netproxy.ReasonProtocol, Origin: netproxy.OriginPeer, Phase: netproxy.OpRead})
+			return 0, c.readErr
+		}
+		size := 2 + int(c.response[1])
+		n, err := io.ReadFull(c.Conn, c.response[c.responseUsed:size])
+		c.responseUsed += n
+		if err != nil {
 			return 0, err
 		}
+		c.ready = true
 	}
-	return c.write(b)
+	return c.Conn.Read(p)
 }
-
-func (c *Conn) write(b []byte) (n int, err error) {
-	if !c.onceWrite {
-		if c.metadata.IsClient {
-			buf := c.reqHeaderFromPool(b)
-			defer pool.Put(buf)
-			if _, err = c.Conn.Write(buf); err != nil {
-				return 0, fmt.Errorf("write header: %w", err)
-			}
-			c.onceWrite = true
-			return len(b), nil
-		}
+func (c *Conn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeErr != nil {
+		return 0, c.writeErr
 	}
-	return c.Conn.Write(b)
-}
-
-func (c *Conn) Read(b []byte) (n int, err error) {
-	c.readMutex.Lock()
-	defer c.readMutex.Unlock()
-
-	if c.metadata.Network == "udp" && c.metadata.Flow != XRV {
-		// logrus.Println("!!!", "UDP, read")
-		// defer func() {
-		// 	logrus.Println("READ", n, err)
-		// }()
-		bLen := pool.Get(2)
-		defer pool.Put(bLen)
-		if _, err = io.ReadFull(&netproxy.ReadWrapper{ReadFunc: c.read}, bLen); err != nil {
-			return 0, err
-		}
-		length := int(binary.BigEndian.Uint16(bLen))
-		if len(b) < length {
-			return 0, fmt.Errorf("buf size is not enough")
-		}
+	n, err := c.Conn.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
 	}
-
-	return c.read(b)
-}
-
-func (c *Conn) read(b []byte) (n int, err error) {
-	c.onceRead.Do(func() {
-		if c.metadata.IsClient {
-			if err = c.ReadRespHeader(); err != nil {
-				return
-			}
-		} else {
-			if err = c.ReadReqHeader(); err != nil {
-				return
-			}
-		}
-	})
 	if err != nil {
-		return 0, err
+		c.writeErr = err
 	}
-	return c.Conn.Read(b)
+	return n, err
 }
-
-func (c *Conn) ReadReqHeader() (err error) {
-	buf := pool.Get(18)
-	defer pool.Put(buf)
-	if _, err = io.ReadFull(c.Conn, buf); err != nil {
-		return err
+func (c *Conn) CloseWrite() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeErr != nil {
+		return c.writeErr
 	}
-	if buf[0] != 0 {
-		return fmt.Errorf("version %v is not supprted", buf[0])
+	c.writeErr = net.ErrClosed
+	if writer, ok := c.Conn.(netproxy.CloseWriter); ok {
+		return writer.CloseWrite()
 	}
-	if subtle.ConstantTimeCompare(c.cmdKey[:16], buf[1:17]) != 1 {
-		return FailAuthErr
-	}
-	if _, err = io.CopyN(io.Discard, c.Conn, int64(buf[17])); err != nil { // ignore addons
-		return err
-	}
-	buf = pool.Get(4)
-	defer pool.Put(buf)
-	if _, err = io.ReadFull(c.Conn, buf); err != nil {
-		return err
-	}
-	if err = CompleteMetadataFromReader(&c.metadata, buf, c.Conn); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Conn) ReadRespHeader() (err error) {
-	buf := pool.Get(2)
-	defer pool.Put(buf)
-	if _, err = io.ReadFull(c.Conn, buf); err != nil {
-		return err
-	}
-	if buf[0] != 0 {
-		return fmt.Errorf("version %v is not supprted", buf[0])
-	}
-	if _, err = io.CopyN(io.Discard, c.Conn, int64(buf[1])); err != nil {
-		return err
-	}
-	return nil
+	return errors.ErrUnsupported
 }

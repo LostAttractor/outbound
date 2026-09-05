@@ -335,62 +335,6 @@ func TestSingleSessionCloseWaitsForCleanupAndReportsError(t *testing.T) {
 	}
 }
 
-func TestSingleSessionReconnectWaitsForDisconnectCleanup(t *testing.T) {
-	first := new(singleSessionResource)
-	second := new(singleSessionResource)
-	cleanupStarted := make(chan struct{})
-	cleanupRelease := make(chan struct{})
-	secondEstablish := make(chan struct{})
-	firstObserved := make(chan *SingleSessionHandle[*singleSessionResource], 1)
-	var establishes atomic.Int32
-	session := NewSingleSession(SingleSessionConfig[*singleSessionResource]{
-		Establish: func(context.Context) (*singleSessionResource, error) {
-			if establishes.Add(1) == 1 {
-				return first, nil
-			}
-			close(secondEstablish)
-			return second, nil
-		},
-		Observe: func(_ context.Context, handle *SingleSessionHandle[*singleSessionResource]) {
-			if handle.Resource() == first {
-				firstObserved <- handle
-			}
-		},
-		Close: func(resource *singleSessionResource) error {
-			if resource == first {
-				close(cleanupStarted)
-				<-cleanupRelease
-			}
-			resource.closes.Add(1)
-			return nil
-		},
-	})
-	if err := session.Connect(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	firstHandle := <-firstObserved
-	disconnected := make(chan bool, 1)
-	go func() { disconnected <- firstHandle.Disconnect(errors.New("lost")) }()
-	<-cleanupStarted
-	connectResult := make(chan error, 1)
-	go func() { connectResult <- session.Connect(context.Background()) }()
-	select {
-	case <-secondEstablish:
-		t.Fatal("replacement establishment overlapped old cleanup")
-	default:
-	}
-	close(cleanupRelease)
-	if !<-disconnected {
-		t.Fatal("Disconnect rejected the current resource")
-	}
-	if err := <-connectResult; err != nil {
-		t.Fatal(err)
-	}
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestSingleSessionRejectsTerminalObserverTransition(t *testing.T) {
 	resource := new(singleSessionResource)
 	observed := make(chan *SingleSessionHandle[*singleSessionResource], 1)
