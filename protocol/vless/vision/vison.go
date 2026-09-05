@@ -1,4 +1,4 @@
-// Package vision implements VLESS flow `xtls-rprx-vision` introduced by Xray-core.
+// Package vision implements the client side of xtls-rprx-vision.
 package vision
 
 import (
@@ -6,65 +6,56 @@ import (
 	gotls "crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"unsafe"
 
-	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/transport/tls"
 	utls "github.com/refraction-networking/utls"
 )
 
-var ErrNotTLS13 = errors.New("XTLS Vision based on TLS 1.3 outer connection")
+var ErrNotTLS13 = errors.New("XTLS Vision requires a TLS 1.3 carrier")
 
-func NewPacketConn(conn netproxy.Conn, userUUID []byte, network string, addr string) (*PacketConn, error) {
-	c, err := NewConn(conn, userUUID)
-	return &PacketConn{c, network, addr}, err
-}
-
-func NewConn(conn netproxy.Conn, userUUID []byte) (*Conn, error) {
-	c := &Conn{
-		overlayConn:                conn,
-		userUUID:                   userUUID,
-		packetsToFilter:            6,
-		needHandshake:              true,
-		readFilterUUID:             true,
-		writeFilterApplicationData: true,
+func NewConn(overlay net.Conn, userUUID []byte) (*Conn, error) {
+	if len(userUUID) != 16 {
+		return nil, fmt.Errorf("Vision requires a 16-byte UUID")
 	}
-	c.writer = &writeWrapper{
-		vision: c,
+	provider, ok := overlay.(interface{ TLSConn() net.Conn })
+	if !ok {
+		return nil, fmt.Errorf("Vision requires an explicit TLS carrier: %T", overlay)
 	}
-	c.reader = &readWrapper{
-		vision: c,
-	}
+	carrier := provider.TLSConn()
+	var raw net.Conn
 	var t reflect.Type
-	var p unsafe.Pointer
-	if iconn, ok := conn.(interface{ IntrinsicConn() netproxy.Conn }); ok {
-		ic := iconn.IntrinsicConn()
-		if tlsConn, ok := ic.(*gotls.Conn); ok {
-			c.Conn = tlsConn.NetConn()
-			c.tlsConn = tlsConn
-			t = reflect.TypeOf(tlsConn).Elem()
-			p = unsafe.Pointer(tlsConn)
-		} else if utlsConn, ok := ic.(*utls.UConn); ok {
-			c.Conn = utlsConn.NetConn()
-			c.tlsConn = utlsConn
-			t = reflect.TypeOf(utlsConn.Conn).Elem()
-			p = unsafe.Pointer(utlsConn.Conn)
-		} else if realityConn, ok := ic.(*tls.RealityUConn); ok {
-			// logrus.Infoln("realityConn")
-			c.Conn = realityConn.NetConn()
-			c.tlsConn = realityConn.UConn
-			t = reflect.TypeOf(realityConn.Conn).Elem()
-			p = unsafe.Pointer(realityConn.Conn)
-		} else {
-			return nil, fmt.Errorf("XTLS only supports TLS and REALITY directly for now: %T", ic)
+	var pointer unsafe.Pointer
+	switch conn := carrier.(type) {
+	case *gotls.Conn:
+		if conn.ConnectionState().Version != gotls.VersionTLS13 {
+			return nil, ErrNotTLS13
 		}
-	} else {
-		return nil, fmt.Errorf("XTLS only supports TLS and REALITY directly for now: %T", conn)
+		raw = conn.NetConn()
+		t = reflect.TypeOf(conn).Elem()
+		pointer = unsafe.Pointer(conn)
+	case *utls.UConn:
+		if conn.ConnectionState().Version != utls.VersionTLS13 {
+			return nil, ErrNotTLS13
+		}
+		raw = conn.NetConn()
+		t = reflect.TypeOf(conn.Conn).Elem()
+		pointer = unsafe.Pointer(conn.Conn)
+	default:
+		return nil, fmt.Errorf("unsupported Vision TLS carrier: %T", carrier)
 	}
-	i, _ := t.FieldByName("input")
-	r, _ := t.FieldByName("rawInput")
-	c.input = (*bytes.Reader)(unsafe.Add(p, i.Offset))
-	c.rawInput = (*bytes.Buffer)(unsafe.Add(p, r.Offset))
+	// Vision must drain TLS's already decrypted and encrypted input before the
+	// authenticated peer requests direct forwarding. Check the concrete layout;
+	// never search through arbitrary connection wrappers.
+	input, okInput := t.FieldByName("input")
+	rawInput, okRaw := t.FieldByName("rawInput")
+	if !okInput || !okRaw || input.Type != reflect.TypeOf(bytes.Reader{}) || rawInput.Type != reflect.TypeOf(bytes.Buffer{}) {
+		return nil, fmt.Errorf("unsupported Vision TLS input layout: %s", t)
+	}
+	c := &Conn{Conn: raw, overlay: overlay, writePadding: true, readPadding: true, packetsToFilter: 6}
+	copy(c.uuid[:], userUUID)
+	c.input = (*bytes.Reader)(unsafe.Add(pointer, input.Offset))
+	c.rawInput = (*bytes.Buffer)(unsafe.Add(pointer, rawInput.Offset))
 	return c, nil
 }

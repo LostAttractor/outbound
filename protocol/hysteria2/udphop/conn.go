@@ -3,107 +3,162 @@ package udphop
 import (
 	"context"
 	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
-	"github.com/samber/oops"
+	"github.com/daeuniverse/outbound/protocol"
 )
 
 const (
-	packetQueueSize = 1024
-	udpBufferSize   = 2048 // QUIC packets are at most 1500 bytes long, so 2k should be more than enough
-
+	packetQueueSize    = 1024
+	udpBufferSize      = 2048
 	defaultHopInterval = 30 * time.Second
 )
 
 type udpHopPacketConn struct {
-	HopInterval time.Duration
-
-	addrs []net.Addr
-
-	dialFunc dialFunc
-
-	connMutex   sync.RWMutex
-	prevConn    net.Conn
-	currentConn net.Conn
-
-	readBufferSize  int
-	writeBufferSize int
-
-	recvQueue chan *udpPacket
-
-	ctx    context.Context
-	cancel context.CancelFunc
+	HopInterval                     time.Duration
+	addrs                           []net.Addr
+	dialFunc                        func(context.Context, net.Addr) (net.Conn, error)
+	connMutex                       sync.RWMutex
+	prevConn, currentConn           net.Conn
+	readBufferSize, writeBufferSize int
+	writeDeadline                   time.Time
+	readDeadline                    protocol.Deadline
+	recvQueue                       chan *udpPacket
+	readError                       chan error
+	ctx                             context.Context
+	cancel                          context.CancelFunc
+	hopDone                         chan struct{}
+	receivers                       sync.WaitGroup
+	lease                           *netproxy.Lease
+	currentWatchCancel              context.CancelFunc
+	closeAsyncOnce                  sync.Once
+	closeOnce                       sync.Once
+	closeErr                        error
 }
-
 type udpPacket struct {
 	Buf  []byte
 	N    int
 	Addr net.Addr
-	Err  error
 }
 
-type dialFunc = func(addr net.Addr) (net.Conn, error)
-
-func NewUDPHopPacketConn(addr *UDPHopAddr, hopInterval time.Duration, dialFunc dialFunc) (net.PacketConn, error) {
-	if hopInterval == 0 {
-		hopInterval = defaultHopInterval
-	} else if hopInterval < 5*time.Second {
+// The initial context owns establishment only. Close cancels later hop dials
+// and joins both the hopping worker and every socket receiver.
+func NewUDPHopPacketConn(initial context.Context, addr *UDPHopAddr, interval time.Duration, dial func(context.Context, net.Addr) (net.Conn, error)) (net.PacketConn, error) {
+	if interval == 0 {
+		interval = defaultHopInterval
+	} else if interval < 5*time.Second {
 		return nil, errors.New("hop interval must be at least 5 seconds")
 	}
 	addrs, err := addr.addrs()
 	if err != nil {
 		return nil, err
 	}
-
-	newAddrIndex := rand.Intn(len(addrs))
-	curConn, err := dialFunc(addrs[newAddrIndex])
+	if len(addrs) == 0 {
+		return nil, errors.New("UDP hopping requires at least one port")
+	}
+	// Do not let the caller's dependency collector capture this temporary
+	// socket: the stable hopper lease owns the current socket dependency.
+	var dialCtx context.Context
+	var cancelDial context.CancelFunc
+	if deadline, ok := initial.Deadline(); ok {
+		dialCtx, cancelDial = context.WithDeadline(context.Background(), deadline)
+	} else {
+		dialCtx, cancelDial = context.WithCancel(context.Background())
+	}
+	defer cancelDial()
+	stop := context.AfterFunc(initial, cancelDial)
+	defer stop()
+	conn, err := dial(dialCtx, addrs[rand.IntN(len(addrs))])
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	hConn := &udpHopPacketConn{
-		HopInterval: hopInterval,
-		addrs:       addrs,
-		dialFunc:    dialFunc,
-		currentConn: curConn,
-		recvQueue:   make(chan *udpPacket, packetQueueSize),
-		ctx:         ctx,
-		cancel:      cancel,
+	if err = initial.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
-	go hConn.recvLoop(curConn)
-	go hConn.hopLoop()
-	return hConn, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	u := &udpHopPacketConn{HopInterval: interval, addrs: addrs, dialFunc: dial, currentConn: conn, recvQueue: make(chan *udpPacket, packetQueueSize), readError: make(chan error, 1), readDeadline: protocol.MakeDeadline(), lease: netproxy.NewLease(netproxy.NewResourceRef()), ctx: ctx, cancel: cancel, hopDone: make(chan struct{})}
+	if parent := netproxy.DependencyOf(conn); parent != nil && !parent.Valid() {
+		cancel()
+		_ = conn.Close()
+		return nil, parent.Cause()
+	}
+	u.receivers.Add(1)
+	go u.recvLoop(conn)
+	u.watchCurrent(conn)
+	go u.hopLoop()
+	return u, nil
 }
+func (u *udpHopPacketConn) DependencyLease() *netproxy.Lease { return u.lease }
 
+// Called with the state lock held, or before publishing the hopper.
+func (u *udpHopPacketConn) watchCurrent(conn net.Conn) {
+	parent := netproxy.DependencyOf(conn)
+	if parent == nil {
+		u.currentWatchCancel = nil
+		return
+	}
+	ctx, cancel := context.WithCancel(u.ctx)
+	u.currentWatchCancel = cancel
+	u.receivers.Add(1)
+	go func() {
+		defer u.receivers.Done()
+		select {
+		case <-ctx.Done():
+			return
+		case <-parent.Done():
+		}
+		u.connMutex.Lock()
+		current := u.currentConn == conn && u.ctx.Err() == nil
+		if current {
+			u.lease.Invalidate(parent.Cause())
+		}
+		u.connMutex.Unlock()
+		if current {
+			u.closeAsyncOnce.Do(func() { go u.Close() })
+		}
+	}()
+}
 func (u *udpHopPacketConn) recvLoop(conn net.Conn) {
+	defer u.receivers.Done()
 	for {
 		buf := pool.GetBuffer(udpBufferSize)
 		n, err := conn.Read(buf)
 		if err != nil {
 			pool.PutBuffer(buf)
-			if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
-				// Only pass through timeout errors here, not permanent errors
-				// like connection closed. Connection close is normal as we close
-				// the old connection to exit this loop every time we hop.
-				u.recvQueue <- &udpPacket{nil, 0, nil, netErr}
+			u.connMutex.RLock()
+			current := u.currentConn == conn
+			u.connMutex.RUnlock()
+			if current && u.ctx.Err() == nil {
+				select {
+				case u.readError <- err:
+				default:
+				}
 			}
 			return
 		}
+		packet := &udpPacket{Buf: buf, N: n, Addr: conn.RemoteAddr()}
 		select {
-		case u.recvQueue <- &udpPacket{buf, n, conn.RemoteAddr(), nil}:
-			// Packet successfully queued
+		case <-u.ctx.Done():
+			pool.PutBuffer(buf)
+			return
 		default:
-			// Queue is full, drop the packet
+		}
+		select {
+		case u.recvQueue <- packet:
+		default:
 			pool.PutBuffer(buf)
 		}
 	}
 }
-
 func (u *udpHopPacketConn) hopLoop() {
+	defer close(u.hopDone)
 	ticker := time.NewTicker(u.HopInterval)
 	defer ticker.Stop()
 	for {
@@ -115,151 +170,155 @@ func (u *udpHopPacketConn) hopLoop() {
 		}
 	}
 }
-
 func (u *udpHopPacketConn) hop() {
-	u.connMutex.Lock()
-	defer u.connMutex.Unlock()
-	newAddrIndex := rand.Intn(len(u.addrs))
-	newConn, err := u.dialFunc(u.addrs[newAddrIndex])
-	if err != nil {
-		// Could be temporary, just skip this hop
+	if u.ctx.Err() != nil {
 		return
 	}
-	// We need to keep receiving packets from the previous connection,
-	// because otherwise there will be packet loss due to the time gap
-	// between we hop to a new port and the server acknowledges this change.
-	// So we do the following:
-	// Close prevConn,
-	// move currentConn to prevConn,
-	// set newConn as currentConn,
-	// start recvLoop on newConn.
-	if u.prevConn != nil {
-		u.prevConn.Close() // recvLoop for this conn will exit
+	conn, err := u.dialFunc(u.ctx, u.addrs[rand.IntN(len(u.addrs))])
+	if err != nil {
+		return
 	}
-	u.prevConn = u.currentConn
-	u.currentConn = newConn
-	// Set buffer sizes if previously set
+	u.connMutex.Lock()
+	if u.ctx.Err() != nil || !u.lease.Valid() {
+		u.connMutex.Unlock()
+		_ = conn.Close()
+		return
+	}
+	previous := u.prevConn
+	u.prevConn, u.currentConn = u.currentConn, conn
+	if u.currentWatchCancel != nil {
+		u.currentWatchCancel()
+	}
+	u.watchCurrent(conn)
+	_ = conn.SetWriteDeadline(u.writeDeadline)
 	if u.readBufferSize > 0 {
-		_ = trySetReadBuffer(u.currentConn, u.readBufferSize)
+		_ = trySetReadBuffer(conn, u.readBufferSize)
 	}
 	if u.writeBufferSize > 0 {
-		_ = trySetWriteBuffer(u.currentConn, u.writeBufferSize)
+		_ = trySetWriteBuffer(conn, u.writeBufferSize)
 	}
-	go u.recvLoop(newConn)
+	u.receivers.Add(1)
+	u.connMutex.Unlock()
+	go u.recvLoop(conn)
+	if previous != nil {
+		_ = previous.Close()
+	}
 }
-
-func (u *udpHopPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+func (u *udpHopPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if u.ctx.Err() != nil {
+		return 0, nil, u.terminalError()
+	}
 	select {
 	case <-u.ctx.Done():
-		return 0, nil, net.ErrClosed
-	case p := <-u.recvQueue:
-		if p.Err != nil {
-			return 0, nil, p.Err
-		}
-		// Currently we do not check whether the packet is from
-		// the server or not due to performance reasons.
-		n := copy(b, p.Buf[:p.N])
-		pool.PutBuffer(p.Buf)
-		return n, p.Addr, nil
+		return 0, nil, u.terminalError()
+	case <-u.readDeadline.Wait():
+		return 0, nil, os.ErrDeadlineExceeded
+	case err := <-u.readError:
+		return 0, nil, err
+	case packet := <-u.recvQueue:
+		n := copy(p, packet.Buf[:packet.N])
+		pool.PutBuffer(packet.Buf)
+		return n, packet.Addr, nil
 	}
 }
-
-func (u *udpHopPacketConn) WriteTo(b []byte, _ net.Addr) (n int, err error) {
+func (u *udpHopPacketConn) terminalError() error {
+	if cause := u.lease.Cause(); cause != nil {
+		return cause
+	}
+	return net.ErrClosed
+}
+func (u *udpHopPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if u.ctx.Err() != nil {
-		return 0, net.ErrClosed
+		return 0, u.terminalError()
 	}
 	u.connMutex.RLock()
-	defer u.connMutex.RUnlock()
-	// Skip the check for now, always write to the server,
-	// for the same reason as in ReadFrom.
-	return u.currentConn.Write(b)
+	conn := u.currentConn
+	u.connMutex.RUnlock()
+	return conn.Write(p)
 }
-
 func (u *udpHopPacketConn) Close() error {
-	u.cancel()
+	u.closeOnce.Do(func() {
+		u.cancel()
+		u.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: u.lease.Resource(), Scope: netproxy.ScopeSharedResource, Layer: netproxy.LayerUDP, Origin: netproxy.OriginLocalCleanup, Reason: netproxy.ReasonClosed}))
+		u.connMutex.Lock()
+		current, previous := u.currentConn, u.prevConn
+		u.readDeadline.Set(time.Time{})
+		u.connMutex.Unlock()
+		u.closeErr = current.Close()
+		if previous != nil {
+			u.closeErr = errors.Join(u.closeErr, previous.Close())
+		}
+		<-u.hopDone
+		u.receivers.Wait()
+		for {
+			select {
+			case packet := <-u.recvQueue:
+				pool.PutBuffer(packet.Buf)
+			default:
+				return
+			}
+		}
+	})
+	return u.closeErr
+}
+func (u *udpHopPacketConn) LocalAddr() net.Addr {
+	u.connMutex.RLock()
+	conn := u.currentConn
+	u.connMutex.RUnlock()
+	return conn.LocalAddr()
+}
+func (u *udpHopPacketConn) SetDeadline(t time.Time) error {
+	return errors.Join(u.SetReadDeadline(t), u.SetWriteDeadline(t))
+}
+func (u *udpHopPacketConn) SetReadDeadline(t time.Time) error {
 	u.connMutex.Lock()
 	defer u.connMutex.Unlock()
-	// Close prevConn and currentConn
-	// Close closeChan to unblock ReadFrom & hopLoop
-	// Set closed flag to true to prevent double close
-	err := u.currentConn.Close()
+	if u.ctx.Err() != nil {
+		return net.ErrClosed
+	}
+	u.readDeadline.Set(t)
+	return nil
+}
+func (u *udpHopPacketConn) SetWriteDeadline(t time.Time) error {
+	u.connMutex.Lock()
+	defer u.connMutex.Unlock()
+	if u.ctx.Err() != nil {
+		return net.ErrClosed
+	}
+	u.writeDeadline = t
+	err := u.currentConn.SetWriteDeadline(t)
 	if u.prevConn != nil {
-		err = oops.Join(err, u.prevConn.Close())
+		err = errors.Join(err, u.prevConn.SetWriteDeadline(t))
 	}
 	return err
 }
-
-func (u *udpHopPacketConn) LocalAddr() net.Addr {
-	u.connMutex.RLock()
-	defer u.connMutex.RUnlock()
-	return u.currentConn.LocalAddr()
-}
-
-func (u *udpHopPacketConn) SetDeadline(t time.Time) error {
-	u.connMutex.RLock()
-	defer u.connMutex.RUnlock()
-	if u.prevConn != nil {
-		_ = u.prevConn.SetDeadline(t)
-	}
-	return u.currentConn.SetDeadline(t)
-}
-
-func (u *udpHopPacketConn) SetReadDeadline(t time.Time) error {
-	u.connMutex.RLock()
-	defer u.connMutex.RUnlock()
-	if u.prevConn != nil {
-		_ = u.prevConn.SetReadDeadline(t)
-	}
-	return u.currentConn.SetReadDeadline(t)
-}
-
-func (u *udpHopPacketConn) SetWriteDeadline(t time.Time) error {
-	u.connMutex.RLock()
-	defer u.connMutex.RUnlock()
-	if u.prevConn != nil {
-		_ = u.prevConn.SetWriteDeadline(t)
-	}
-	return u.currentConn.SetWriteDeadline(t)
-}
-
-// UDP-specific methods below
-
-func (u *udpHopPacketConn) SetReadBuffer(bytes int) error {
+func (u *udpHopPacketConn) SetReadBuffer(size int) error {
 	u.connMutex.Lock()
 	defer u.connMutex.Unlock()
-	u.readBufferSize = bytes
-	if u.prevConn != nil {
-		_ = trySetReadBuffer(u.prevConn, bytes)
+	if u.ctx.Err() != nil {
+		return net.ErrClosed
 	}
-	return trySetReadBuffer(u.currentConn, bytes)
+	u.readBufferSize = size
+	return trySetReadBuffer(u.currentConn, size)
 }
-
-func (u *udpHopPacketConn) SetWriteBuffer(bytes int) error {
+func (u *udpHopPacketConn) SetWriteBuffer(size int) error {
 	u.connMutex.Lock()
 	defer u.connMutex.Unlock()
-	u.writeBufferSize = bytes
-	if u.prevConn != nil {
-		_ = trySetWriteBuffer(u.prevConn, bytes)
+	if u.ctx.Err() != nil {
+		return net.ErrClosed
 	}
-	return trySetWriteBuffer(u.currentConn, bytes)
+	u.writeBufferSize = size
+	return trySetWriteBuffer(u.currentConn, size)
 }
-
-func trySetReadBuffer(pc net.Conn, bytes int) error {
-	sc, ok := pc.(interface {
-		SetReadBuffer(bytes int) error
-	})
-	if ok {
-		return sc.SetReadBuffer(bytes)
+func trySetReadBuffer(conn net.Conn, size int) error {
+	if c, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
+		return c.SetReadBuffer(size)
 	}
 	return nil
 }
-
-func trySetWriteBuffer(pc net.Conn, bytes int) error {
-	sc, ok := pc.(interface {
-		SetWriteBuffer(bytes int) error
-	})
-	if ok {
-		return sc.SetWriteBuffer(bytes)
+func trySetWriteBuffer(conn net.Conn, size int) error {
+	if c, ok := conn.(interface{ SetWriteBuffer(int) error }); ok {
+		return c.SetWriteBuffer(size)
 	}
 	return nil
 }

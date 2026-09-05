@@ -1,8 +1,12 @@
 package ws
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,7 +18,6 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	transportTls "github.com/daeuniverse/outbound/transport/tls"
-	"github.com/gorilla/websocket"
 )
 
 func init() {
@@ -108,16 +111,23 @@ func NewWs(link string) (dialer.Builder, *dialer.Property, error) {
 }
 
 func (s *WsConfig) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (netproxy.Layer, error) {
+	if s.Alpn != "" {
+		for _, alpn := range strings.Split(s.Alpn, ",") {
+			if alpn != "http/1.1" {
+				return netproxy.Layer{}, fmt.Errorf("unsupported WebSocket ALPN %q: only http/1.1 is supported", alpn)
+			}
+		}
+	}
 	wsUrl := url.URL{
 		Scheme: s.Scheme,
 		Host:   s.Host,
 		Path:   s.Path,
 	}
 	ws := &Ws{
-		ParentDialer:   upstream,
-		wsAddr:         wsUrl.String(),
-		passthroughUdp: s.PassthroughUdp,
-		header:         http.Header{},
+		StatelessDialer: protocol.StatelessDialer{ParentDialer: upstream},
+		wsAddr:          wsUrl.String(),
+		passthroughUdp:  s.PassthroughUdp,
+		header:          http.Header{},
 		tlsClientConfig: &tls.Config{
 			ServerName:         s.Sni,
 			InsecureSkipVerify: s.AllowInsecure || option.AllowInsecure,
@@ -148,26 +158,72 @@ func (s *WsConfig) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (
 func (s *Ws) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {
 	switch network {
 	case "tcp":
-		wsDialer := &websocket.Dialer{
-			NetDial: func(_, addr string) (net.Conn, error) {
-				c, err := s.ParentDialer.DialContext(ctx, network, addr)
-				if err != nil {
-					return nil, err
-				}
-
-				if s.tlsFragmentation {
-					c = transportTls.NewFragmentConn(c, s.fragmentMinLength, s.fragmentMaxLength, s.fragmentMinInterval, s.fragmentMaxInterval)
-				}
-
-				return c, nil
-			},
-			TLSClientConfig: s.tlsClientConfig,
-		}
-		rc, _, err := wsDialer.DialContext(ctx, s.wsAddr, s.header)
+		endpoint, err := url.Parse(s.wsAddr)
 		if err != nil {
-			return nil, fmt.Errorf("[Ws]: dial to %s: %w", s.wsAddr, err)
+			return nil, err
 		}
-		return newConn(rc), err
+		address := endpoint.Host
+		if endpoint.Port() == "" {
+			port := "80"
+			if endpoint.Scheme == "wss" {
+				port = "443"
+			}
+			address = net.JoinHostPort(endpoint.Hostname(), port)
+		}
+		raw, err := s.ParentDialer.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		netproxy.CaptureDependency(ctx, raw)
+		dependency := netproxy.DependencyOf(raw)
+		if endpoint.Scheme == "wss" {
+			if s.tlsFragmentation {
+				raw = transportTls.NewFragmentConn(raw, s.fragmentMinLength, s.fragmentMaxLength, s.fragmentMinInterval, s.fragmentMaxInterval)
+			}
+			config := s.tlsClientConfig.Clone()
+			if config.ServerName == "" {
+				config.ServerName = endpoint.Hostname()
+			}
+			raw = tls.Client(raw, config)
+		}
+		reader := bufio.NewReader(raw)
+		err = protocol.Handshake(ctx, raw, func() error {
+			var nonce [16]byte
+			if _, err := rand.Read(nonce[:]); err != nil {
+				return err
+			}
+			key := base64.StdEncoding.EncodeToString(nonce[:])
+			request := &http.Request{Method: "GET", URL: endpoint, Host: endpoint.Host, Header: s.header.Clone()}
+			if host := request.Header.Get("Host"); host != "" {
+				request.Host = host
+				request.Header.Del("Host")
+			}
+			request.Header.Set("Upgrade", "websocket")
+			request.Header.Set("Connection", "Upgrade")
+			request.Header.Set("Sec-WebSocket-Key", key)
+			request.Header.Set("Sec-WebSocket-Version", "13")
+			if err := request.Write(raw); err != nil {
+				return err
+			}
+			response, err := http.ReadResponse(reader, request)
+			if err != nil {
+				return err
+			}
+			accept := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+			if response.StatusCode != http.StatusSwitchingProtocols || !strings.EqualFold(response.Header.Get("Upgrade"), "websocket") || !headerToken(response.Header.Get("Connection"), "upgrade") || response.Header.Get("Sec-WebSocket-Accept") != base64.StdEncoding.EncodeToString(accept[:]) || response.Header.Get("Sec-WebSocket-Extensions") != "" || response.Header.Get("Sec-WebSocket-Protocol") != "" {
+				return netproxy.WrapFailure(fmt.Errorf("websocket upgrade rejected: %s", response.Status), netproxy.Failure{Layer: netproxy.LayerProxy, Scope: netproxy.ScopeOperation, Phase: netproxy.OpHandshake, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonRejected, Code: strconv.Itoa(response.StatusCode)})
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !dependency.Valid() {
+			_ = raw.Close()
+			return nil, dependency.Cause()
+		}
+		return newConn(raw, reader, dependency), nil
+
 	case "udp":
 		if s.passthroughUdp {
 			return s.ParentDialer.DialContext(ctx, network, addr)

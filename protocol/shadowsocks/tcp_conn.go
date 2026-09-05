@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/cipher"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -14,7 +15,6 @@ import (
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/socks5"
-	disk_bloom "github.com/mzz2017/disk-bloom"
 	"github.com/samber/oops"
 )
 
@@ -37,14 +37,13 @@ type TCPConn struct {
 	nonceRead   []byte
 	nonceWrite  []byte
 	writeErr    error // Sticky after an incomplete ciphertext write.
+	readErr     error
 
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
 
 	readBuf    []byte
 	readOffset int
-
-	bloom *disk_bloom.FilterGroup
 }
 
 type Key struct {
@@ -52,7 +51,8 @@ type Key struct {
 	MasterKey  []byte
 }
 
-func NewTCPConn(conn net.Conn, conf *ciphers.CipherConf, masterKey []byte, sg SaltGenerator, addr *socks5.AddressInfo, bloom *disk_bloom.FilterGroup) net.Conn {
+// A nil addr omits the destination header for an enclosing client protocol.
+func NewTCPConn(conn net.Conn, conf *ciphers.CipherConf, masterKey []byte, sg SaltGenerator, addr *socks5.AddressInfo) net.Conn {
 	tcpConn := &TCPConn{
 		Conn:       conn,
 		addr:       addr,
@@ -61,10 +61,6 @@ func NewTCPConn(conn net.Conn, conf *ciphers.CipherConf, masterKey []byte, sg Sa
 		sg:         sg,
 		nonceRead:  make([]byte, conf.NonceLen),
 		nonceWrite: make([]byte, conf.NonceLen),
-		bloom:      bloom,
-	}
-	if _, ok := conn.(netproxy.CloseWriter); ok {
-		return &netproxy.CloseWriteConn{Conn: tcpConn, CloseWriter: conn.(netproxy.CloseWriter)}
 	}
 	return tcpConn
 }
@@ -72,6 +68,12 @@ func NewTCPConn(conn net.Conn, conf *ciphers.CipherConf, masterKey []byte, sg Sa
 func (c *TCPConn) Read(b []byte) (n int, err error) {
 	c.readMutex.Lock()
 	defer c.readMutex.Unlock()
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+	if len(b) == 0 {
+		return 0, nil
+	}
 
 	if c.readBuf != nil {
 		n = copy(b, c.readBuf[c.readOffset:])
@@ -90,17 +92,17 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 
 		n, err = io.ReadFull(c.Conn, salt)
 		if err != nil {
+			if n > 0 {
+				c.readErr = err
+			}
 			return 0, err
 		}
 		c.cipherRead, err = CreateCipher(c.masterKey, salt, c.cipherConf)
 		if err != nil {
-			return 0, oops.Wrapf(err, "fail to initiate cipher")
+			c.readErr = oops.Wrapf(err, "fail to initiate cipher")
+			return 0, c.readErr
 		}
-		if c.bloom != nil {
-			if c.bloom.ExistOrAdd(salt) {
-				return 0, protocol.ErrReplayAttack
-			}
-		}
+
 		c.onceRead = true
 	}
 	if c.cipherRead == nil {
@@ -125,24 +127,30 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 func (c *TCPConn) readChunk() ([]byte, error) {
 	payloadLength := pool.GetBuffer(2 + c.cipherConf.TagLen)
 	defer pool.PutBuffer(payloadLength)
-	if _, err := io.ReadFull(c.Conn, payloadLength); err != nil {
+	if n, err := io.ReadFull(c.Conn, payloadLength); err != nil {
+		if n > 0 {
+			c.readErr = err
+		}
 		return nil, err
 	}
 	_, err := c.cipherRead.Open(payloadLength[:0], c.nonceRead, payloadLength, nil)
 	if err != nil {
-		return nil, protocol.ErrFailAuth
+		c.readErr = responseFailure(protocol.ErrFailAuth, netproxy.ScopeStream)
+		return nil, c.readErr
 	}
 	common.BytesIncLittleEndian(c.nonceRead)
 	l := binary.BigEndian.Uint16(payloadLength)
 	payload := pool.GetBuffer(int(l) + c.cipherConf.TagLen)
 	if _, err = io.ReadFull(c.Conn, payload); err != nil {
 		pool.PutBuffer(payload)
+		c.readErr = err
 		return nil, err
 	}
 	plaintext, err := c.cipherRead.Open(payload[:0], c.nonceRead, payload, nil)
 	if err != nil {
 		pool.PutBuffer(payload)
-		return nil, protocol.ErrFailAuth
+		c.readErr = responseFailure(protocol.ErrFailAuth, netproxy.ScopeStream)
+		return nil, c.readErr
 	}
 	common.BytesIncLittleEndian(c.nonceRead)
 	return plaintext, nil
@@ -151,12 +159,33 @@ func (c *TCPConn) readChunk() ([]byte, error) {
 func (c *TCPConn) Close() error {
 	err := c.Conn.Close()
 	c.readMutex.Lock()
+	c.readErr = net.ErrClosed
 	if c.readBuf != nil {
 		pool.PutBuffer(c.readBuf)
 		c.readBuf = nil
 		c.readOffset = 0
 	}
 	c.readMutex.Unlock()
+	return err
+}
+
+// CloseWrite follows the last complete encrypted frame and leaves Read usable.
+func (c *TCPConn) CloseWrite() error {
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.writeErr != nil {
+		return c.writeErr
+	}
+	writer, ok := c.Conn.(netproxy.CloseWriter)
+	if !ok {
+		c.writeErr = errors.ErrUnsupported
+		return c.writeErr
+	}
+	err := writer.CloseWrite()
+	c.writeErr = err
+	if err == nil {
+		c.writeErr = net.ErrClosed
+	}
 	return err
 }
 
@@ -171,6 +200,11 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 	defer pool.PutBytesBuffer(buf)
 	defer pool.PutBytesBuffer(payload)
 	if !c.onceWrite {
+		defer func() {
+			if err != nil && !c.onceWrite {
+				c.writeErr = err
+			}
+		}()
 		// Generate salt and setup encryption
 		salt := c.sg.Get()
 		defer pool.PutBuffer(salt)
@@ -181,10 +215,10 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		// Add salt for first write
 		buf.Write(salt)
 
-		// Create address metadata for the first write
-		// For client connections, encode the target address
-		if err = socks5.WriteAddrInfo(c.addr, payload); err != nil {
-			return 0, err
+		if c.addr != nil {
+			if err = socks5.WriteAddrInfo(c.addr, payload); err != nil {
+				return 0, err
+			}
 		}
 
 		c.onceWrite = true

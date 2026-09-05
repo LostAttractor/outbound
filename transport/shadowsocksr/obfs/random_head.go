@@ -33,14 +33,6 @@ func (r *randomHead) GetServerInfo() (s *ServerInfo) {
 	return &r.ServerInfo
 }
 
-func (r *randomHead) SetData(data interface{}) {
-
-}
-
-func (r *randomHead) GetData() interface{} {
-	return nil
-}
-
 func (r *randomHead) Encode(data []byte) (encodedData []byte, err error) {
 	if r.rawTransSent {
 		return data, nil
@@ -77,5 +69,5 @@ func (r *randomHead) Decode(data []byte) (decodedData []byte, needSendBack bool,
 		return data, false, nil
 	}
 	r.rawTransReceived = true
-	return data, true, nil
+	return nil, true, nil
 }

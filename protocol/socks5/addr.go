@@ -9,7 +9,8 @@ import (
 	"net/netip"
 	"strconv"
 
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol/infra/socks"
 )
 
 type AddressType uint8
@@ -46,12 +47,15 @@ func WriteAddrInfo(addr *AddressInfo, buf *bytes.Buffer) error {
 	buf.WriteByte(byte(addr.Type))
 	switch addr.Type {
 	case AddressTypeIPv4, AddressTypeIPv6:
+		if (addr.Type == AddressTypeIPv4 && !addr.IP.Is4()) || (addr.Type == AddressTypeIPv6 && !addr.IP.Is6()) {
+			return ErrInvalidAddress
+		}
 		buf.Write(addr.IP.AsSlice())
 		binary.Write(buf, binary.BigEndian, addr.Port)
 	case AddressTypeDomain:
 		lenDN := len(addr.Hostname)
-		if lenDN > 255 {
-			return fmt.Errorf("domain name too long: %d bytes", lenDN)
+		if lenDN == 0 || lenDN > 255 {
+			return fmt.Errorf("invalid domain length: %d bytes", lenDN)
 		}
 		buf.WriteByte(uint8(lenDN))
 		buf.WriteString(addr.Hostname)
@@ -68,61 +72,32 @@ func ReadAddr(data io.Reader) (net.Addr, error) {
 		return nil, err
 	}
 
-	// Create address object (only support IP addresses for UDP)
+	// Preserve domain addresses without performing hidden DNS lookups.
 	switch addressInfo.Type {
 	case AddressTypeIPv4, AddressTypeIPv6:
 		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(addressInfo.IP, addressInfo.Port)), nil
+	case AddressTypeDomain:
+		return netproxy.NewAddr("udp", net.JoinHostPort(addressInfo.Hostname, strconv.Itoa(int(addressInfo.Port)))), nil
 	default:
-		return nil, fmt.Errorf("unsupported address type for UDP: %v", addressInfo.Type)
+		return nil, ErrInvalidAddress
 	}
 }
 
-// ReadAddr reads address from buffer
+// ReadAddrInfo shares the exact-length SOCKS address decoder used by the
+// other client protocols, including readers that fragment every field.
 func ReadAddrInfo(data io.Reader) (*AddressInfo, error) {
-	var typ uint8
-	if err := binary.Read(data, binary.BigEndian, &typ); err != nil {
-		return nil, fmt.Errorf("%w: too short", ErrInvalidAddress)
+	addr, err := socks.ReadAddr(data)
+	if err != nil {
+		return nil, fmt.Errorf("read SOCKS address: %w", err)
 	}
-
-	info := &AddressInfo{Type: AddressType(typ)}
-
+	info := &AddressInfo{Type: AddressType(addr[0]), Port: binary.BigEndian.Uint16(addr[len(addr)-2:])}
 	switch info.Type {
 	case AddressTypeIPv4:
-		ip := pool.GetBuffer(4)
-		defer pool.PutBuffer(ip)
-		if _, err := data.Read(ip); err != nil {
-			return nil, fmt.Errorf("failed to read IP: %w", err)
-		}
-		info.IP = netip.AddrFrom4([4]byte(ip))
-		if err := binary.Read(data, binary.BigEndian, &info.Port); err != nil {
-			return nil, fmt.Errorf("failed to read port: %w", err)
-		}
+		info.IP = netip.AddrFrom4([4]byte(addr[1:5]))
 	case AddressTypeIPv6:
-		ip := pool.GetBuffer(16)
-		defer pool.PutBuffer(ip)
-		if _, err := data.Read(ip); err != nil {
-			return nil, fmt.Errorf("failed to read IP: %w", err)
-		}
-		info.IP = netip.AddrFrom16([16]byte(ip))
-		if err := binary.Read(data, binary.BigEndian, &info.Port); err != nil {
-			return nil, fmt.Errorf("failed to read port: %w", err)
-		}
+		info.IP = netip.AddrFrom16([16]byte(addr[1:17]))
 	case AddressTypeDomain:
-		var domainLen uint8
-		if err := binary.Read(data, binary.BigEndian, &domainLen); err != nil {
-			return nil, fmt.Errorf("failed to read domain length: %w", err)
-		}
-		domain := pool.GetBuffer(int(domainLen))
-		defer pool.PutBuffer(domain)
-		if _, err := data.Read(domain); err != nil {
-			return nil, fmt.Errorf("failed to read domain: %w", err)
-		}
-		info.Hostname = string(domain)
-		if err := binary.Read(data, binary.BigEndian, &info.Port); err != nil {
-			return nil, fmt.Errorf("failed to read port: %w", err)
-		}
-	default:
-		return nil, fmt.Errorf("%w: invalid type: %v", ErrInvalidAddress, info.Type)
+		info.Hostname = string(addr[2 : len(addr)-2])
 	}
 	return info, nil
 }
@@ -141,6 +116,9 @@ func AddressFromString(addr string) (*AddressInfo, error) {
 
 	ip, err := netip.ParseAddr(hostname)
 	if err != nil {
+		if len(hostname) == 0 || len(hostname) > 255 {
+			return nil, ErrInvalidAddress
+		}
 		info.Type = AddressTypeDomain
 		info.Hostname = hostname
 	} else {

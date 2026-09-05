@@ -1,6 +1,7 @@
 package tuic
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -8,587 +9,192 @@ import (
 	"net/netip"
 	"strconv"
 
+	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/quic-go"
-	"github.com/google/uuid"
 )
-
-type BufferedReader interface {
-	io.Reader
-	io.ByteReader
-}
-
-type BufferedWriter interface {
-	io.Writer
-	io.ByteWriter
-}
-
-type CommandType byte
 
 const (
-	AuthenticateType = CommandType(0x00)
-	ConnectType      = CommandType(0x01)
-	PacketType       = CommandType(0x02)
-	DissociateType   = CommandType(0x03)
-	HeartbeatType    = CommandType(0x04)
+	AuthenticateType byte = iota
+	ConnectType
+	PacketType
+	DissociateType
+	HeartbeatType
 )
 
-func (c CommandType) String() string {
-	switch c {
-	case AuthenticateType:
-		return "Authenticate"
-	case ConnectType:
-		return "Connect"
-	case PacketType:
-		return "Packet"
-	case DissociateType:
-		return "Dissociate"
-	case HeartbeatType:
-		return "Heartbeat"
-	default:
-		return fmt.Sprintf("UnknowCommand: %#x", byte(c))
-	}
-}
-
-func (c CommandType) BytesLen() int {
-	return 1
-}
-
-type CommandHead struct {
-	VER  byte
-	TYPE CommandType
-}
-
-func NewCommandHead(TYPE CommandType, VER byte) *CommandHead {
-	return &CommandHead{
-		VER:  VER,
-		TYPE: TYPE,
-	}
-}
-
-func ReadCommandHead(reader BufferedReader) (c *CommandHead, err error) {
-	var _c CommandHead
-	_c.VER, err = reader.ReadByte()
+// WriteAuthentication is the client authentication frame shared by TUIC v5
+// and Juicity v0. Authentication decoding belongs to the peer.
+func WriteAuthentication(w io.Writer, version byte, state quic.ConnectionState, id [16]byte, password string) error {
+	token, err := state.TLS.ExportKeyingMaterial(string(id[:]), []byte(password), 32)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	TYPE, err := reader.ReadByte()
-	if err != nil {
-		return nil, err
-	}
-	_c.TYPE = CommandType(TYPE)
-	return &_c, nil
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	buf.Write([]byte{version, AuthenticateType})
+	buf.Write(id[:])
+	buf.Write(token)
+	_, err = buf.WriteTo(w)
+	return err
 }
 
-func (c CommandHead) WriteTo(writer BufferedWriter) (err error) {
-	err = writer.WriteByte(c.VER)
-	if err != nil {
-		return
-	}
-	err = writer.WriteByte(byte(c.TYPE))
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (c CommandHead) WriteToBytes(buf []byte) (n int) {
-	buf[0] = c.VER
-	buf[1] = byte(c.TYPE)
-	return 2
-}
-
-func (c CommandHead) BytesLen() int {
-	return 1 + c.TYPE.BytesLen()
-}
-
-type Authenticate struct {
-	*CommandHead
-	UUID  uuid.UUID
-	TOKEN [32]byte
-	VER   byte
-}
-
-func NewAuthenticate(UUID [16]byte, TOKEN [32]byte, VER byte) *Authenticate {
-	return &Authenticate{
-		CommandHead: NewCommandHead(AuthenticateType, VER),
-		UUID:        UUID,
-		TOKEN:       TOKEN,
-		VER:         VER,
-	}
-}
-
-func ReadAuthenticateWithHead(head *CommandHead, reader BufferedReader) (c *Authenticate, err error) {
-	var _c Authenticate
-	_c.CommandHead = head
-	if _c.CommandHead.TYPE != AuthenticateType {
-		return nil, fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
-	}
-	_, err = io.ReadFull(reader, _c.UUID[:])
-	if err != nil {
-		return nil, fmt.Errorf("read uuid: %w", err)
-	}
-	_, err = io.ReadFull(reader, _c.TOKEN[:])
-	if err != nil {
-		return nil, fmt.Errorf("read token: %w", err)
-	}
-	return &_c, nil
-}
-
-func ReadAuthenticate(reader BufferedReader) (c *Authenticate, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadAuthenticateWithHead(head, reader)
-}
-
-func GenToken(state quic.ConnectionState, uuid [16]byte, password string) (token [32]byte, err error) {
-	var tokenBytes []byte
-	tokenBytes, err = state.TLS.ExportKeyingMaterial(string(uuid[:]), []byte(password), 32)
-	if err != nil {
-		return
-	}
-	copy(token[:], tokenBytes)
-	return
-}
-
-func (c Authenticate) WriteTo(writer BufferedWriter) (err error) {
-	err = c.CommandHead.WriteTo(writer)
-	if err != nil {
-		return
-	}
-	_, err = writer.Write(c.UUID[:])
-	if err != nil {
-		return
-	}
-	_, err = writer.Write(c.TOKEN[:])
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (c Authenticate) BytesLen() int {
-	return c.CommandHead.BytesLen() + 16 + 32
-}
-
-type Connect struct {
-	*CommandHead
-	ADDR *Address
-}
-
-func NewConnect(ADDR *Address, VER byte) *Connect {
-	return &Connect{
-		CommandHead: NewCommandHead(ConnectType, VER),
-		ADDR:        ADDR,
-	}
-}
-
-func ReadConnectWithHead(head *CommandHead, reader BufferedReader) (c *Connect, err error) {
-	var _c Connect
-	_c.CommandHead = head
-	if _c.CommandHead.TYPE != ConnectType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
-		return nil, err
-	}
-	_c.ADDR, err = ReadAddress(reader)
-	if err != nil {
-		return nil, err
-	}
-	return &_c, nil
-}
-
-func ReadConnect(reader BufferedReader) (c *Connect, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadConnectWithHead(head, reader)
-}
-
-func (c Connect) WriteTo(writer BufferedWriter) (err error) {
-	err = c.CommandHead.WriteTo(writer)
-	if err != nil {
-		return
-	}
-	err = c.ADDR.WriteTo(writer)
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (c Connect) WriteToBytes(b []byte) (n int) {
-	n += c.CommandHead.WriteToBytes(b)
-	n += c.ADDR.WriteToBytes(b[2:])
-	return n
-}
-
-func (c Connect) BytesLen() int {
-	return c.CommandHead.BytesLen() + c.ADDR.BytesLen()
-}
-
-type Packet struct {
-	*CommandHead
-	ASSOC_ID   uint16
-	PKT_ID     uint16
-	FRAG_TOTAL uint8
-	FRAG_ID    uint8
-	SIZE       uint16
-	ADDR       *Address
-	DATA       []byte
-}
-
-func NewPacket(ASSOC_ID uint16, PKT_ID uint16, FRGA_TOTAL uint8, FRAG_ID uint8, SIZE uint16, ADDR *Address, DATA []byte, VER byte) *Packet {
-	return &Packet{
-		CommandHead: NewCommandHead(PacketType, VER),
-		ASSOC_ID:    ASSOC_ID,
-		PKT_ID:      PKT_ID,
-		FRAG_ID:     FRAG_ID,
-		FRAG_TOTAL:  FRGA_TOTAL,
-		SIZE:        SIZE,
-		ADDR:        ADDR,
-		DATA:        DATA,
-	}
-}
-
-func ReadPacketWithHead(head *CommandHead, reader BufferedReader) (c *Packet, err error) {
-	var _c Packet
-	_c.CommandHead = head
-	if _c.CommandHead.TYPE != PacketType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
-		return nil, err
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.ASSOC_ID)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.PKT_ID)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.FRAG_TOTAL)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.FRAG_ID)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.SIZE)
-	if err != nil {
-		return nil, err
-	}
-	_c.ADDR, err = ReadAddress(reader)
-	if err != nil {
-		return nil, err
-	}
-	_c.DATA = make([]byte, _c.SIZE)
-	_, err = io.ReadFull(reader, _c.DATA)
-	if err != nil {
-		return nil, err
-	}
-	return &_c, nil
-}
-
-func ReadPacket(reader BufferedReader) (c *Packet, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadPacketWithHead(head, reader)
-}
-
-func (c Packet) WriteTo(writer BufferedWriter) (err error) {
-	err = c.CommandHead.WriteTo(writer)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.ASSOC_ID)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.PKT_ID)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.FRAG_TOTAL)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.FRAG_ID)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.SIZE)
-	if err != nil {
-		return
-	}
-	err = c.ADDR.WriteTo(writer)
-	if err != nil {
-		return
-	}
-	_, err = writer.Write(c.DATA)
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (c Packet) BytesLen() int {
-	return c.CommandHead.BytesLen() + 4 + 2 + c.ADDR.BytesLen() + len(c.DATA)
-}
-
-var PacketOverHead = NewPacket(0, 0, 0, 0, 0, NewAddressAddrPort(netip.AddrPortFrom(netip.IPv6Unspecified(), 0)), nil, 0).BytesLen()
-
-type Dissociate struct {
-	*CommandHead
-	ASSOC_ID uint16
-}
-
-func NewDissociate(ASSOC_ID uint16, VER byte) *Dissociate {
-	return &Dissociate{
-		CommandHead: NewCommandHead(DissociateType, VER),
-		ASSOC_ID:    ASSOC_ID,
-	}
-}
-
-func ReadDissociateWithHead(head *CommandHead, reader BufferedReader) (c *Dissociate, err error) {
-	var _c Dissociate
-	_c.CommandHead = head
-	if _c.CommandHead.TYPE != DissociateType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
-		return nil, err
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.ASSOC_ID)
-	if err != nil {
-		return nil, err
-	}
-	return &_c, nil
-}
-
-func ReadDissociate(reader BufferedReader) (c *Dissociate, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadDissociateWithHead(head, reader)
-}
-
-func (c Dissociate) WriteTo(writer BufferedWriter) (err error) {
-	err = c.CommandHead.WriteTo(writer)
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.ASSOC_ID)
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (c Dissociate) BytesLen() int {
-	return c.CommandHead.BytesLen() + 4
-}
-
-type Heartbeat struct {
-	*CommandHead
-}
-
-func NewHeartbeat(VER byte) *Heartbeat {
-	return &Heartbeat{
-		CommandHead: NewCommandHead(HeartbeatType, VER),
-	}
-}
-
-func ReadHeartbeatWithHead(head *CommandHead, reader BufferedReader) (c *Heartbeat, err error) {
-	var _c Heartbeat
-	_c.CommandHead = head
-	if _c.CommandHead.TYPE != HeartbeatType {
-		err = fmt.Errorf("error command type: %s", _c.CommandHead.TYPE)
-		return nil, err
-	}
-	return &_c, nil
-}
-
-func ReadHeartbeat(reader BufferedReader) (c *Heartbeat, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadHeartbeatWithHead(head, reader)
-}
-
-// Addr types
 const (
 	AtypDomainName byte = 0
 	AtypIPv4       byte = 1
 	AtypIPv6       byte = 2
-	AtypNone       byte = 255 // Address type None is used in Packet commands that is not the first fragment of a UDP packet.
+	AtypNone       byte = 255
 )
 
-type Address struct {
+type address struct {
 	TYPE byte
 	ADDR []byte
 	PORT uint16
 }
 
-func NewAddress(metadata *protocol.Metadata) *Address {
-	var addrType byte
-	var addr []byte
+func addressFromMetadata(metadata *protocol.Metadata) *address {
+	a := &address{PORT: metadata.Port}
 	switch metadata.Type {
 	case protocol.MetadataTypeIPv4:
-		addrType = AtypIPv4
-		addr = net.ParseIP(metadata.Hostname).To4()
+		a.TYPE, a.ADDR = AtypIPv4, net.ParseIP(metadata.Hostname).To4()
 	case protocol.MetadataTypeIPv6:
-		addrType = AtypIPv6
-		addr = net.ParseIP(metadata.Hostname).To16()
-	case protocol.MetadataTypeDomain:
-		addrType = AtypDomainName
-		addr = make([]byte, len(metadata.Hostname)+1)
-		addr[0] = byte(len(metadata.Hostname))
-		copy(addr[1:], metadata.Hostname)
+		a.TYPE, a.ADDR = AtypIPv6, net.ParseIP(metadata.Hostname).To16()
+	default:
+		a.TYPE = AtypDomainName
+		a.ADDR = append([]byte{byte(len(metadata.Hostname))}, metadata.Hostname...)
 	}
-
-	return &Address{
-		TYPE: addrType,
-		ADDR: addr,
-		PORT: metadata.Port,
-	}
+	return a
 }
 
-func NewAddressNetAddr(addr net.Addr) (*Address, error) {
-	if addr, ok := addr.(interface{ AddrPort() netip.AddrPort }); ok {
-		if addrPort := addr.AddrPort(); addrPort.IsValid() { // sing's M.Socksaddr maybe return an invalid AddrPort if it's a DomainName
-			return NewAddressAddrPort(addrPort), nil
-		}
+func readAddress(r io.Reader) (*address, error) {
+	var head [2]byte
+	if _, err := io.ReadFull(r, head[:1]); err != nil {
+		return nil, err
 	}
-	addrStr := addr.String()
-	if addrPort, err := netip.ParseAddrPort(addrStr); err == nil {
-		return NewAddressAddrPort(addrPort), nil
-	}
-	metadata, err := protocol.ParseMetadata(addrStr)
-	if err != nil {
-		return &Address{}, err
-	}
-	return NewAddress(&metadata), nil
-}
-
-func NewAddressAddrPort(addrPort netip.AddrPort) *Address {
-	var addrType byte
-	port := addrPort.Port()
-	addr := addrPort.Addr().Unmap()
-	if addr.Is4() {
-		addrType = AtypIPv4
-	} else {
-		addrType = AtypIPv6
-	}
-	return &Address{
-		TYPE: addrType,
-		ADDR: addr.AsSlice(),
-		PORT: port,
-	}
-}
-
-func ReadAddress(reader BufferedReader) (c *Address, err error) {
-	var _c Address
-	_c.TYPE, err = reader.ReadByte()
-	if err != nil {
-		return
-	}
-	switch _c.TYPE {
+	a := &address{TYPE: head[0]}
+	size := 0
+	switch a.TYPE {
+	case AtypNone:
+		return a, nil
 	case AtypIPv4:
-		_c.ADDR = make([]byte, net.IPv4len)
-		_, err = io.ReadFull(reader, _c.ADDR)
-		if err != nil {
-			return
+		size = net.IPv4len
+	case AtypIPv6:
+		size = net.IPv6len
+	case AtypDomainName:
+		if _, err := io.ReadFull(r, head[1:]); err != nil {
+			return nil, err
+		}
+		size = int(head[1])
+		a.ADDR = append(a.ADDR, head[1])
+	default:
+		return nil, fmt.Errorf("invalid TUIC address type: %d", a.TYPE)
+	}
+	a.ADDR = append(a.ADDR, make([]byte, size)...)
+	if _, err := io.ReadFull(r, a.ADDR[len(a.ADDR)-size:]); err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return nil, err
+	}
+	a.PORT = binary.BigEndian.Uint16(head[:])
+	return a, nil
+}
+
+func (a *address) appendTo(buf *bytes.Buffer) error {
+	if a == nil {
+		return fmt.Errorf("missing TUIC address")
+	}
+	switch a.TYPE {
+	case AtypNone:
+		return buf.WriteByte(AtypNone)
+	case AtypIPv4:
+		if len(a.ADDR) != 4 {
+			return fmt.Errorf("invalid TUIC IPv4 address")
 		}
 	case AtypIPv6:
-		_c.ADDR = make([]byte, net.IPv6len)
-		_, err = io.ReadFull(reader, _c.ADDR)
-		if err != nil {
-			return
+		if len(a.ADDR) != 16 {
+			return fmt.Errorf("invalid TUIC IPv6 address")
 		}
 	case AtypDomainName:
-		var addrLen byte
-		addrLen, err = reader.ReadByte()
-		if err != nil {
-			return
+		if len(a.ADDR) < 2 || len(a.ADDR) > 256 || int(a.ADDR[0]) != len(a.ADDR)-1 {
+			return fmt.Errorf("invalid TUIC domain length")
 		}
-		_c.ADDR = make([]byte, addrLen+1)
-		_c.ADDR[0] = addrLen
-		_, err = io.ReadFull(reader, _c.ADDR[1:])
-		if err != nil {
-			return
-		}
-	}
-
-	if _c.TYPE == AtypNone {
-		return
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.PORT)
-	if err != nil {
-		return
-	}
-	return &_c, nil
-}
-
-func (c Address) WriteTo(writer BufferedWriter) (err error) {
-	err = writer.WriteByte(c.TYPE)
-	if err != nil {
-		return
-	}
-	if c.TYPE == AtypNone {
-		return
-	}
-	_, err = writer.Write(c.ADDR[:])
-	if err != nil {
-		return
-	}
-	err = binary.Write(writer, binary.BigEndian, c.PORT)
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (c Address) WriteToBytes(b []byte) (n int) {
-	b[0] = c.TYPE
-	if c.TYPE == AtypNone {
-		return
-	}
-	n = copy(b[1:], c.ADDR)
-	binary.BigEndian.PutUint16(b[1+n:], c.PORT)
-	return 3 + n
-}
-
-func (c Address) String() string {
-	switch c.TYPE {
-	case AtypDomainName:
-		return net.JoinHostPort(string(c.ADDR[1:]), strconv.Itoa(int(c.PORT)))
 	default:
-		addr, _ := netip.AddrFromSlice(c.ADDR)
-		addrPort := netip.AddrPortFrom(addr, c.PORT)
-		return addrPort.String()
+		return fmt.Errorf("invalid TUIC address type: %d", a.TYPE)
 	}
+	buf.WriteByte(a.TYPE)
+	buf.Write(a.ADDR)
+	buf.Write(binary.BigEndian.AppendUint16(nil, a.PORT))
+	return nil
 }
 
-func (c Address) UDPAddr() *net.UDPAddr {
-	return &net.UDPAddr{
-		IP:   c.ADDR,
-		Port: int(c.PORT),
-		Zone: "",
+func (a *address) netAddr() net.Addr {
+	if a.TYPE == AtypDomainName {
+		return netproxy.NewAddr("udp", a.String())
 	}
+	return &net.UDPAddr{IP: a.ADDR, Port: int(a.PORT)}
 }
 
-func (c Address) BytesLen() int {
-	return 1 + len(c.ADDR) + 2
+func (a *address) String() string {
+	if a.TYPE == AtypDomainName {
+		return net.JoinHostPort(string(a.ADDR[1:]), strconv.Itoa(int(a.PORT)))
+	}
+	ip, _ := netip.AddrFromSlice(a.ADDR)
+	return netip.AddrPortFrom(ip, a.PORT).String()
+}
+
+func (a *address) BytesLen() int {
+	if a.TYPE == AtypNone {
+		return 1
+	}
+	return 3 + len(a.ADDR)
+}
+
+type packetFrame struct {
+	ASSOC_ID   uint16
+	PKT_ID     uint16
+	FRAG_TOTAL uint8
+	FRAG_ID    uint8
+	ADDR       *address
+	DATA       []byte
+}
+
+// readPacket consumes a server UDP frame. The caller has consumed its two-byte command.
+func readPacket(r io.Reader) (*packetFrame, error) {
+	var header [8]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	p := &packetFrame{ASSOC_ID: binary.BigEndian.Uint16(header[:]), PKT_ID: binary.BigEndian.Uint16(header[2:]), FRAG_TOTAL: header[4], FRAG_ID: header[5]}
+	if p.FRAG_TOTAL == 0 || p.FRAG_ID >= p.FRAG_TOTAL {
+		return nil, fmt.Errorf("invalid TUIC fragment index")
+	}
+	var err error
+	p.ADDR, err = readAddress(r)
+	if err != nil {
+		return nil, err
+	}
+	if (p.FRAG_ID == 0) == (p.ADDR.TYPE == AtypNone) {
+		return nil, fmt.Errorf("invalid TUIC fragment address")
+	}
+	p.DATA = make([]byte, binary.BigEndian.Uint16(header[6:]))
+	_, err = io.ReadFull(r, p.DATA)
+	return p, err
+}
+
+func (p *packetFrame) appendTo(buf *bytes.Buffer) error {
+	buf.Write([]byte{Ver5, PacketType})
+	buf.Write(binary.BigEndian.AppendUint16(nil, p.ASSOC_ID))
+	buf.Write(binary.BigEndian.AppendUint16(nil, p.PKT_ID))
+	buf.Write([]byte{p.FRAG_TOTAL, p.FRAG_ID})
+	buf.Write(binary.BigEndian.AppendUint16(nil, uint16(len(p.DATA))))
+	if err := p.ADDR.appendTo(buf); err != nil {
+		return err
+	}
+	buf.Write(p.DATA)
+	return nil
 }
 
 const (
-	ProtocolError         = quic.ApplicationErrorCode(0xfffffff0)
-	AuthenticationFailed  = quic.ApplicationErrorCode(0xfffffff1)
-	AuthenticationTimeout = quic.ApplicationErrorCode(0xfffffff2)
-	BadCommand            = quic.ApplicationErrorCode(0xfffffff3)
+	ProtocolError = quic.ApplicationErrorCode(0xfffffff0)
 )

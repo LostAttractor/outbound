@@ -30,14 +30,6 @@ type AuthResponse struct {
 	RxAuto     bool   // true = server asks client to use bandwidth detection
 }
 
-func AuthRequestFromHeader(h http.Header) AuthRequest {
-	rx, _ := strconv.ParseUint(h.Get(CommonHeaderCCRX), 10, 64)
-	return AuthRequest{
-		Auth: h.Get(RequestHeaderAuth),
-		Rx:   rx,
-	}
-}
-
 func AuthRequestToHeader(h http.Header, req AuthRequest) {
 	h.Set(RequestHeaderAuth, req.Auth)
 	h.Set(CommonHeaderCCRX, strconv.FormatUint(req.Rx, 10))
@@ -55,14 +47,4 @@ func AuthResponseFromHeader(h http.Header) AuthResponse {
 		resp.Rx, _ = strconv.ParseUint(rxStr, 10, 64)
 	}
 	return resp
-}
-
-func AuthResponseToHeader(h http.Header, resp AuthResponse) {
-	h.Set(ResponseHeaderUDPEnabled, strconv.FormatBool(resp.UDPEnabled))
-	if resp.RxAuto {
-		h.Set(CommonHeaderCCRX, "auto")
-	} else {
-		h.Set(CommonHeaderCCRX, strconv.FormatUint(resp.Rx, 10))
-	}
-	h.Set(CommonHeaderPadding, authResponsePadding.String())
 }

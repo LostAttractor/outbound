@@ -26,6 +26,9 @@ type Dialer struct {
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
 	conf := ciphers.AeadCiphersConf[header.Cipher]
+	if conf == nil {
+		return nil, fmt.Errorf("unsupported shadowsocks cipher: %s", header.Cipher)
+	}
 	key := common.EVPBytesToKey(header.Password, conf.KeyLen)
 	sg, err := NewRandomSaltGenerator(conf.SaltLen)
 	if err != nil {
@@ -53,7 +56,12 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 		if err != nil {
 			return nil, err
 		}
-		return NewTCPConn(conn, d.conf, d.key, d.sg, addrInfo, nil), nil
+		client := NewTCPConn(conn, d.conf, d.key, d.sg, addrInfo)
+		if err = protocol.Handshake(ctx, client, func() error { _, err := client.Write(nil); return err }); err != nil {
+			return nil, err
+		}
+		return client, nil
+
 	case "udp":
 		conn, err := d.ListenPacket(ctx, d.proxyAddress)
 		if err != nil {
@@ -68,11 +76,26 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	}
 }
 
+// DialTCPTransport exposes AEAD encryption without a destination header. The
+// caller supplies the enclosing protocol's handshake as the first plaintext.
+func (d *Dialer) DialTCPTransport(ctx context.Context) (net.Conn, error) {
+	conn, err := d.ParentDialer.DialContext(ctx, "tcp", d.proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	netproxy.CaptureDependency(ctx, conn)
+	return NewTCPConn(conn, d.conf, d.key, d.sg, nil), nil
+}
+
 func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
 	// Shadowsocks transfer UDP traffic via UDP tunnel.
 	conn, err := d.ParentDialer.DialContext(ctx, "udp", d.proxyAddress)
 	if err != nil {
 		return nil, err
 	}
-	return NewUdpConn(conn, d.conf, d.key, d.sg, nil)
+	return NewUdpConn(conn, d.conf, d.key, d.sg)
 }

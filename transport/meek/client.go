@@ -4,197 +4,256 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 )
 
-func newClientSession(ctx context.Context, tripper Tripper, config *config, workers *sync.WaitGroup) (*assemblerClientSession, error) {
-	sessionID := make([]byte, 16)
-	_, err := io.ReadFull(rand.Reader, sessionID)
-	if err != nil {
-		return nil, err
-	}
+const maxWriteSize = 64 << 10
+const maxResponseSize = 1 << 20
 
-	sessionContext, finish := context.WithCancel(ctx)
+// Each logical connection owns one polling worker and bounded receive queue.
+// An unsuccessful POST ends that connection: it may already have delivered
+// application bytes, so retrying its body would silently replay traffic.
+type clientSession struct {
+	url, tag                    string
+	transport                   http.RoundTripper
+	ctx                         context.Context
+	finish                      context.CancelCauseFunc
+	done                        chan struct{}
+	writerChan, readerChan      chan []byte
+	readMu, writeMu, stateMu    sync.Mutex
+	pending                     []byte
+	readDeadline, writeDeadline protocol.Deadline
+	closed                      bool
+}
 
-	session := &assemblerClientSession{
-		sessionID:        sessionID,
-		currentWriteWait: int(config.InitialPollingIntervalMs),
-		ctx:              sessionContext,
-		tripper:          tripper,
-		config:           config,
-		finish:           finish,
-		readBuffer:       bytes.NewBuffer(nil),
-		writerChan:       make(chan []byte),
-		readerChan:       make(chan []byte, 16),
-		done:             make(chan struct{}),
+func newClientSession(ctx context.Context, transport http.RoundTripper, url string, workers *sync.WaitGroup) *clientSession {
+	var id [16]byte
+	_, _ = rand.Read(id[:])
+	ctx, cancel := context.WithCancelCause(ctx)
+	s := &clientSession{
+		url: url, tag: base64.RawURLEncoding.EncodeToString(id[:]), transport: transport,
+		ctx: ctx, finish: cancel, done: make(chan struct{}),
+		writerChan: make(chan []byte), readerChan: make(chan []byte, 16),
+		readDeadline: protocol.MakeDeadline(), writeDeadline: protocol.MakeDeadline(),
 	}
-
-	if workers != nil {
-		workers.Add(1)
-	}
+	workers.Add(1)
 	go func() {
-		defer close(session.done)
-		if workers != nil {
-			defer workers.Done()
-		}
-		session.keepRunning()
+		defer workers.Done()
+		defer close(s.done)
+		s.terminate(s.run())
 	}()
-
-	return session, nil
+	return s
 }
 
-type assemblerClientSession struct {
-	sessionID        []byte
-	currentWriteWait int
-
-	tripper    Tripper
-	config     *config
-	readBuffer *bytes.Buffer
-	writerChan chan []byte
-	readerChan chan []byte
-	ctx        context.Context
-	finish     func()
-	done       chan struct{}
-}
-
-var _ net.Conn = (*assemblerClientSession)(nil)
-
-func (s *assemblerClientSession) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (s *assemblerClientSession) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (s *assemblerClientSession) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
-func (s *assemblerClientSession) keepRunning() {
-	for s.ctx.Err() == nil {
-		s.runOnce()
+func (s *clientSession) terminate(err error) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.closed {
+		return
 	}
+	s.closed = true
+	if err == nil {
+		err = context.Canceled
+	}
+	s.finish(err)
+	s.readDeadline.Set(time.Time{})
+	s.writeDeadline.Set(time.Time{})
 }
 
-func (s *assemblerClientSession) runOnce() {
-	sendBuffer := bytes.NewBuffer(nil)
-	if s.currentWriteWait != 0 {
-		waitTimer := time.NewTimer(time.Millisecond * time.Duration(s.currentWriteWait))
-		waitForFirstWrite := true
-	copyFromWriterLoop:
+func (s *clientSession) run() error {
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	wait := 100 * time.Millisecond
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		buf.Reset()
+		timer.Reset(wait)
+	collect:
 		for {
 			select {
 			case <-s.ctx.Done():
-				return
+				return context.Cause(s.ctx)
 			case data := <-s.writerChan:
-				sendBuffer.Write(data)
-				if sendBuffer.Len() >= int(s.config.MaxWriteSize) {
-					break copyFromWriterLoop
+				first := buf.Len() == 0
+				buf.Write(data)
+				if buf.Len() >= maxWriteSize {
+					break collect
 				}
-				if waitForFirstWrite {
-					waitForFirstWrite = false
-					waitTimer.Reset(time.Millisecond * time.Duration(s.config.WaitSubsequentWriteMs))
+				if first {
+					timer.Reset(10 * time.Millisecond)
 				}
-			case <-waitTimer.C:
-				break copyFromWriterLoop
+			case <-timer.C:
+				break collect
 			}
 		}
-		waitTimer.Stop()
-	}
-
-	firstRound := true
-	pollConnection := true
-	for sendBuffer.Len() != 0 || firstRound {
-		firstRound = false
-		sendAmount := sendBuffer.Len()
-		if sendAmount > int(s.config.MaxWriteSize) {
-			sendAmount = int(s.config.MaxWriteSize)
-		}
-		data := sendBuffer.Next(sendAmount)
-		if len(data) != 0 {
-			pollConnection = false
-		}
-		for {
+		timer.Stop()
+		idle := buf.Len() == 0
+		for first := true; first || buf.Len() > 0; first = false {
+			data := buf.Next(min(buf.Len(), maxWriteSize))
 			ctx, cancel := netproxy.NewDialTimeoutContextFrom(s.ctx)
-			resp, err := s.tripper.RoundTrip(ctx, Request{Data: data, ConnectionTag: s.sessionID})
-			ctxErr := ctx.Err()
+			response, err := s.roundTrip(ctx, data)
 			cancel()
 			if err != nil {
-				if ctxErr != nil {
-					return
-				}
-				retry := time.NewTimer(time.Millisecond * time.Duration(s.config.FailedRetryIntervalMs))
-				select {
-				case <-s.ctx.Done():
-					retry.Stop()
-					return
-				case <-retry.C:
-				}
-				continue
+				return err
 			}
-			if len(resp.Data) != 0 {
-				pollConnection = false
+			if len(response) > 0 {
+				idle = false
 				select {
-				case s.readerChan <- resp.Data:
+				case s.readerChan <- response:
 				case <-s.ctx.Done():
-					return
+					return context.Cause(s.ctx)
 				}
 			}
-			break
 		}
-	}
-	if pollConnection {
-		s.currentWriteWait = int(s.config.BackoffFactor * float32(s.currentWriteWait))
-		if s.currentWriteWait > int(s.config.MaxPollingIntervalMs) {
-			s.currentWriteWait = int(s.config.MaxPollingIntervalMs)
+		if idle {
+			wait = min(max(wait*3/2, 10*time.Millisecond), time.Second)
+		} else {
+			wait = 0
 		}
-		if s.currentWriteWait < int(s.config.MinPollingIntervalMs) {
-			s.currentWriteWait = int(s.config.MinPollingIntervalMs)
-		}
-	} else {
-		s.currentWriteWait = 0
 	}
 }
 
-func (s *assemblerClientSession) Read(p []byte) (n int, err error) {
-	if s.readBuffer.Len() == 0 {
-		select {
-		case <-s.ctx.Done():
-			return 0, s.ctx.Err()
-		case data := <-s.readerChan:
-			s.readBuffer.Write(data)
-		}
+func (s *clientSession) roundTrip(ctx context.Context, data []byte) ([]byte, error) {
+	// RoundTrip may return an early response before it finishes reading or
+	// closing the request body. That asynchronous reader owns immutable bytes.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, bytes.NewReader(bytes.Clone(data)))
+	if err != nil {
+		return nil, err
 	}
-	n, err = s.readBuffer.Read(p)
-	if err == io.EOF {
-		s.readBuffer.Reset()
+	req.Header.Set("X-Session-ID", s.tag)
+	resp, err := s.transport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, netproxy.WrapFailure(fmt.Errorf("meek: rejected response %s", resp.Status), netproxy.Failure{Layer: netproxy.LayerProxy, Scope: netproxy.ScopeStream, Phase: netproxy.OpRead, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonRejected, Code: strconv.Itoa(resp.StatusCode)})
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize+1))
+	if len(body) > maxResponseSize {
+		return nil, errors.New("meek response exceeds maximum size")
+	}
+	return body, err
+}
+
+func (s *clientSession) Read(p []byte) (int, error) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if len(p) == 0 {
 		return 0, nil
 	}
-	return
+	select {
+	case <-s.readDeadline.Wait():
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
+	if len(s.pending) == 0 {
+		select {
+		case s.pending = <-s.readerChan:
+		default:
+		}
+	}
+	if len(s.pending) == 0 {
+		select {
+		case <-s.ctx.Done():
+			return 0, context.Cause(s.ctx)
+		case <-s.readDeadline.Wait():
+			return 0, os.ErrDeadlineExceeded
+		case s.pending = <-s.readerChan:
+		}
+	}
+	n := copy(p, s.pending)
+	s.pending = s.pending[n:]
+	if len(s.pending) == 0 {
+		s.pending = nil
+	}
+	return n, nil
 }
 
-func (s *assemblerClientSession) Write(p []byte) (n int, err error) {
-	buf := make([]byte, len(p))
-	copy(buf, p)
-	select {
-	case <-s.ctx.Done():
-		return 0, s.ctx.Err()
-	case s.writerChan <- buf:
-		return len(p), nil
+func (s *clientSession) Write(p []byte) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	written := 0
+	for len(p) > 0 {
+		if s.ctx.Err() != nil {
+			return written, context.Cause(s.ctx)
+		}
+		select {
+		case <-s.writeDeadline.Wait():
+			return written, os.ErrDeadlineExceeded
+		default:
+		}
+		n := min(len(p), maxWriteSize)
+		data := bytes.Clone(p[:n])
+		select {
+		case <-s.ctx.Done():
+			return written, context.Cause(s.ctx)
+		case <-s.writeDeadline.Wait():
+			return written, os.ErrDeadlineExceeded
+		case s.writerChan <- data:
+			written += n
+			p = p[n:]
+		}
+	}
+	return written, nil
+}
+
+func (s *clientSession) Close() error {
+	s.terminate(context.Canceled)
+	<-s.done
+	s.readMu.Lock()
+	s.pending = nil
+	for {
+		select {
+		case <-s.readerChan:
+		default:
+			s.readMu.Unlock()
+			return nil
+		}
 	}
 }
 
-func (s *assemblerClientSession) Close() error {
-	s.finish()
-	<-s.done
+func (s *clientSession) SetDeadline(deadline time.Time) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.closed {
+		return net.ErrClosed
+	}
+	s.readDeadline.Set(deadline)
+	s.writeDeadline.Set(deadline)
 	return nil
 }
-
-func (s *assemblerClientSession) LocalAddr() net.Addr  { return nil }
-func (s *assemblerClientSession) RemoteAddr() net.Addr { return nil }
+func (s *clientSession) SetReadDeadline(deadline time.Time) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.closed {
+		return net.ErrClosed
+	}
+	s.readDeadline.Set(deadline)
+	return nil
+}
+func (s *clientSession) SetWriteDeadline(deadline time.Time) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.closed {
+		return net.ErrClosed
+	}
+	s.writeDeadline.Set(deadline)
+	return nil
+}
+func (s *clientSession) LocalAddr() net.Addr  { return nil }
+func (s *clientSession) RemoteAddr() net.Addr { return netproxy.NewAddr("meek", s.url) }

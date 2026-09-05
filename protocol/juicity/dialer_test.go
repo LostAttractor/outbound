@@ -1,99 +1,51 @@
 package juicity
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"fmt"
+	"errors"
 	"net"
-	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
-	"github.com/daeuniverse/outbound/protocol/direct"
 )
 
-type Params struct {
-	Method, Passwd, Address, Port string
+type recoveryTestParent struct {
+	calls int
+	err   error
 }
 
-func TestTcp(t *testing.T) {
-	d, err := NewDialer(direct.SymmetricDirect, protocol.Header{
-		ProxyAddress: "example.com:50001",
-		SNI:          "",
-		Feature1:     "bbr",
-		TlsConfig:    &tls.Config{NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13, ServerName: "aabbcc.com"},
-		Cipher:       "",
-		User:         "00000000-0000-0000-0000-000000000000",
-		Password:     "mypassword",
-		IsClient:     true,
-		Flags:        0,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := http.Client{
-		Transport: &http.Transport{Dial: func(network string, addr string) (net.Conn, error) {
-			t.Log("target", addr)
-			c, err := d.DialContext(context.Background(), "tcp", addr)
-			if err != nil {
-				return nil, err
-			}
-			return &netproxy.FakeNetConn{
-				Conn:  c,
-				LAddr: nil,
-				RAddr: nil,
-			}, nil
-		}},
-	}
-	resp, err := c.Get("https://ipinfo.io")
-	if err != nil {
-		t.Fatal(err)
-	}
-	buf := new(bytes.Buffer)
-	buf.ReadFrom(resp.Body)
-	defer resp.Body.Close()
-	t.Log(buf.String())
+func (p *recoveryTestParent) DialContext(context.Context, string, string) (net.Conn, error) {
+	p.calls++
+	return nil, p.err
+}
+func (p *recoveryTestParent) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	p.calls++
+	return nil, p.err
 }
 
-func TestUdp(t *testing.T) {
-	d, err := NewDialer(direct.SymmetricDirect, protocol.Header{
-		ProxyAddress: "example.com:50001",
-		SNI:          "",
-		Feature1:     "bbr",
-		TlsConfig:    &tls.Config{NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13, ServerName: "aabbcc.com"},
-		Cipher:       "",
-		User:         "00000000-0000-0000-0000-000000000000",
-		Password:     "mypassword",
-		IsClient:     true,
-		Flags:        0,
-	})
+func TestRecoveryRejectsUnreadyDialWithoutWaiting(t *testing.T) {
+	want := errors.New("parent transport unavailable")
+	parent := &recoveryTestParent{err: want}
+	d, err := NewDialer(parent, protocol.Header{ProxyAddress: "127.0.0.1:443", User: "00000000-0000-0000-0000-000000000000", Feature1: "bbr", TlsConfig: &tls.Config{InsecureSkipVerify: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := net.Resolver{
-		PreferGo:     true,
-		StrictErrors: false,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			if !strings.HasPrefix(network, "udp") {
-				return nil, fmt.Errorf("unsupported network")
-			}
-			c, err := d.DialContext(context.Background(), "udp", address)
-			if err != nil {
-				return nil, err
-			}
-			return netproxy.NewFakeNetPacketConn(
-				c.(netproxy.PacketConn),
-				nil,
-				nil,
-			), nil
-		},
+	defer d.Close()
+	if _, err := d.DialContext(context.Background(), "tcp", "example.test:80"); !errors.Is(err, netproxy.ErrNotConnected) {
+		t.Fatalf("unready dial returned %v", err)
 	}
-	ips, err := resolver.LookupNetIP(context.TODO(), "ip", "www.baidu.com")
-	if err != nil {
-		t.Fatal(err)
+	if parent.calls != 0 {
+		t.Fatalf("unready data-plane dial attempted recovery: calls=%d", parent.calls)
 	}
-	t.Log(ips)
+	if err := d.Connect(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("Connect returned %v", err)
+	}
+	if d.Snapshot().State != netproxy.SessionDisconnected {
+		t.Fatalf("failed connect state: %+v", d.Snapshot())
+	}
+	if parent.calls != 1 {
+		t.Fatalf("Connect attempts=%d", parent.calls)
+	}
 }

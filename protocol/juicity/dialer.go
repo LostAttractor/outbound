@@ -6,14 +6,12 @@ import (
 	"io"
 	"math"
 	"net"
-	"strconv"
 	"time"
 
 	C "github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/shadowsocks"
-	"github.com/daeuniverse/outbound/protocol/trojanc"
 	"github.com/daeuniverse/outbound/protocol/tuic/common"
 	"github.com/daeuniverse/quic-go"
 	"github.com/google/uuid"
@@ -25,7 +23,7 @@ func init() {
 		if err != nil {
 			return netproxy.Layer{}, err
 		}
-		return netproxy.Layer{Data: dialer, Resources: []io.Closer{dialer}}, nil
+		return netproxy.Layer{Data: dialer, Sessions: []netproxy.Session{dialer}, Resources: []io.Closer{dialer}}, nil
 	})
 }
 
@@ -86,139 +84,106 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, err
 
 func (d *Dialer) Close() error { return d.clientRing.Close() }
 
-func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
-	return d.DialContext(ctx, "tcp", addr)
+func (d *Dialer) Snapshot() netproxy.StateEvent { return d.clientRing.Snapshot() }
+func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
+	return d.clientRing.WatchState(ctx)
 }
-
-func (d *Dialer) DialUdp(ctx context.Context, addr string) (c netproxy.PacketConn, err error) {
-	pktConn, err := d.DialContext(ctx, "udp", addr)
+func (d *Dialer) Connect(ctx context.Context) error {
+	proxyAddr, err := C.ResolveUDPAddr(d.proxyAddress)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return pktConn.(netproxy.PacketConn), nil
+	return d.clientRing.Connect(ctx, d.nextDialer, d.dialFuncFactory("udp", proxyAddr))
 }
 
-func (d *Dialer) dialFuncFactory(udpNetwork string, rAddr net.Addr) common.DialFunc {
-	return func(ctx context.Context, dialer netproxy.Dialer) (transport *quic.Transport, addr net.Addr, err error) {
-		conn, err := dialer.DialContext(ctx, udpNetwork, d.proxyAddress)
+func (d *Dialer) dialFuncFactory(_ string, rAddr net.Addr) common.DialFunc {
+	return func(ctx context.Context, dialer netproxy.Dialer) (*quic.Transport, net.Addr, error) {
+		conn, err := dialer.ListenPacket(ctx, d.proxyAddress)
 		if err != nil {
 			return nil, nil, err
 		}
-		pc := netproxy.NewFakeNetPacketConn(
-			conn.(netproxy.PacketConn),
-			net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
-			rAddr)
-		transport = &quic.Transport{Conn: pc}
-		return transport, rAddr, nil
+		netproxy.CaptureDependency(ctx, conn)
+		return &quic.Transport{Conn: conn}, rAddr, nil
 	}
 }
 
-func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c netproxy.Conn, err error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network == "udp" {
+		packet, err := d.ListenPacket(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return &netproxy.BindPacketConn{PacketConn: packet, Address: netproxy.NewAddr("udp", address)}, nil
+	}
+	if network != "tcp" {
+		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, network)
+	}
+	if err := netproxy.RequireConnected(d); err != nil {
+		return nil, err
+	}
+	metadata, err := protocol.ParseMetadata(address)
 	if err != nil {
 		return nil, err
 	}
-	switch magicNetwork.Network {
-	case "tcp", "udp":
-		mdata, err := protocol.ParseMetadata(addr)
-		if err != nil {
-			return nil, err
-		}
-		mdata.IsClient = true
-		proxyAddr, err := C.ResolveUDPAddr(d.proxyAddress)
-		if err != nil {
-			return nil, err
-		}
-		udpNetwork := network
-		if magicNetwork.Network == "tcp" {
-			udpNetwork = netproxy.MagicNetwork{
-				Network: "udp",
-				Mark:    magicNetwork.Mark,
-			}.Encode()
-		}
-		if magicNetwork.Network == "udp" {
-			switch mdata.Port {
-			// case 443, 8443, 5201:
-			case 0:
-				iv, psk, err := d.clientRing.DialAuth(ctx, &trojanc.Metadata{
-					Metadata: mdata,
-					Network:  magicNetwork.Network,
-				}, d.nextDialer, d.dialFuncFactory(udpNetwork, proxyAddr))
-				if err != nil {
-					return nil, err
-				}
-				key, err := underlayKey(psk)
-				if err != nil {
-					return nil, err
-				}
-				innerAddr, err := C.ResolveUDPAddr(net.JoinHostPort(mdata.Hostname, strconv.Itoa(int(mdata.Port))))
-				if err != nil {
-					return nil, err
-				}
-				transport, _, err := d.dialFuncFactory(udpNetwork, proxyAddr)(context.TODO(), d.nextDialer)
-				if err != nil {
-					return nil, err
-				}
-				return &TransportPacketConn{
-					Transport: transport,
-					proxyAddr: proxyAddr,
-					tgt:       innerAddr.AddrPort(),
-					key:       key,
-					firstIv:   iv,
-				}, nil
-			}
-		}
-		conn, err := d.clientRing.DialContext(ctx, &trojanc.Metadata{
-			Metadata: mdata,
-			Network:  magicNetwork.Network,
-		}, d.nextDialer,
-			d.dialFuncFactory(udpNetwork, proxyAddr),
-		)
-		if err != nil {
-			return nil, err
-		}
-		if magicNetwork.Network == "tcp" {
-			time.AfterFunc(100*time.Millisecond, func() {
-				// avoid the situation where the server sends messages first
-				if _, err = conn.Write(nil); err != nil {
-					return
-				}
-			})
-			return conn, nil
-		} else {
-			return &PacketConn{
-				Conn: conn,
-			}, nil
-		}
-
-	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, magicNetwork.Network)
+	conn, err := d.clientRing.DialContext(ctx, &Metadata{Metadata: metadata, Network: "tcp"})
+	if err != nil {
+		return nil, err
 	}
+	if err = protocol.Handshake(ctx, conn, func() error { _, err := conn.Write(nil); return err }); err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
-func underlayKey(psk []byte) (key *shadowsocks.Key, err error) {
-	return &shadowsocks.Key{
-		CipherConf: CipherConf,
-		MasterKey:  psk,
-	}, nil
-}
-
-func (d *Dialer) DialCmdMsg(ctx context.Context, cmd protocol.MetadataCmd) (c netproxy.Conn, err error) {
+func (d *Dialer) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	if err := netproxy.RequireConnected(d); err != nil {
+		return nil, err
+	}
+	metadata, err := protocol.ParseMetadata(address)
+	if err != nil {
+		return nil, err
+	}
+	m := &Metadata{Metadata: metadata, Network: "udp"}
+	if metadata.Port != 0 {
+		conn, err := d.clientRing.DialContext(ctx, m)
+		if err != nil {
+			return nil, err
+		}
+		if err = protocol.Handshake(ctx, conn, func() error { _, err := conn.Write(nil); return err }); err != nil {
+			return nil, err
+		}
+		return &PacketConn{Conn: conn}, nil
+	}
+	auth, err := d.clientRing.DialAuth(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			auth.lease.Invalidate(net.ErrClosed)
+		}
+	}()
 	proxyAddr, err := C.ResolveUDPAddr(d.proxyAddress)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := d.clientRing.DialContext(ctx, &trojanc.Metadata{
-		Metadata: protocol.Metadata{
-			Type:     protocol.MetadataTypeMsg,
-			Cmd:      cmd,
-			IsClient: true,
-		},
-	}, d.nextDialer,
-		d.dialFuncFactory("udp", proxyAddr),
-	)
+	conn, err := d.nextDialer.ListenPacket(ctx, d.proxyAddress)
 	if err != nil {
 		return nil, err
 	}
-	return conn, nil
+	packet := &TransportPacketConn{PacketConn: conn, proxyAddr: proxyAddr, target: netproxy.NewAddr("udp", address), key: &shadowsocks.Key{CipherConf: CipherConf, MasterKey: auth.Psk}, firstIv: auth.IV, authLease: auth.lease, lease: netproxy.NewLease(auth.lease.Resource(), auth.lease, netproxy.DependencyOf(conn)), done: make(chan struct{})}
+	if !packet.lease.Valid() {
+		_ = packet.Close()
+		return nil, packet.lease.Cause()
+	}
+	go func() {
+		select {
+		case <-packet.lease.Done():
+			_ = packet.Close()
+		case <-packet.done:
+		}
+	}()
+	transferred = true
+	return packet, nil
 }

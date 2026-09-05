@@ -1,6 +1,8 @@
 package trojan
 
 import (
+	"context"
+	cryptotls "crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -14,6 +16,7 @@ import (
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/protocol/shadowsocks"
 	"github.com/daeuniverse/outbound/transport/grpc"
 	"github.com/daeuniverse/outbound/transport/httpupgrade"
 	"github.com/daeuniverse/outbound/transport/ws"
@@ -62,6 +65,15 @@ func (s *Trojan) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (la
 		}
 	}()
 
+	var encryption []string
+	if s.Encryption != "" && s.Encryption != "none" {
+		encryption = strings.SplitN(s.Encryption, ";", 3)
+		if len(encryption) != 3 || encryption[0] != "ss" || encryption[1] == "" {
+			err = fmt.Errorf("invalid Trojan encryption: expected ss;method;password")
+			return
+		}
+	}
+
 	if s.Type != "grpc" { // grpc contains tls
 		tlsConfig := tls.TLSConfig{
 			Host:          proxyAddress,
@@ -89,11 +101,10 @@ func (s *Trojan) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (la
 		}
 	case "grpc":
 		transport := &grpc.Dialer{
-			ParentDialer:  layer.Data,
-			ServiceName:   s.ServiceName,
-			ServerName:    s.Sni,
-			Address:       proxyAddress,
-			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
+			ParentDialer: layer.Data,
+			ServiceName:  s.ServiceName,
+			Address:      proxyAddress,
+			TLSConfig:    &cryptotls.Config{ServerName: s.Sni, InsecureSkipVerify: s.AllowInsecure || option.AllowInsecure},
 		}
 		layer.Data = transport
 		layer.Sessions = append(layer.Sessions, transport)
@@ -113,22 +124,36 @@ func (s *Trojan) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (la
 			return
 		}
 	}
-	if strings.HasPrefix(s.Encryption, "ss;") {
-		fields := strings.SplitN(s.Encryption, ";", 3)
-		err = layer.AppendResult(protocol.Build("shadowsocks", layer.Data, protocol.Header{
+	if encryption != nil {
+		var encrypted netproxy.Dialer
+		encrypted, err = shadowsocks.NewDialer(layer.Data, protocol.Header{
 			ProxyAddress: proxyAddress,
-			Cipher:       fields[1],
-			Password:     fields[2],
-		}))
+			Cipher:       encryption[1],
+			Password:     encryption[2],
+		})
 		if err != nil {
 			return
 		}
+		layer.Data = shadowsocksTransport{encrypted.(*shadowsocks.Dialer)}
 	}
 	err = layer.AppendResult(protocol.Build("trojanc", layer.Data, protocol.Header{
 		ProxyAddress: proxyAddress,
 		Password:     s.Password,
 	}))
 	return
+}
+
+// Trojan owns the destination header; this layer only encrypts its TCP carrier.
+type shadowsocksTransport struct{ *shadowsocks.Dialer }
+
+func (d shadowsocksTransport) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("%w: Trojan Shadowsocks transport: %s", netproxy.UnsupportedTunnelTypeError, network)
+	}
+	return d.DialTCPTransport(ctx)
+}
+func (shadowsocksTransport) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	return nil, fmt.Errorf("%w: Trojan Shadowsocks transport requires TCP", netproxy.UnsupportedTunnelTypeError)
 }
 
 func ParseTrojanURL(u string) (data *Trojan, err error) {

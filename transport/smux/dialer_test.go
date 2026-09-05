@@ -169,6 +169,20 @@ func TestPoolExpandsAndDistributesConcurrentStreams(t *testing.T) {
 	if err := dialer.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	// Provision the requested pool through the same Connect entry point used
+	// by the recovery coordinator before distributing business streams.
+	p := dialer.pool()
+	p.mu.Lock()
+	for _, slot := range p.slots[1:] {
+		p.activateLocked(slot)
+	}
+	p.publishStateLocked(nil)
+	p.mu.Unlock()
+	for range maxConnections - 1 {
+		if err := dialer.Connect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	connections := make([]net.Conn, streamCount)
 	errs := make([]error, streamCount)
 	var wg sync.WaitGroup
@@ -229,6 +243,14 @@ func TestOpenStreamFailureUsesAnotherSession(t *testing.T) {
 	if err := dialer.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	p := dialer.pool()
+	p.mu.Lock()
+	p.activateLocked(p.slots[1])
+	p.publishStateLocked(nil)
+	p.mu.Unlock()
+	if err := dialer.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	conn, err := dialer.DialContext(context.Background(), "tcp", "failover.example:443")
 	if err != nil {
 		t.Fatalf("DialContext did not fail over: %v", err)
@@ -240,6 +262,10 @@ func TestOpenStreamFailureUsesAnotherSession(t *testing.T) {
 			_ = session.Close()
 		}
 	}()
+	deadline := time.Now().Add(time.Second)
+	for failedConn != nil && !failedConn.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if failedConn == nil || !failedConn.closed.Load() {
 		t.Fatal("session with failed OpenStream was not closed")
 	}
@@ -251,7 +277,7 @@ func TestOpenStreamFailureUsesAnotherSession(t *testing.T) {
 	}
 }
 
-func TestOpenStreamFailureTriesRemainingSlots(t *testing.T) {
+func TestBusinessDialDoesNotRetryFailedConnections(t *testing.T) {
 	replacementErr := errors.New("replacement connection failed")
 	parent := &pipeDialer{
 		server: make(chan net.Conn),
@@ -275,9 +301,33 @@ func TestOpenStreamFailureTriesRemainingSlots(t *testing.T) {
 	if err := dialer.Connect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := dialer.DialContext(context.Background(), "tcp", "failover.example:443"); err == nil {
+		t.Fatal("failed stream unexpectedly succeeded")
+	}
+	parent.mu.Lock()
+	attempts := parent.dialCount
+	parent.mu.Unlock()
+	if attempts != 1 {
+		t.Fatalf("business dial started %d connections", attempts)
+	}
+	if err := dialer.Connect(context.Background()); !errors.Is(err, replacementErr) {
+		t.Fatalf("recovery error=%v", err)
+	}
+	if _, err := dialer.DialContext(context.Background(), "tcp", "failover.example:443"); err == nil {
+		t.Fatal("unready business dial succeeded")
+	}
+	parent.mu.Lock()
+	attempts = parent.dialCount
+	parent.mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("business dial bypassed backoff: %d attempts", attempts)
+	}
+	if err := dialer.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	conn, err := dialer.DialContext(context.Background(), "tcp", "failover.example:443")
 	if err != nil {
-		t.Fatalf("DialContext stopped after one replacement failure: %v", err)
+		t.Fatal(err)
 	}
 	defer conn.Close()
 	serverSessions := waitForSmuxSessions(t, accepted, 2)
@@ -369,6 +419,18 @@ func TestPoolStaysConnectedWhenOneSessionFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer first.Close()
+	// Request the second slot, then let the owner establish it.
+	requested, err := dialer.DialContext(context.Background(), "tcp", "request-expansion.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer requested.Close()
+	if !dialer.Snapshot().RecoveryRequired {
+		t.Fatal("pool did not request expansion")
+	}
+	if err := dialer.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	second, err := dialer.DialContext(context.Background(), "tcp", "second.example:443")
 	if err != nil {
 		t.Fatal(err)
@@ -388,6 +450,18 @@ func TestPoolStaysConnectedWhenOneSessionFails(t *testing.T) {
 		t.Fatalf("pool state after one session failed = %s, want connected", state)
 	}
 
+	if !dialer.Snapshot().RecoveryRequired {
+		t.Fatal("degraded pool did not request replenishment")
+	}
+	parent.mu.Lock()
+	attempts := parent.dialCount
+	parent.mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("unexpected data-plane connection attempts: %d", attempts)
+	}
+	if err := dialer.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	replacement, err := dialer.DialContext(context.Background(), "tcp", "replacement.example:443")
 	if err != nil {
 		t.Fatal(err)
@@ -479,5 +553,31 @@ func TestProtocolErrorPublishesState(t *testing.T) {
 	}
 	if err := dialer.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPoolEpisodeUsesBoundedSlotGenerationWatermarks(t *testing.T) {
+	p := newSmuxPool(&Smux{}, 2)
+	defer p.Close()
+	first, second := netproxy.NewResourceRef(), netproxy.NewResourceRef()
+	event := func(ref netproxy.ResourceRef) netproxy.StateEvent {
+		return netproxy.StateEvent{Resource: ref, Cause: netproxy.WrapFailure(errors.New("carrier failed"), netproxy.Failure{Resource: ref, Scope: netproxy.ScopeSharedResource, Layer: netproxy.LayerTCP})}
+	}
+	p.observeSlotFailureLocked(p.slots[0], event(first))
+	p.observeSlotFailureLocked(p.slots[0], event(first))
+	if p.episode != 1 {
+		t.Fatalf("duplicate root created %d episodes", p.episode)
+	}
+	newer := first
+	newer.Generation++
+	p.observeSlotFailureLocked(p.slots[0], event(newer))
+	p.observeSlotFailureLocked(p.slots[0], event(first))
+	p.observeSlotFailureLocked(p.slots[1], event(second))
+	if p.episode != 3 {
+		t.Fatalf("generation watermark episodes=%d", p.episode)
+	}
+	snapshot := p.Snapshot()
+	if snapshot.Resource != p.ref || snapshot.Resource.OwnerID == 0 || snapshot.EpisodeID != 3 {
+		t.Fatalf("pool publishing identity=%+v", snapshot)
 	}
 }

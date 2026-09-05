@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"strings"
 
+	"fmt"
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	tls2 "github.com/daeuniverse/outbound/transport/tls"
-	"github.com/samber/oops"
 )
 
 // HttpProxy is an HTTP/HTTPS proxy.
@@ -63,12 +63,12 @@ func BuildHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netprox
 	}
 	transport, _ := strconv.ParseBool(query.Get("transport"))
 	s := &HttpProxy{
-		ParentDialer: layer.Data,
-		https:        https,
-		transport:    transport,
-		Addr:         u.Host,
-		Path:         path,
-		Host:         query.Get("host"),
+		StatelessDialer: protocol.StatelessDialer{ParentDialer: layer.Data},
+		https:           https,
+		transport:       transport,
+		Addr:            u.Host,
+		Path:            path,
+		Host:            query.Get("host"),
 	}
 	if u.User != nil {
 		s.HaveAuth = true
@@ -78,6 +78,9 @@ func BuildHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netprox
 	s.pool = newH2ConnsPool(s.ParentDialer, s.Addr)
 	layer.Data = s
 	layer.Resources = append(layer.Resources, s)
+	if https {
+		layer.Sessions = append(layer.Sessions, s.pool)
+	}
 	return layer, nil
 }
 
@@ -85,19 +88,46 @@ func (s *HttpProxy) DialContext(ctx context.Context, network, addr string) (net.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+
+	s.pool.mu.Lock()
 	if s.pool.ctx.Err() != nil {
+		s.pool.mu.Unlock()
 		return nil, net.ErrClosed
 	}
-	switch network {
-	case "tcp":
-		return NewConn(s.ParentDialer, s, addr, network), nil
-	default:
-		return nil, oops.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
+	s.pool.operations.Add(1)
+	s.pool.mu.Unlock()
+	defer s.pool.operations.Done()
+	operation, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.pool.ctx, cancel)
+	defer func() { stop(); cancel() }()
+	ctx = operation
+
+	if network != "tcp" {
+		return nil, fmt.Errorf("%w: HTTP %s", netproxy.UnsupportedTunnelTypeError, network)
 	}
+	if s.https {
+		if err := netproxy.RequireConnected(s.pool); err != nil {
+			return nil, err
+		}
+		raw, h2, err := s.pool.getConn(ctx, true)
+		if err != nil {
+			return nil, err
+		}
+		if h2 != nil {
+			return s.connectHTTP2(ctx, raw, h2, addr)
+		}
+		return s.connectHTTP1(ctx, raw, addr)
+	}
+	raw, err := s.ParentDialer.DialContext(ctx, network, s.Addr)
+	if err != nil {
+		return nil, err
+	}
+	netproxy.CaptureDependency(ctx, raw)
+	return s.connectHTTP1(ctx, raw, addr)
 }
 
 func (s *HttpProxy) ListenPacket(ctx context.Context, network string) (net.PacketConn, error) {
-	return nil, oops.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
+	return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, network)
 }
 
 func (s *HttpProxy) Close() error {

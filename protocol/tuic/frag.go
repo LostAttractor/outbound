@@ -2,80 +2,68 @@ package tuic
 
 import (
 	"bytes"
-	"net/netip"
-
 	"github.com/daeuniverse/quic-go"
+	"net"
+	"time"
 )
 
-func fragWriteNative(quicConn *quic.Conn, packet *Packet, buf *bytes.Buffer, fragSize int) (err error) {
-	fullPayload := packet.DATA
-	off := 0
-	fragID := uint8(0)
-	if fragSize == 0 {
-		fragSize = 1
+func fragWriteNative(conn *quic.Conn, packet *packetFrame, buf *bytes.Buffer, size int) error {
+	if size <= 0 || (len(packet.DATA)+size-1)/size > 255 {
+		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(max(0, size) * 255)}
 	}
-	fragCount := uint8((len(fullPayload) + fragSize - 1) / fragSize) // round up
-	packet.FRAG_TOTAL = fragCount
-	for off < len(fullPayload) {
-		payloadSize := len(fullPayload) - off
-		if payloadSize > fragSize {
-			payloadSize = fragSize
+	count := (len(packet.DATA) + size - 1) / size
+	for id, offset := 0, 0; offset < len(packet.DATA); id++ {
+		fragment := *packet
+		fragment.FRAG_ID, fragment.FRAG_TOTAL = uint8(id), uint8(count)
+		end := min(len(packet.DATA), offset+size)
+		fragment.DATA = packet.DATA[offset:end]
+		if id > 0 {
+			fragment.ADDR = &address{TYPE: AtypNone}
 		}
-		frag := packet
-		frag.FRAG_ID = fragID
-		frag.SIZE = uint16(payloadSize)
-		frag.DATA = fullPayload[off : off+payloadSize]
-		off += payloadSize
-		fragID++
 		buf.Reset()
-		err = frag.WriteTo(buf)
-		if err != nil {
-			return
+		if err := fragment.appendTo(buf); err != nil {
+			return err
 		}
-		data := buf.Bytes()
-		err = quicConn.SendDatagram(data)
-		if err != nil {
-			return
+		if err := conn.SendDatagram(buf.Bytes()); err != nil {
+			return err
 		}
-		packet.ADDR.TYPE = AtypNone // avoid "fragment 2/2: address in non-first fragment"
+		offset = end
 	}
-	return
+	return nil
 }
 
 type deFragger struct {
-	pkgID uint16
-	frags []*Packet
-	count uint8
+	frags   []*packetFrame
+	count   int
+	size    int
+	updated time.Time
 }
 
-func (d *deFragger) Feed(m *Packet, p []byte) (n int, addrPort netip.AddrPort, assembled bool) {
-	if m.FRAG_TOTAL <= 1 {
-		return copy(p, m.DATA), m.ADDR.UDPAddr().AddrPort(), true
+func (d *deFragger) Feed(packet *packetFrame, p []byte) (int, net.Addr, bool) {
+	if packet.FRAG_TOTAL < 2 || packet.FRAG_ID >= packet.FRAG_TOTAL {
+		return 0, nil, false
 	}
-	if m.FRAG_ID >= m.FRAG_TOTAL {
-		// wtf is this?
-		return
+	if len(d.frags) != int(packet.FRAG_TOTAL) {
+		d.frags = make([]*packetFrame, packet.FRAG_TOTAL)
+		d.count, d.size = 0, 0
 	}
-	if d.count == 0 {
-		// new message, clear previous state
-		d.pkgID = m.PKT_ID
-		d.frags = make([]*Packet, m.FRAG_TOTAL)
-		d.count = 1
-		d.frags[m.FRAG_ID] = m
-	} else if d.frags[m.FRAG_ID] == nil {
-		d.frags[m.FRAG_ID] = m
-		d.count++
-		if int(d.count) == len(d.frags) {
-			// all fragments received, assemble
-			for _, frag := range d.frags {
-				if n >= len(p) {
-					break
-				}
-				n += copy(p[n:], frag.DATA)
-			}
-			d.count = 0
-			return n, d.frags[0].ADDR.UDPAddr().AddrPort(), true
-		}
+	if d.frags[packet.FRAG_ID] != nil {
+		return 0, nil, false
 	}
-	return
+	d.size += len(packet.DATA)
+	if d.size > 65535 {
+		d.frags = nil
+		d.count, d.size = 0, 0
+		return 0, nil, false
+	}
+	d.frags[packet.FRAG_ID] = packet
+	d.count++
+	if d.count != len(d.frags) {
+		return 0, nil, false
+	}
+	n := 0
+	for _, fragment := range d.frags {
+		n += copy(p[n:], fragment.DATA)
+	}
+	return n, d.frags[0].ADDR.netAddr(), true
 }

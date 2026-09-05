@@ -6,7 +6,6 @@ import (
 	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/quic-go"
 )
 
@@ -17,13 +16,6 @@ var (
 )
 
 type DialFunc func(ctx context.Context, dialer netproxy.Dialer) (transport *quic.Transport, addr net.Addr, err error)
-
-type Client interface {
-	DialContextWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn DialFunc) (net.Conn, error)
-	ListenPacketWithDialer(ctx context.Context, metadata *protocol.Metadata, dialer netproxy.Dialer, dialFn DialFunc) (net.PacketConn, error)
-	OpenStreams() int64
-	Close()
-}
 
 type UdpRelayMode uint8
 

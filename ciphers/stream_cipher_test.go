@@ -1,6 +1,7 @@
 package ciphers
 
 import (
+	"bytes"
 	"crypto/rc4"
 	"reflect"
 	"testing"
@@ -8,6 +9,27 @@ import (
 	"github.com/daeuniverse/outbound/common"
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
 )
+
+func TestCloneUsesFreshIV(t *testing.T) {
+	cipher, err := NewStreamCipher("aes-128-cfb", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := cipher.InitEncrypt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := cipher.Clone().InitEncrypt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first, second) {
+		t.Fatal("clone reused a connection IV")
+	}
+	if _, err := NewStreamCipher("seed-cfb", "password"); err == nil {
+		t.Fatal("unimplemented SEED must not silently select RC2")
+	}
+}
 
 const text = "Don't tell me the moon is shining; show me the glint of light on broken glass."
 

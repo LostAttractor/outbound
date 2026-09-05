@@ -11,6 +11,7 @@ func uTLSConfigFromTLSConfig(config *tls.Config) *utls.Config {
 	return &utls.Config{
 		ServerName:         config.ServerName,
 		InsecureSkipVerify: config.InsecureSkipVerify,
+		NextProtos:         append([]string(nil), config.NextProtos...),
 	}
 }
 

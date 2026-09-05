@@ -32,3 +32,6 @@ func (c *BindPacketConn) Read(b []byte) (n int, err error) {
 func (c *BindPacketConn) RemoteAddr() net.Addr {
 	return c.Address
 }
+
+func (c *CloseWriteConn) DependencyLease() *Lease { return DependencyOf(c.Conn) }
+func (c *BindPacketConn) DependencyLease() *Lease { return DependencyOf(c.PacketConn) }

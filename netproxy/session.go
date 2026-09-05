@@ -34,9 +34,22 @@ func (s SessionState) String() string {
 }
 
 type StateEvent struct {
-	Seq   uint64
-	State SessionState
-	Cause error
+	// PublisherID identifies a logical event source, including channels whose
+	// physical transport identity cannot be observed. It is not a ResourceRef.
+	PublisherID      uint64
+	Seq              uint64
+	State            SessionState
+	Cause            error
+	Resource         ResourceRef
+	ReadinessVersion uint64
+	EpisodeID        uint64
+	Accepting        bool
+	UsableCapacity   int
+	RecoveryExecutor RecoveryExecutor
+	RecoveryRequired bool
+	RecoveryPhase    string
+	BlockedBy        string
+	Layer            FailureLayer
 }
 
 // Session is the lifecycle of a dialer-level shared connection. WatchState's
@@ -94,10 +107,13 @@ type StateBroadcaster struct {
 }
 
 func NewStateBroadcaster(initial SessionState) *StateBroadcaster {
-	return newStateBroadcaster(StateEvent{State: initial})
+	return newStateBroadcaster(StateEvent{State: initial, Accepting: initial == SessionConnected, UsableCapacity: boolCapacity(initial == SessionConnected)})
 }
 
 func newStateBroadcaster(initial StateEvent) *StateBroadcaster {
+	if initial.PublisherID == 0 {
+		initial.PublisherID = NewResourceRef().OwnerID
+	}
 	return &StateBroadcaster{
 		current:  initial,
 		watchers: make(map[*stateWatcher]struct{}),
@@ -165,25 +181,55 @@ func (b *StateBroadcaster) Transition(state SessionState, cause error) bool {
 	return b.publishLocked(state, cause)
 }
 
-func (b *StateBroadcaster) update(state SessionState, cause error) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.current.State == SessionClosed || b.current.State == state && b.current.Cause == nil && cause == nil {
-		return false
+func boolCapacity(accepting bool) int {
+	if accepting {
+		return 1
 	}
-	return b.publishLocked(state, cause)
+	return 0
 }
 
 func (b *StateBroadcaster) publishLocked(state SessionState, cause error) bool {
-	b.current = StateEvent{Seq: b.current.Seq + 1, State: state, Cause: cause}
 	event := b.current
+	event.State, event.Cause = state, cause
+	event.Accepting = state == SessionConnected
+	event.UsableCapacity = boolCapacity(event.Accepting)
+	return b.publishEventWithReadinessLocked(event, true)
+}
+
+// Publish commits owner facts. Seq is the diagnostic revision; readiness only
+// changes when usable dependencies change, never for a retry countdown alone.
+// Resource owners supply EpisodeID; the broadcaster does not infer accidents.
+func (b *StateBroadcaster) Publish(event StateEvent) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.current.State == SessionClosed {
+		return false
+	}
+	return b.publishEventWithReadinessLocked(event, true)
+}
+func (b *StateBroadcaster) publishEventWithReadinessLocked(event StateEvent, resourceAffectsReadiness bool) bool {
+	previous := b.current
+	if event.PublisherID == 0 {
+		event.PublisherID = previous.PublisherID
+	}
+	event.Seq = previous.Seq + 1
+	requestedReadiness := event.ReadinessVersion
+	event.ReadinessVersion = previous.ReadinessVersion
+	if previous.State != event.State || previous.Accepting != event.Accepting ||
+		resourceAffectsReadiness && previous.Resource != event.Resource && (previous.Accepting || event.Accepting) {
+		event.ReadinessVersion++
+	}
+	if requestedReadiness > event.ReadinessVersion {
+		event.ReadinessVersion = requestedReadiness
+	}
+	b.current = event
 	for watcher := range b.watchers {
 		watcher.enqueue(event)
-		if state == SessionClosed {
+		if event.State == SessionClosed {
 			watcher.finish(false)
 		}
 	}
-	if state == SessionClosed {
+	if event.State == SessionClosed {
 		clear(b.watchers)
 	}
 	return true
@@ -222,25 +268,65 @@ func NewSessionGroup(children ...Session) *SessionGroup {
 }
 
 func (s *SessionGroup) aggregateLocked() StateEvent {
+	aggregate := StateEvent{State: SessionConnected, Accepting: true, UsableCapacity: 1, RecoveryExecutor: RecoveryDaemon, RecoveryPhase: "ready"}
+	if len(s.states) == 0 {
+		return aggregate
+	}
+	// Diagnostic attribution and chain readiness are separate. Prefer the first
+	// unready dependency, otherwise retain the first useful pool diagnostic;
+	// when healthy the outermost session is the user-facing resource.
+	selected := len(s.states) - 1
+	selectedFailure := false
+	capacity := s.states[0].UsableCapacity
+	executor := RecoveryLibraryManaged
+	required := false
 	state := SessionConnected
-	var cause error
-	for _, child := range s.states {
-		switch child.State {
-		case SessionClosed:
-			return StateEvent{State: SessionClosed, Cause: child.Cause}
-		case SessionDisconnected:
-			state = SessionDisconnected
-			if cause == nil {
-				cause = child.Cause
-			}
-		case SessionConnecting:
-			if state == SessionConnected {
+	accepting := true
+	for i, child := range s.states {
+		required = required || child.RecoveryRequired
+		gate := child.State == SessionConnected && child.Accepting
+		if child.RecoveryExecutor != RecoveryLibraryManaged {
+			executor = RecoveryDaemon
+		}
+		if child.State == SessionClosed {
+			selected = i
+			state = SessionClosed
+			accepting = false
+			selectedFailure = true
+			break
+		}
+		if !gate {
+			accepting = false
+			if child.State == SessionDisconnected || !child.Accepting && child.State == SessionConnected {
+				if state != SessionDisconnected {
+					selected = i
+					selectedFailure = true
+				}
+				state = SessionDisconnected
+			} else if state == SessionConnected {
+				selected = i
+				selectedFailure = true
 				state = SessionConnecting
-				cause = child.Cause
+			}
+		} else {
+			capacity = min(capacity, child.UsableCapacity)
+			if child.Cause != nil && !selectedFailure {
+				selected = i
+				selectedFailure = true
 			}
 		}
 	}
-	return StateEvent{State: state, Cause: cause}
+	aggregate = s.states[selected]
+	aggregate.State, aggregate.Accepting, aggregate.RecoveryExecutor = state, accepting, executor
+	if !accepting {
+		capacity = 0
+
+	}
+	// Capacity is the minimum currently usable shared-resource count along the
+	// chain; it is not a promise about protocol stream limits.
+	aggregate.UsableCapacity = capacity
+	aggregate.RecoveryRequired = required
+	return aggregate
 }
 
 func (s *SessionGroup) watch(index int, child Session) {
@@ -261,9 +347,21 @@ func (s *SessionGroup) update(index int, event StateEvent) bool {
 	if event.Seq <= s.states[index].Seq {
 		return true
 	}
+	readinessChanged := s.states[index].ReadinessVersion != event.ReadinessVersion
 	s.states[index] = event
 	aggregate := s.aggregateLocked()
-	s.state.update(aggregate.State, aggregate.Cause)
+	current := s.state.Snapshot()
+	aggregate.ReadinessVersion = current.ReadinessVersion
+	if readinessChanged {
+		aggregate.ReadinessVersion++
+	}
+	if aggregate.State != current.State || aggregate.Cause != current.Cause || aggregate.Accepting != current.Accepting || aggregate.ReadinessVersion != current.ReadinessVersion || aggregate.RecoveryExecutor != current.RecoveryExecutor || aggregate.RecoveryPhase != current.RecoveryPhase || aggregate.BlockedBy != current.BlockedBy || aggregate.UsableCapacity != current.UsableCapacity || aggregate.Resource != current.Resource || aggregate.EpisodeID != current.EpisodeID || aggregate.Layer != current.Layer || aggregate.RecoveryRequired != current.RecoveryRequired || aggregate.PublisherID != current.PublisherID {
+		s.state.mu.Lock()
+		if s.state.current.State != SessionClosed {
+			s.state.publishEventWithReadinessLocked(aggregate, false)
+		}
+		s.state.mu.Unlock()
+	}
 	return true
 }
 
@@ -280,10 +378,24 @@ func (s *SessionGroup) Connect(ctx context.Context) error {
 			return err
 		}
 	}
+	for i, child := range s.children {
+		event := child.Snapshot()
+		if !s.update(i, event) {
+			return net.ErrClosed
+		}
+		if event.State != SessionConnected || !event.Accepting {
+			return ErrDependencyInvalid
+		}
+	}
 	return nil
 }
 
-func (s *SessionGroup) Snapshot() StateEvent { return s.state.Snapshot() }
+func (s *SessionGroup) Snapshot() StateEvent {
+	for i, child := range s.children {
+		s.update(i, child.Snapshot())
+	}
+	return s.state.Snapshot()
+}
 
 func (s *SessionGroup) WatchState(ctx context.Context) <-chan StateEvent {
 	return s.state.WatchState(ctx)
@@ -305,7 +417,7 @@ func RequireConnected(session Session) error {
 	if event.State == SessionClosed {
 		return net.ErrClosed
 	}
-	if event.State != SessionConnected {
+	if event.State != SessionConnected || !event.Accepting {
 		return ErrNotConnected
 	}
 	return nil

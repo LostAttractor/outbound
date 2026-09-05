@@ -22,7 +22,7 @@ func TestClientRingCloseStopsAndClosesClients(t *testing.T) {
 	if err := ring.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if _, err := ring.DialContextWithDialer(context.Background(), nil, nil, nil); !errors.Is(err, common.ErrClientClosed) {
+	if _, err := ring.DialContext(context.Background(), nil); !errors.Is(err, common.ErrClientClosed) {
 		t.Fatalf("DialContextWithDialer after Close returned %v", err)
 	}
 }

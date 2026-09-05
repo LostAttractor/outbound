@@ -24,8 +24,6 @@ func (p padding) String() string {
 }
 
 var (
-	authRequestPadding  = padding{Min: 256, Max: 2048}
-	authResponsePadding = padding{Min: 256, Max: 2048}
-	tcpRequestPadding   = padding{Min: 64, Max: 512}
-	tcpResponsePadding  = padding{Min: 128, Max: 1024}
+	authRequestPadding = padding{Min: 256, Max: 2048}
+	tcpRequestPadding  = padding{Min: 64, Max: 512}
 )

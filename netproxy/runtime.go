@@ -242,3 +242,6 @@ func (r *Runtime) Wait(ctx context.Context) error {
 		}
 	}
 }
+
+func (c *runtimeConn) DependencyLease() *Lease       { return DependencyOf(c.Conn) }
+func (c *runtimePacketConn) DependencyLease() *Lease { return DependencyOf(c.PacketConn) }

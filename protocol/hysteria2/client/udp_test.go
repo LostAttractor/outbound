@@ -67,3 +67,13 @@ func TestUDPConnExpiresIncompletePacket(t *testing.T) {
 		t.Fatalf("expired defraggers retained: %d", len(u.defraggers))
 	}
 }
+
+func TestUDPConnLimitsIncompletePackets(t *testing.T) {
+	u := new(udpConn)
+	for i := 0; i < udpMessageChanSize+100; i++ {
+		u.feedDefrag(&protocol.UDPMessage{PacketID: uint16(i), FragCount: 2, Addr: "127.0.0.1:53", Data: []byte("pending")})
+	}
+	if len(u.defraggers) != udpMessageChanSize {
+		t.Fatalf("pending packets=%d", len(u.defraggers))
+	}
+}

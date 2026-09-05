@@ -3,8 +3,7 @@ package proto
 import (
 	"strings"
 
-	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/pool/bytes"
+	"bytes"
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto"
 )
 
@@ -21,12 +20,10 @@ type pktRndMethod func(random *crypto.Shift128plusContext, lastHash []byte) int
 
 type IProtocol interface {
 	InitWithServerInfo(s *ServerInfo)
-	Encode(data []byte) ([]byte, error)
-	Decode(data []byte) ([]byte, int, error)
+	Encode(data []byte, dst *bytes.Buffer) error
+	Decode(data []byte, dst *bytes.Buffer) (int, error)
 	EncodePkt(buf *bytes.Buffer) error
-	DecodePkt(data []byte) (pool.Bytes, error)
-	SetData(data interface{})
-	GetData() interface{}
+	DecodePkt(data []byte) ([]byte, error)
 	GetOverhead() int
 }
 

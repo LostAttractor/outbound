@@ -7,7 +7,7 @@ import (
 type Creator func() IObfs
 
 type constructor struct {
-	New Creator
+	New      Creator
 	Overhead int
 }
 
@@ -20,8 +20,6 @@ type IObfs interface {
 	GetServerInfo() (s *ServerInfo)
 	Encode(data []byte) (encodedData []byte, err error)
 	Decode(data []byte) (decodedData []byte, needSendBack bool, err error)
-	SetData(data interface{})
-	GetData() interface{}
 }
 
 func register(name string, c *constructor) {

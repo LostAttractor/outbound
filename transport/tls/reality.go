@@ -51,6 +51,7 @@ func aesgcmPreferred(ciphers []uint16) bool
 
 type RealityUConn struct {
 	*utls.UConn
+	lease      *netproxy.Lease
 	ServerName string
 	AuthKey    []byte
 	Verified   bool
@@ -184,7 +185,7 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c net.
 		}()
 		retry := 0
 	retryHandshake:
-		uConn := &RealityUConn{}
+		uConn := &RealityUConn{lease: netproxy.DependencyOf(c)}
 		utlsConfig := &utls.Config{
 			VerifyPeerCertificate:  uConn.VerifyPeerCertificate,
 			ServerName:             x.serverName,

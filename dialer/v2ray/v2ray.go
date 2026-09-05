@@ -1,12 +1,12 @@
 package v2ray
 
 import (
+	cryptotls "crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/daeuniverse/outbound/common"
@@ -33,6 +33,8 @@ type V2Ray struct {
 	Port          string `json:"port"`
 	ID            string `json:"id"`
 	Aid           string `json:"aid"`
+	Cipher        string `json:"scy,omitempty"`
+	Encryption    string `json:"encryption,omitempty"`
 	Net           string `json:"net"`
 	Type          string `json:"type"`
 	Host          string `json:"host"`
@@ -61,9 +63,6 @@ func NewV2Ray(link string) (dialer.Builder, *dialer.Property, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		if s.Aid != "0" && s.Aid != "" {
-			return nil, nil, fmt.Errorf("%w: aid: %v, we only support AEAD encryption", dialer.UnexpectedFieldErr, s.Aid)
-		}
 	case strings.HasPrefix(link, "vless://"):
 		s, err = ParseVlessURL(link)
 		if err != nil {
@@ -71,6 +70,9 @@ func NewV2Ray(link string) (dialer.Builder, *dialer.Property, error) {
 		}
 	default:
 		return nil, nil, dialer.InvalidParameterErr
+	}
+	if _, err := s.dataCipher(); err != nil {
+		return nil, nil, err
 	}
 	return s, &dialer.Property{
 		Name:     s.Ps,
@@ -97,8 +99,21 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		return
 	}
 
-	if s.TLS == "reality" && s.Protocol != "vless" {
-		err = fmt.Errorf("only VLESS supports reality")
+	dataCipher, cipherErr := s.dataCipher()
+	if cipherErr != nil {
+		err = cipherErr
+		return
+	}
+
+	switch s.TLS {
+	case "", "none", "tls":
+	case "reality":
+		if s.Protocol != "vless" || strings.ToLower(s.Net) != "tcp" {
+			err = fmt.Errorf("REALITY requires VLESS over TCP")
+			return
+		}
+	default:
+		err = fmt.Errorf("%w: security: %s", dialer.UnexpectedFieldErr, s.TLS)
 		return
 	}
 	sni := s.SNI
@@ -109,7 +124,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 	switch strings.ToLower(s.Net) {
 	case "ws":
 		scheme := "ws"
-		if s.TLS == "tls" || s.TLS == "reality" {
+		if s.TLS == "tls" {
 			scheme = "wss"
 		}
 		host := s.Host
@@ -122,6 +137,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 			Path:          s.Path,
 			Hostname:      host,
 			Sni:           sni,
+			Alpn:          s.Alpn,
 			AllowInsecure: s.AllowInsecure,
 		}
 		if err = layer.AppendResult(wsBuilder.Build(option, dialer.NewUpstream(layer.Data))); err != nil {
@@ -150,6 +166,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 				tlsConfig := tls.TLSConfig{
 					Host:          proxyAddress,
 					Sni:           sni,
+					Alpn:          s.Alpn,
 					AllowInsecure: s.AllowInsecure,
 				}
 				err = layer.AppendResult(tlsConfig.Build(option, dialer.NewUpstream(layer.Data)))
@@ -160,11 +177,12 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		}
 	case "grpc":
 		transport := &grpc.Dialer{
-			ParentDialer:  layer.Data,
-			ServiceName:   s.Path,
-			ServerName:    sni,
-			Address:       proxyAddress,
-			AllowInsecure: s.AllowInsecure || option.AllowInsecure,
+			StatelessDialer: protocol.StatelessDialer{ParentDialer: layer.Data},
+			ServiceName:     s.Path,
+			Address:         proxyAddress,
+		}
+		if s.TLS == "tls" {
+			transport.TLSConfig = &cryptotls.Config{ServerName: sni, InsecureSkipVerify: s.AllowInsecure || option.AllowInsecure}
 		}
 		layer.Data = transport
 		layer.Sessions = append(layer.Sessions, transport)
@@ -194,7 +212,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 			return
 		}
 	case "meek":
-		if strings.HasPrefix(s.Path, "https://") && s.TLS != "tls" && s.TLS != "utls" {
+		if strings.HasPrefix(s.Path, "https://") && s.TLS != "tls" {
 			err = fmt.Errorf("%w: meek: tls should be enabled", dialer.InvalidParameterErr)
 			return
 		}
@@ -243,7 +261,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 
 	err = layer.AppendResult(protocol.Build(s.Protocol, layer.Data, protocol.Header{
 		ProxyAddress: proxyAddress,
-		Cipher:       getAutoCipher(),
+		Cipher:       dataCipher,
 		Password:     s.ID,
 		Feature1:     s.Flow,
 		//Flags:        protocol.Flags_VMess_UsePacketAddr,
@@ -268,6 +286,7 @@ func ParseVlessURL(vless string) (data *V2Ray, err error) {
 		Path:          u.Query().Get("path"),
 		TLS:           u.Query().Get("security"),
 		Flow:          u.Query().Get("flow"),
+		Encryption:    u.Query().Get("encryption"),
 		Alpn:          u.Query().Get("alpn"),
 		AllowInsecure: false,
 		Fingerprint:   u.Query().Get("fp"),
@@ -298,80 +317,74 @@ func ParseVlessURL(vless string) (data *V2Ray, err error) {
 	return data, nil
 }
 
-func ParseVmessURL(vmess string) (data *V2Ray, err error) {
-	var info V2Ray
-	// perform base64 decoding and unmarshal to VmessInfo
-	raw, err := common.Base64StdDecode(vmess[8:])
+func ParseVmessURL(link string) (*V2Ray, error) {
+	payload, ok := strings.CutPrefix(link, "vmess://")
+	if !ok {
+		return nil, dialer.InvalidParameterErr
+	}
+	encoded, query, _ := strings.Cut(payload, "?")
+	raw, err := common.Base64StdDecode(encoded)
 	if err != nil {
-		raw, err = common.Base64UrlDecode(vmess[8:])
+		raw, err = common.Base64UrlDecode(encoded)
 	}
 	if err != nil {
-		// not in json format, try to resolve as vmess://BASE64(Security:ID@Add:Port)?remarks=Ps&obfsParam=Host&Path=Path&obfs=Net&tls=TLS
-		var u *url.URL
-		u, err = url.Parse(vmess)
+		return nil, fmt.Errorf("%w: VMess payload encoding", dialer.InvalidParameterErr)
+	}
+	var info V2Ray
+	if strings.HasPrefix(strings.TrimSpace(raw), "{") {
+		if err := jsoniter.Unmarshal([]byte(raw), &info); err != nil {
+			return nil, err
+		}
+	} else {
+		// Compact form: BASE64(cipher:UUID@server:port)?obfs=... .
+		credentials, server, ok := strings.Cut(raw, "@")
+		if !ok {
+			return nil, fmt.Errorf("%w: VMess credentials/address", dialer.InvalidParameterErr)
+		}
+		info.Cipher, info.ID, ok = strings.Cut(credentials, ":")
+		if !ok {
+			return nil, fmt.Errorf("%w: VMess cipher/UUID", dialer.InvalidParameterErr)
+		}
+		info.Add, info.Port, err = net.SplitHostPort(server)
 		if err != nil {
-			return
+			return nil, fmt.Errorf("%w: VMess server address", dialer.InvalidParameterErr)
 		}
-		re := regexp.MustCompile(`.*:(.+)@(.+):(\d+)`)
-		s := strings.Split(vmess[8:], "?")[0]
-		s, err = common.Base64StdDecode(s)
+		q, err := url.ParseQuery(query)
 		if err != nil {
-			s, _ = common.Base64UrlDecode(s)
+			return nil, err
 		}
-		subMatch := re.FindStringSubmatch(s)
-		if subMatch == nil {
-			err = fmt.Errorf("unrecognized vmess address")
-			return
+		info.Ps = q.Get("remarks")
+		if info.Ps == "" {
+			info.Ps = q.Get("remark")
 		}
-		q := u.Query()
-		ps := q.Get("remarks")
-		if ps == "" {
-			ps = q.Get("remark")
+		info.Net = q.Get("obfs")
+		info.Host = jsoniter.Get([]byte(q.Get("obfsParam")), "host").ToString()
+		info.Path = q.Get("path")
+		info.Aid = q.Get("alterId")
+		if info.Aid == "" {
+			info.Aid = q.Get("aid")
 		}
-		obfs := q.Get("obfs")
-		obfsParam := q.Get("obfsParam")
-		path := q.Get("path")
-		if obfs == "kcp" || obfs == "mkcp" {
-			m := make(map[string]string)
-			//cater to v2rayN definition
-			_ = jsoniter.Unmarshal([]byte(obfsParam), &m)
-			path = m["seed"]
-			obfsParam = ""
-		}
-		aid := q.Get("alterId")
-		if aid == "" {
-			aid = q.Get("aid")
-		}
-		sni := q.Get("peer")
-		info = V2Ray{
-			ID:            subMatch[1],
-			Add:           subMatch[2],
-			Port:          subMatch[3],
-			Ps:            ps,
-			Host:          jsoniter.Get([]byte(obfsParam), "host").ToString(),
-			Path:          path,
-			Net:           obfs,
-			Aid:           aid,
-			TLS:           map[string]string{"1": "tls"}[q.Get("tls")],
-			SNI:           sni,
-			AllowInsecure: false,
+		info.SNI = q.Get("peer")
+		switch q.Get("tls") {
+		case "", "0":
+		case "1":
+			info.TLS = "tls"
+		default:
+			return nil, fmt.Errorf("%w: VMess TLS option", dialer.UnexpectedFieldErr)
 		}
 		if info.Net == "websocket" {
 			info.Net = "ws"
 		}
-	} else {
-		err = jsoniter.Unmarshal([]byte(raw), &info)
-		if err != nil {
-			return
-		}
 	}
-	// correct the wrong vmess as much as possible
 	if strings.HasPrefix(info.Host, "/") && info.Path == "" {
 		info.Path = info.Host
 		info.Host = ""
 	}
 	if info.Aid == "" {
 		info.Aid = "0"
+	}
+	if info.Net == "" {
+		info.Net = "tcp"
 	}
 	info.Protocol = "vmess"
 	return &info, nil
@@ -384,6 +397,7 @@ func (s *V2Ray) ExportToURL() string {
 		var query = make(url.Values)
 		common.SetValue(&query, "type", s.Net)
 		common.SetValue(&query, "security", s.TLS)
+		common.SetValue(&query, "encryption", s.Encryption)
 		switch s.Net {
 		case "websocket", "ws", "http", "h2", "httpupgrade":
 			common.SetValue(&query, "path", s.Path)

@@ -22,7 +22,7 @@ func init() {
 		if err != nil {
 			return netproxy.Layer{}, err
 		}
-		return netproxy.Layer{Data: dialer, Resources: []io.Closer{dialer}}, nil
+		return netproxy.Layer{Data: dialer, Sessions: []netproxy.Session{dialer}, Resources: []io.Closer{dialer}}, nil
 	})
 }
 
@@ -31,14 +31,9 @@ type Dialer struct {
 
 	proxyAddress string
 	nextDialer   netproxy.Dialer
-	metadata     protocol.Metadata
 }
 
 func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, error) {
-	metadata := protocol.Metadata{
-		IsClient: header.IsClient,
-	}
-
 	id, err := uuid.Parse(header.User)
 	if err != nil {
 		return nil, fmt.Errorf("parse UUID: %w", err)
@@ -79,81 +74,62 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, err
 		}, 10),
 		proxyAddress: header.ProxyAddress,
 		nextDialer:   nextDialer,
-		metadata:     metadata,
 	}, nil
 }
 
 func (d *Dialer) Close() error { return d.clientRing.Close() }
 
-func (d *Dialer) DialTcp(ctx context.Context, addr string) (c netproxy.Conn, err error) {
-	return d.DialContext(ctx, "tcp", addr)
+func (d *Dialer) Snapshot() netproxy.StateEvent { return d.clientRing.Snapshot() }
+func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
+	return d.clientRing.WatchState(ctx)
 }
-
-func (d *Dialer) DialUdp(ctx context.Context, addr string) (c netproxy.PacketConn, err error) {
-	pktConn, err := d.DialContext(ctx, "udp", addr)
+func (d *Dialer) Connect(ctx context.Context) error {
+	proxyAddr, err := C.ResolveUDPAddr(d.proxyAddress)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return pktConn.(netproxy.PacketConn), nil
+	return d.clientRing.Connect(ctx, d.nextDialer, d.dialFuncFactory("udp", proxyAddr))
 }
 
-func (d *Dialer) dialFuncFactory(udpNetwork string, rAddr net.Addr) common.DialFunc {
-	return func(ctx context.Context, dialer netproxy.Dialer) (transport *quic.Transport, addr net.Addr, err error) {
-		conn, err := dialer.DialContext(ctx, udpNetwork, d.proxyAddress)
+func (d *Dialer) dialFuncFactory(_ string, rAddr net.Addr) common.DialFunc {
+	return func(ctx context.Context, dialer netproxy.Dialer) (*quic.Transport, net.Addr, error) {
+		conn, err := dialer.ListenPacket(ctx, d.proxyAddress)
 		if err != nil {
 			return nil, nil, err
 		}
-		pc := netproxy.NewFakeNetPacketConn(
-			conn.(netproxy.PacketConn),
-			net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
-			rAddr,
-		)
-		transport = &quic.Transport{Conn: pc}
-		return transport, rAddr, nil
+		netproxy.CaptureDependency(ctx, conn)
+		return &quic.Transport{Conn: conn}, rAddr, nil
 	}
 }
 
-func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (c netproxy.Conn, err error) {
-	magicNetwork, err := netproxy.ParseMagicNetwork(network)
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network == "udp" {
+		packet, err := d.ListenPacket(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return &netproxy.BindPacketConn{PacketConn: packet, Address: netproxy.NewAddr("udp", address)}, nil
+	}
+	if network != "tcp" {
+		return nil, fmt.Errorf("%w: %s", netproxy.UnsupportedTunnelTypeError, network)
+	}
+	if err := netproxy.RequireConnected(d); err != nil {
+		return nil, err
+	}
+	metadata, err := protocol.ParseMetadata(address)
 	if err != nil {
 		return nil, err
 	}
-	switch magicNetwork.Network {
-	case "tcp", "udp":
-		mdata, err := protocol.ParseMetadata(addr)
-		if err != nil {
-			return nil, err
-		}
-		mdata.IsClient = d.metadata.IsClient
-		proxyAddr, err := C.ResolveUDPAddr(d.proxyAddress)
-		if err != nil {
-			return nil, err
-		}
-		udpNetwork := network
-		if magicNetwork.Network == "tcp" {
-			udpNetwork = netproxy.MagicNetwork{
-				Network: "udp",
-				Mark:    magicNetwork.Mark,
-			}.Encode()
-			tcpConn, err := d.clientRing.DialContextWithDialer(ctx, &mdata, d.nextDialer,
-				d.dialFuncFactory(udpNetwork, proxyAddr),
-			)
-			if err != nil {
-				return nil, err
-			}
-			return tcpConn, nil
-		} else {
-			udpConn, err := d.clientRing.ListenPacketWithDialer(ctx, &mdata, d.nextDialer,
-				d.dialFuncFactory(udpNetwork, proxyAddr),
-			)
-			if err != nil {
-				return nil, err
-			}
-			udpConn.(*quicStreamPacketConn).target = addr
-			return udpConn, nil
-		}
+	return d.clientRing.DialContext(ctx, &metadata)
+}
 
-	default:
-		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, magicNetwork.Network)
+func (d *Dialer) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	if err := netproxy.RequireConnected(d); err != nil {
+		return nil, err
 	}
+	metadata, err := protocol.ParseMetadata(address)
+	if err != nil {
+		return nil, err
+	}
+	return d.clientRing.ListenPacket(ctx, &metadata)
 }

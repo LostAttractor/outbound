@@ -31,6 +31,9 @@ type Dialer struct {
 
 func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
 	conf := ciphers.Aead2022CiphersConf[header.Cipher]
+	if conf == nil {
+		return nil, fmt.Errorf("unsupported shadowsocks_2022 cipher: %s", header.Cipher)
+	}
 	keyStrList := strings.Split(header.Password, ":")
 	pskList := make([][]byte, len(keyStrList))
 	for i, keyStr := range keyStrList {
@@ -77,7 +80,12 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 		if err != nil {
 			return nil, err
 		}
-		return NewTCPConn(conn, d.conf, d.pskList, d.uPSK, d.sg, addrInfo, nil), nil
+		client := NewTCPConn(conn, d.conf, d.pskList, d.uPSK, d.sg, addrInfo)
+		if err = protocol.Handshake(ctx, client, func() error { _, err := client.Write(nil); return err }); err != nil {
+			return nil, err
+		}
+		return client, nil
+
 	case "udp":
 		conn, err := d.ListenPacket(ctx, d.proxyAddress)
 		if err != nil {
@@ -98,5 +106,5 @@ func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn,
 	if err != nil {
 		return nil, err
 	}
-	return NewUdpConn(conn, d.conf, d.blockCipherEncrypt, d.blockCipherDecrypt, d.pskList, d.uPSK, nil)
+	return NewUdpConn(conn, d.conf, d.blockCipherEncrypt, d.blockCipherDecrypt, d.pskList, d.uPSK)
 }

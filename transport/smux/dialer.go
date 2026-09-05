@@ -62,6 +62,8 @@ type smuxResource struct {
 type monitoredConn struct {
 	net.Conn
 	reportOnce       sync.Once
+	failureMu        sync.Mutex
+	failureCause     error
 	failed           chan error
 	broken           atomic.Bool
 	expectedVersion  byte
@@ -74,6 +76,9 @@ func (c *monitoredConn) report(err error) {
 	if err != nil {
 		c.broken.Store(true)
 		c.reportOnce.Do(func() {
+			c.failureMu.Lock()
+			c.failureCause = err
+			c.failureMu.Unlock()
 			select {
 			case c.failed <- err:
 			default:
@@ -179,6 +184,7 @@ func (s *Smux) establish(ctx context.Context) (*smuxResource, error) {
 	if err != nil {
 		return nil, err
 	}
+	netproxy.CaptureDependency(ctx, conn)
 	_, err = common.Invoke(ctx, func() (any, error) {
 		return conn.Write([]byte{Version0, ProtocolSmux})
 	}, func() {
@@ -279,9 +285,27 @@ func (s *Smux) observe(ctx context.Context, handle *netproxy.SingleSessionHandle
 		cause = net.ErrClosed
 	case cause = <-resource.monitor.failed:
 	}
-	handle.Disconnect(cause)
+	if reported := resource.monitor.cause(); reported != nil {
+		cause = reported
+	}
+	fact := netproxy.ClassifyFailure(cause)
+	fact.Resource, fact.Scope = handle.Ref(), netproxy.ScopeSharedResource
+	if fact.Layer == netproxy.LayerUnknown {
+		fact.Layer = netproxy.LayerSMUX
+	}
+	if cause == smux.ErrInvalidProtocol {
+		fact.Reason = netproxy.ReasonProtocol
+	}
+	handle.Disconnect(netproxy.WrapFailure(cause, fact))
 }
 
 func (s *Smux) Close() error {
 	return s.pool().Close()
 }
+
+func (c *monitoredConn) cause() error {
+	c.failureMu.Lock()
+	defer c.failureMu.Unlock()
+	return c.failureCause
+}
+func (c *monitoredConn) DependencyLease() *netproxy.Lease { return netproxy.DependencyOf(c.Conn) }

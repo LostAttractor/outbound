@@ -158,12 +158,6 @@ func newRC4Stream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
 	return rc4.NewCipher(key)
 }
 
-func newSeedStream(key, iv []byte, doe DecOrEnc) (cipher.Stream, error) {
-	// TODO: SEED block cipher implementation is required
-	block, err := rc2.New(key, 16)
-	return newCFBStream(block, err, key, iv, doe)
-}
-
 type NoneStream struct {
 	cipher.Stream
 }
@@ -205,7 +199,6 @@ var streamCipherMethod = map[string]*cipherInfo{
 	"camellia-256-cfb": {32, 16, newCamelliaStream},
 	"idea-cfb":         {16, 8, newIdeaStream},
 	"rc2-cfb":          {16, 8, newRC2Stream},
-	"seed-cfb":         {16, 8, newSeedStream},
 	"rc4":              {16, 0, newRC4Stream},
 	"none":             {16, 0, newNoneStream},
 	"plain":            {16, 0, newNoneStream},
@@ -225,9 +218,6 @@ type StreamCipher struct {
 func NewStreamCipher(method, password string) (c *StreamCipher, err error) {
 	if password == "" {
 		return nil, errEmptyPassword
-	}
-	if method == "" {
-		method = "rc4-md5"
 	}
 	mi, ok := streamCipherMethod[method]
 	if !ok {
@@ -294,47 +284,15 @@ func (c *StreamCipher) Decrypt(dst, src []byte) {
 	c.dec.XORKeyStream(dst, src)
 }
 
-// Clone creates a new cipher at it's initial state.
+// Clone creates an independent connection cipher with a fresh IV.
 func (c *StreamCipher) Clone() *StreamCipher {
-	// This optimization maybe not necessary. But without this function, we
-	// need to maintain a table cache for newTableCipher and use lock to
-	// protect concurrent access to that cache.
-
-	// AES and DES ciphers does not return specific types, so it's difficult
-	// to create copy. But their initialization time is less than 4000ns on my
-	// 2.26 GHz Intel Core 2 Duo processor. So no need to worry.
-
-	// Currently, blow-fish and cast5 initialization cost is an order of
-	// magnitude slower than other ciphers. (I'm not sure whether this is
-	// because the current implementation is not highly optimized, or this is
-	// the nature of the algorithm.)
-
-	nc := *c
-	nc.enc = nil
-	nc.dec = nil
-	return &nc
+	return &StreamCipher{key: c.key, info: c.info}
 }
 
 func (c *StreamCipher) Key() []byte {
 	return c.key
 }
 
-func (c *StreamCipher) IV() []byte {
-	return c.iv
-}
-
-func (c *StreamCipher) SetIV(iv []byte) {
-	c.iv = iv
-}
-
-func (c *StreamCipher) SetKey(key []byte) {
-	c.key = key
-}
-
 func (c *StreamCipher) InfoIVLen() int {
 	return c.info.ivLen
-}
-
-func (c *StreamCipher) InfoKeyLen() int {
-	return c.info.keyLen
 }

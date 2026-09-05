@@ -65,6 +65,7 @@ func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 	}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.transport = &http.Transport{
+		ForceAttemptHTTP2: true,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := m.nextDialer.DialContext(ctx, network, addr)
 			if err != nil {
@@ -89,25 +90,7 @@ func (m *Dialer) DialContext(ctx context.Context, network, addr string) (c net.C
 	}
 	switch network {
 	case "tcp":
-		tripper := &httpTripperClient{
-			url:          m.url,
-			roundTripper: m.transport,
-		}
-
-		clientConfig := &config{
-			MaxWriteSize:             65536,
-			WaitSubsequentWriteMs:    10,
-			InitialPollingIntervalMs: 100,
-			MaxPollingIntervalMs:     1000,
-			MinPollingIntervalMs:     10,
-			BackoffFactor:            1.5,
-			FailedRetryIntervalMs:    1000,
-		}
-
-		session, err := newClientSession(m.ctx, tripper, clientConfig, &m.workers)
-		if err != nil {
-			return nil, err
-		}
+		session := newClientSession(m.ctx, m.transport, m.url, &m.workers)
 		if err := ctx.Err(); err != nil {
 			_ = session.Close()
 			return nil, err

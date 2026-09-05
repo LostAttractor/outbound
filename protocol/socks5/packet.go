@@ -1,108 +1,133 @@
 // Modified from https://github.com/nadoo/glider/tree/v0.16.2
-
 package socks5
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"sync"
 
-	"github.com/daeuniverse/outbound/common"
-
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
 )
 
-// PktConn .
 type PktConn struct {
 	net.PacketConn
-	ctrlConn net.Conn // tcp control conn
-	server   net.Addr
+	ctrlConn    net.Conn
+	server      net.Addr
+	lease       *netproxy.Lease
+	closeOnce   sync.Once
+	closeErr    error
+	controlDone chan struct{}
+	leaseDone   chan struct{}
 }
 
-// NewPktConn returns a PktConn, the writeAddr must be *net.UDPAddr or *net.UnixAddr.
-func NewPktConn(c net.PacketConn, ctrlConn net.Conn, server net.Addr) *PktConn {
-	pc := &PktConn{
-		PacketConn: c,
-		ctrlConn:   ctrlConn,
-		server:     server,
-	}
-
+func NewPktConn(c net.PacketConn, ctrl net.Conn, server net.Addr) *PktConn {
+	pc := &PktConn{PacketConn: c, ctrlConn: ctrl, server: server,
+		lease:       netproxy.NewLease(netproxy.NewResourceRef(), netproxy.DependencyOf(c), netproxy.DependencyOf(ctrl)),
+		controlDone: make(chan struct{}), leaseDone: make(chan struct{})}
 	go func() {
-		buf := pool.GetBuffer(1)
-		defer pool.PutBuffer(buf)
+		defer close(pc.controlDone)
+		var b [1]byte
 		for {
-			_, err := ctrlConn.Read(buf)
-			if err, ok := err.(net.Error); ok && err.Timeout() {
+			_, err := ctrl.Read(b[:])
+			if err == nil {
 				continue
 			}
-			pc.PacketConn.Close()
-			// log.F("[socks5] dialudp udp associate end")
+			onlyTimeout := true
+			for _, failure := range netproxy.Failures(err) {
+				if failure.Reason != netproxy.ReasonDeadline || failure.Scope == netproxy.ScopeSharedResource {
+					onlyTimeout = false
+				}
+			}
+			if onlyTimeout {
+				continue
+			}
+			if err == io.EOF {
+				err = netproxy.WrapFailure(err, netproxy.Failure{Scope: netproxy.ScopeStream, Layer: netproxy.LayerProxy, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonClosed, Phase: netproxy.OpRead})
+			}
+			pc.shutdown(err)
 			return
 		}
 	}()
-
+	go func() {
+		defer close(pc.leaseDone)
+		<-pc.lease.Done()
+		pc.shutdown(pc.lease.Cause())
+	}()
 	return pc
 }
 
-// ReadFrom overrides the original function from transport.PacketConn.
-func (pc *PktConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	buf := pool.GetBuffer(len(b))
+func (pc *PktConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	if !pc.lease.Valid() {
+		return 0, nil, pc.lease.Cause()
+	}
+	buf := pool.GetBuffer(65535)
 	defer pool.PutBuffer(buf)
-
-	n, _, err = pc.PacketConn.ReadFrom(buf)
+	n, _, err := pc.PacketConn.ReadFrom(buf)
 	if err != nil {
-		return
+		return 0, nil, errors.Join(err, pc.lease.Cause())
 	}
-
-	if n < 3 {
-		return n, nil, errors.New("not enough size to get addr")
+	if n < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0 {
+		return 0, nil, netproxy.WrapFailure(fmt.Errorf("invalid SOCKS5 UDP reserved/fragment fields"), netproxy.Failure{Scope: netproxy.ScopeOperation, Layer: netproxy.LayerProxy, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonProtocol, Phase: netproxy.OpRead})
 	}
-
-	// https://www.rfc-editor.org/rfc/rfc1928#section-7
-	// +----+------+------+----------+----------+----------+
-	// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-	// +----+------+------+----------+----------+----------+
-	// | 2  |  1   |  1   | Variable |    2     | Variable |
-	// +----+------+------+----------+----------+----------+
-	tgtAddr := socks.SplitAddr(buf[3:n])
-	if tgtAddr == nil {
-		return n, nil, errors.New("can not get target addr")
-	}
-
-	addr, err = common.ResolveUDPAddr(tgtAddr.String())
+	reader := bytes.NewReader(buf[3:n])
+	addr, err := ReadAddr(reader)
 	if err != nil {
-		return n, nil, errors.New("wrong target addr")
+		return 0, nil, netproxy.WrapFailure(err, netproxy.Failure{Scope: netproxy.ScopeOperation, Layer: netproxy.LayerProxy, Origin: netproxy.OriginPeer, Reason: netproxy.ReasonProtocol, Phase: netproxy.OpRead})
 	}
-
-	n = copy(b, buf[3+len(tgtAddr):n])
-	return
+	payloadLen := reader.Len()
+	copied := copy(b, buf[n-payloadLen:n])
+	if copied < payloadLen {
+		return copied, addr, io.ErrShortBuffer
+	}
+	return copied, addr, nil
 }
 
-// WriteTo overrides the original function from transport.PacketConn.
 func (pc *PktConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if !pc.lease.Valid() {
+		return 0, pc.lease.Cause()
+	}
+	if addr == nil {
+		return 0, ErrInvalidAddress
+	}
 	target, err := socks.ParseAddr(addr.String())
 	if err != nil {
-		return 0, fmt.Errorf("invalid addr: %w", err)
+		return 0, err
 	}
-
-	tgtLen := len(target)
-	buf := pool.GetBuffer(3 + tgtLen + len(b))
-	defer pool.PutBuffer(buf)
-
-	copy(buf, []byte{0, 0, 0})
-	copy(buf[3:], target)
-	copy(buf[3+tgtLen:], b)
-
-	n, err := pc.PacketConn.WriteTo(buf, pc.server)
-	if n > tgtLen+3 {
-		return n - tgtLen - 3, err
+	if 3+len(target)+len(b) > 65507 {
+		return 0, fmt.Errorf("SOCKS5 UDP datagram exceeds 65507 bytes")
 	}
-
-	return 0, err
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	buf.Write([]byte{0, 0, 0})
+	buf.Write(target)
+	buf.Write(b)
+	n, err := pc.PacketConn.WriteTo(buf.Bytes(), pc.server)
+	if n != buf.Len() {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return 0, errors.Join(err, pc.lease.Cause())
+	}
+	return len(b), err
 }
 
-// Close .
+func (pc *PktConn) shutdown(cause error) {
+	pc.closeOnce.Do(func() {
+		pc.lease.Invalidate(cause)
+		pc.closeErr = errors.Join(pc.ctrlConn.Close(), pc.PacketConn.Close())
+	})
+}
+
 func (pc *PktConn) Close() error {
-	return errors.Join(pc.ctrlConn.Close(), pc.PacketConn.Close())
+	pc.shutdown(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Origin: netproxy.OriginLocalCleanup, Scope: netproxy.ScopeStream}))
+	<-pc.controlDone
+	<-pc.leaseDone
+	return pc.closeErr
 }
+
+func (pc *PktConn) DependencyLease() *netproxy.Lease { return pc.lease }

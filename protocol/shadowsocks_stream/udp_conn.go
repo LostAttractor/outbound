@@ -1,156 +1,112 @@
 package shadowsocks_stream
 
 import (
+	"bytes"
 	"fmt"
-	"net/netip"
+	"io"
+	"net"
+	"strconv"
 
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol/infra/socks"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
-// UdpConn the struct that override the netproxy.Conn methods
+// UdpConn encrypts one datagram per Read/Write; its parent is connected to the proxy.
 type UdpConn struct {
-	netproxy.PacketConn
-	cipher      *ciphers.StreamCipher
-	defaultAddr socks.Addr
-	proxyAddr   string
+	net.Conn
+	cipher *ciphers.StreamCipher
 }
 
-func NewUdpConn(c netproxy.PacketConn, cipher *ciphers.StreamCipher, defaultAddr socks.Addr, proxyAddr string) *UdpConn {
-	return &UdpConn{
-		PacketConn:  c,
-		cipher:      cipher,
-		defaultAddr: defaultAddr,
-		proxyAddr:   proxyAddr,
+func NewUDPConn(conn net.Conn, cipher *ciphers.StreamCipher) *UdpConn {
+	return &UdpConn{Conn: conn, cipher: cipher}
+}
+func (c *UdpConn) Cipher() *ciphers.StreamCipher    { return c.cipher }
+func (c *UdpConn) DependencyLease() *netproxy.Lease { return netproxy.DependencyOf(c.Conn) }
+func (c *UdpConn) Write(p []byte) (int, error) {
+	ivLen := c.cipher.InfoIVLen()
+	if len(p)+ivLen > 65535 {
+		return 0, fmt.Errorf("shadowsocks datagram too large: %d", len(p))
 	}
-}
-
-func (c *UdpConn) Cipher() *ciphers.StreamCipher {
-	return c.cipher
-}
-
-func (c *UdpConn) ReadFrom(b []byte) (n int, from netip.AddrPort, err error) {
-	n, _, err = c.PacketConn.ReadFrom(b)
+	buf := pool.GetBuffer(ivLen + len(p))
+	defer pool.PutBuffer(buf)
+	enc, err := c.cipher.NewEncryptor(buf[:ivLen])
 	if err != nil {
-		return n, netip.AddrPort{}, err
+		return 0, err
 	}
-
-	if n < c.cipher.InfoIVLen() {
-		return 0, netip.AddrPort{}, fmt.Errorf("packet too short")
+	enc.XORKeyStream(buf[ivLen:], p)
+	n, err := c.Conn.Write(buf)
+	if err == nil && n != len(buf) {
+		err = io.ErrShortWrite
 	}
-	dec, err := c.cipher.NewDecryptor(b[:c.cipher.InfoIVLen()])
 	if err != nil {
-		return 0, netip.AddrPort{}, err
+		return 0, err
 	}
-	data := b[c.cipher.InfoIVLen():n]
-	dec.XORKeyStream(data, data)
+	return len(p), nil
+}
+func (c *UdpConn) Read(p []byte) (int, error) {
+	buf := pool.GetBuffer(65535)
+	defer pool.PutBuffer(buf)
+	n, err := c.Conn.Read(buf)
+	if err != nil {
+		return 0, err
+	}
+	ivLen := c.cipher.InfoIVLen()
+	if n < ivLen {
+		return 0, fmt.Errorf("shadowsocks datagram has a truncated IV")
+	}
+	dec, err := c.cipher.NewDecryptor(buf[:ivLen])
+	if err != nil {
+		return 0, err
+	}
+	payload := buf[ivLen:n]
+	dec.XORKeyStream(payload, payload)
+	n = copy(p, payload)
+	if n < len(payload) {
+		return n, io.ErrShortBuffer
+	}
+	return n, nil
+}
 
-	addr := socks.SplitAddr(data)
+type packetConn struct{ *UdpConn }
+
+func (c *packetConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if addr == nil {
-		return 0, netip.AddrPort{}, fmt.Errorf("no addr present")
+		return 0, socks5.ErrInvalidAddress
 	}
-
-	from, err = netip.ParseAddrPort(addr.String())
+	buf := pool.GetBytesBuffer()
+	defer pool.PutBytesBuffer(buf)
+	if err := socks5.WriteAddr(addr.String(), buf); err != nil {
+		return 0, err
+	}
+	buf.Write(p)
+	if _, err := c.UdpConn.Write(buf.Bytes()); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	buf := pool.GetBuffer(65535)
+	defer pool.PutBuffer(buf)
+	n, err := c.UdpConn.Read(buf)
 	if err != nil {
-		return 0, netip.AddrPort{}, fmt.Errorf("bad addr: %w", err)
+		return 0, nil, err
 	}
-
-	n = copy(b, data[len(addr):])
-
+	reader := bytes.NewReader(buf[:n])
+	addr, err := socks5.ReadAddrInfo(reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	host := addr.Hostname
+	if addr.IP.IsValid() {
+		host = addr.IP.String()
+	}
+	from := netproxy.NewAddr("udp", net.JoinHostPort(host, strconv.Itoa(int(addr.Port))))
+	size := reader.Len()
+	n, _ = reader.Read(p)
+	if n < size {
+		return n, from, io.ErrShortBuffer
+	}
 	return n, from, nil
-}
-
-func (c *UdpConn) writeTo(p []byte, addr socks.Addr) (n int, err error) {
-	infoIvLen := c.cipher.InfoIVLen()
-	buf := pool.Get(infoIvLen + len(addr) + len(p))
-	defer pool.Put(buf)
-	enc, err := c.cipher.NewEncryptor(buf)
-	if err != nil {
-		return 0, err
-	}
-	copy(buf[infoIvLen:], addr)
-	copy(buf[infoIvLen+len(addr):], p)
-	enc.XORKeyStream(buf[infoIvLen:], buf[infoIvLen:])
-	if _, err = c.PacketConn.WriteTo(buf, c.proxyAddr); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (c *UdpConn) WriteTo(p []byte, to string) (n int, err error) {
-	addr, err := socks.ParseAddr(to)
-	if err != nil {
-		return 0, err
-	}
-	return c.writeTo(p, addr)
-}
-
-func (c *UdpConn) Write(b []byte) (n int, err error) {
-	return c.writeTo(b, c.defaultAddr)
-}
-
-func (c *UdpConn) WriteTransport(p []byte) (n int, err error) {
-	infoIvLen := c.cipher.InfoIVLen()
-	buf := pool.Get(infoIvLen + len(p))
-	defer pool.Put(buf)
-	enc, err := c.cipher.NewEncryptor(buf)
-	if err != nil {
-		return 0, err
-	}
-	copy(buf[infoIvLen:], p)
-	enc.XORKeyStream(buf[infoIvLen:], buf[infoIvLen:])
-	if _, err = c.PacketConn.WriteTo(buf, c.proxyAddr); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (c *UdpConn) Read(b []byte) (n int, err error) {
-	n, _, err = c.ReadFrom(b)
-	return n, err
-}
-
-func (c *UdpConn) ReadTransport(b []byte) (n int, err error) {
-
-	n, _, err = c.PacketConn.ReadFrom(b)
-	if err != nil {
-		return n, err
-	}
-
-	if n < c.cipher.InfoIVLen() {
-		return 0, fmt.Errorf("packet too short")
-	}
-	dec, err := c.cipher.NewDecryptor(b[:c.cipher.InfoIVLen()])
-	if err != nil {
-		return 0, err
-	}
-	data := b[c.cipher.InfoIVLen():n]
-	dec.XORKeyStream(data, data)
-
-	n = copy(b, data)
-
-	return n, err
-}
-
-type UdpTransportConn struct {
-	*UdpConn
-}
-
-func (c *UdpTransportConn) WriteTo(p []byte, to string) (n int, err error) {
-	return c.UdpConn.WriteTransport(p)
-}
-
-func (c *UdpTransportConn) Write(b []byte) (n int, err error) {
-	return c.UdpConn.WriteTransport(b)
-}
-
-func (c *UdpTransportConn) Read(b []byte) (n int, err error) {
-	return c.UdpConn.ReadTransport(b)
-}
-
-func (c *UdpTransportConn) ReadFrom(b []byte) (n int, from netip.AddrPort, err error) {
-	n, err = c.UdpConn.ReadTransport(b)
-	return n, netip.AddrPort{}, err
 }

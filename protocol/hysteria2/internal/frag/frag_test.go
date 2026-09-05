@@ -334,3 +334,12 @@ func TestDefragger(t *testing.T) {
 		})
 	}
 }
+
+func TestFragmentBudgetRejectsImpossibleMessages(t *testing.T) {
+	message := &protocol.UDPMessage{Addr: "127.0.0.1:53", Data: make([]byte, 65535)}
+	for _, size := range []int{0, message.HeaderSize(), message.HeaderSize() + 1} {
+		if got := FragUDPMessage(message, size); len(got) != 0 {
+			t.Fatalf("size=%d produced %d fragments", size, len(got))
+		}
+	}
+}

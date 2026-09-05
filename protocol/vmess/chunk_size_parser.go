@@ -18,10 +18,6 @@ func NewShakeSizeParser(nonce []byte) *ShakeSizeParser {
 	}
 }
 
-func (*ShakeSizeParser) SizeBytes() int32 {
-	return 2
-}
-
 func (s *ShakeSizeParser) next() uint16 {
 	s.shake.Read(s.buffer[:])
 	return binary.BigEndian.Uint16(s.buffer[:])
@@ -45,19 +41,4 @@ func (s *ShakeSizeParser) NextPaddingLen() uint16 {
 
 func (s *ShakeSizeParser) MaxPaddingLen() uint16 {
 	return 64
-}
-
-type PlainChunkSizeParser struct{}
-
-func (PlainChunkSizeParser) SizeBytes() int32 {
-	return 2
-}
-
-func (PlainChunkSizeParser) Encode(size uint16, b []byte) []byte {
-	binary.BigEndian.PutUint16(b, size)
-	return b[:2]
-}
-
-func (PlainChunkSizeParser) Decode(b []byte) (uint16, error) {
-	return binary.BigEndian.Uint16(b), nil
 }

@@ -10,6 +10,9 @@ func FragUDPMessage(m *protocol.UDPMessage, maxSize int) []protocol.UDPMessage {
 	}
 	fullPayload := m.Data
 	maxPayloadSize := maxSize - m.HeaderSize()
+	if maxPayloadSize <= 0 || (len(fullPayload)+maxPayloadSize-1)/maxPayloadSize > 255 {
+		return nil
+	}
 	off := 0
 	fragID := uint8(0)
 	fragCount := uint8((len(fullPayload) + maxPayloadSize - 1) / maxPayloadSize) // round up
@@ -60,6 +63,11 @@ func (d *Defragger) Feed(m *protocol.UDPMessage) *protocol.UDPMessage {
 		d.frags[m.FragID] = m
 		d.count++
 		d.size += len(m.Data)
+		if d.size > 65535 {
+			d.frags = nil
+			d.count, d.size = 0, 0
+			return nil
+		}
 		if int(d.count) == len(d.frags) {
 			// all fragments received, assemble
 			data := make([]byte, d.size)

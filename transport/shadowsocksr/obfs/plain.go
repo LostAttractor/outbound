@@ -31,11 +31,3 @@ func (p *plain) Encode(data []byte) (encodedData []byte, err error) {
 func (p *plain) Decode(data []byte) (decodedData []byte, needSendBack bool, err error) {
 	return data, false, nil
 }
-
-func (p *plain) SetData(data interface{}) {
-
-}
-
-func (p *plain) GetData() interface{} {
-	return nil
-}
