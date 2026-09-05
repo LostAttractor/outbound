@@ -6,15 +6,16 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"syscall"
+
 	quic "github.com/daeuniverse/quic-go"
 	"github.com/daeuniverse/quic-go/http3"
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"net"
-	"os"
-	"strconv"
-	"syscall"
 )
 
 type FailureScope string
@@ -288,8 +289,8 @@ func classifyProtocol(err error) (Failure, bool) {
 	case *quic.VersionNegotiationError:
 		f.Layer, f.Scope = LayerQUIC, ScopeSharedResource
 	case *http3.Error:
-		if child, ok := any(e).(interface{ Unwrap() error }); ok && child.Unwrap() != nil {
-			f = ClassifyFailure(child.Unwrap())
+		if cause := e.Unwrap(); cause != nil {
+			f = ClassifyFailure(cause)
 		}
 		f.Layer, f.Code = LayerH3, strconv.FormatUint(uint64(e.ErrorCode), 10)
 	case http2.StreamError:

@@ -62,40 +62,9 @@ type Session interface {
 }
 
 type stateWatcher struct {
-	mu        sync.Mutex
-	cond      *sync.Cond
-	queue     []StateEvent
-	accepting bool
-	out       chan StateEvent
-}
-
-func newStateWatcher(initial StateEvent) *stateWatcher {
-	w := &stateWatcher{
-		queue:     []StateEvent{initial},
-		accepting: true,
-		out:       make(chan StateEvent),
-	}
-	w.cond = sync.NewCond(&w.mu)
-	return w
-}
-
-func (w *stateWatcher) enqueue(event StateEvent) {
-	w.mu.Lock()
-	if w.accepting {
-		w.queue = append(w.queue, event)
-		w.cond.Signal()
-	}
-	w.mu.Unlock()
-}
-
-func (w *stateWatcher) finish(drop bool) {
-	w.mu.Lock()
-	if drop {
-		w.queue = nil
-	}
-	w.accepting = false
-	w.cond.Broadcast()
-	w.mu.Unlock()
+	queue []StateEvent // owned by StateBroadcaster.mu
+	wake  chan struct{}
+	out   chan StateEvent
 }
 
 // StateBroadcaster implements the event side of Session. Protocols own the
@@ -128,19 +97,12 @@ func (b *StateBroadcaster) Snapshot() StateEvent {
 
 func (b *StateBroadcaster) WatchState(ctx context.Context) <-chan StateEvent {
 	b.mu.Lock()
-	w := newStateWatcher(b.current)
-	closed := b.current.State == SessionClosed
-	if !closed {
+	w := &stateWatcher{queue: []StateEvent{b.current}, wake: make(chan struct{}, 1), out: make(chan StateEvent)}
+	if b.current.State != SessionClosed {
 		b.watchers[w] = struct{}{}
 	}
 	b.mu.Unlock()
-
-	if closed {
-		w.finish(false)
-	}
 	go func() {
-		stop := context.AfterFunc(ctx, func() { w.finish(true) })
-		defer stop()
 		defer close(w.out)
 		defer func() {
 			b.mu.Lock()
@@ -148,18 +110,24 @@ func (b *StateBroadcaster) WatchState(ctx context.Context) <-chan StateEvent {
 			b.mu.Unlock()
 		}()
 		for {
-			w.mu.Lock()
-			for len(w.queue) == 0 && w.accepting {
-				w.cond.Wait()
-			}
+			b.mu.Lock()
 			if len(w.queue) == 0 {
-				w.mu.Unlock()
-				return
+				closed := b.current.State == SessionClosed
+				b.mu.Unlock()
+				if closed {
+					return
+				}
+				select {
+				case <-w.wake:
+					continue
+				case <-ctx.Done():
+					return
+				}
 			}
 			event := w.queue[0]
 			w.queue[0] = StateEvent{}
 			w.queue = w.queue[1:]
-			w.mu.Unlock()
+			b.mu.Unlock()
 			select {
 			case w.out <- event:
 			case <-ctx.Done():
@@ -178,7 +146,12 @@ func (b *StateBroadcaster) Transition(state SessionState, cause error) bool {
 	if b.current.State == SessionClosed || b.current.State == state {
 		return false
 	}
-	return b.publishLocked(state, cause)
+	event := b.current
+	event.State, event.Cause = state, cause
+	event.Accepting = state == SessionConnected
+	event.UsableCapacity = boolCapacity(event.Accepting)
+	event.ReadinessVersion++
+	return b.publishLocked(event)
 }
 
 func boolCapacity(accepting bool) int {
@@ -188,45 +161,38 @@ func boolCapacity(accepting bool) int {
 	return 0
 }
 
-func (b *StateBroadcaster) publishLocked(state SessionState, cause error) bool {
-	event := b.current
-	event.State, event.Cause = state, cause
-	event.Accepting = state == SessionConnected
-	event.UsableCapacity = boolCapacity(event.Accepting)
-	return b.publishEventWithReadinessLocked(event, true)
-}
-
 // Publish commits owner facts. Seq is the diagnostic revision; readiness only
 // changes when usable dependencies change, never for a retry countdown alone.
 // Resource owners supply EpisodeID; the broadcaster does not infer accidents.
 func (b *StateBroadcaster) Publish(event StateEvent) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	previous := b.current
+	readiness := previous.ReadinessVersion
+	if previous.State != event.State || previous.Accepting != event.Accepting ||
+		previous.Resource != event.Resource && (previous.Accepting || event.Accepting) {
+		readiness++
+	}
+	event.ReadinessVersion = max(readiness, event.ReadinessVersion)
+	return b.publishLocked(event)
+}
+
+// Publication only orders and delivers events. Owners and SessionGroup derive
+// readiness from their own resources before committing the event.
+func (b *StateBroadcaster) publishLocked(event StateEvent) bool {
 	if b.current.State == SessionClosed {
 		return false
 	}
-	return b.publishEventWithReadinessLocked(event, true)
-}
-func (b *StateBroadcaster) publishEventWithReadinessLocked(event StateEvent, resourceAffectsReadiness bool) bool {
-	previous := b.current
 	if event.PublisherID == 0 {
-		event.PublisherID = previous.PublisherID
+		event.PublisherID = b.current.PublisherID
 	}
-	event.Seq = previous.Seq + 1
-	requestedReadiness := event.ReadinessVersion
-	event.ReadinessVersion = previous.ReadinessVersion
-	if previous.State != event.State || previous.Accepting != event.Accepting ||
-		resourceAffectsReadiness && previous.Resource != event.Resource && (previous.Accepting || event.Accepting) {
-		event.ReadinessVersion++
-	}
-	if requestedReadiness > event.ReadinessVersion {
-		event.ReadinessVersion = requestedReadiness
-	}
+	event.Seq = b.current.Seq + 1
 	b.current = event
 	for watcher := range b.watchers {
-		watcher.enqueue(event)
-		if event.State == SessionClosed {
-			watcher.finish(false)
+		watcher.queue = append(watcher.queue, event)
+		select {
+		case watcher.wake <- struct{}{}:
+		default:
 		}
 	}
 	if event.State == SessionClosed {
@@ -320,7 +286,6 @@ func (s *SessionGroup) aggregateLocked() StateEvent {
 	aggregate.State, aggregate.Accepting, aggregate.RecoveryExecutor = state, accepting, executor
 	if !accepting {
 		capacity = 0
-
 	}
 	// Capacity is the minimum currently usable shared-resource count along the
 	// chain; it is not a promise about protocol stream limits.
@@ -350,17 +315,16 @@ func (s *SessionGroup) update(index int, event StateEvent) bool {
 	readinessChanged := s.states[index].ReadinessVersion != event.ReadinessVersion
 	s.states[index] = event
 	aggregate := s.aggregateLocked()
-	current := s.state.Snapshot()
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	current := s.state.current
+	aggregate.Seq = current.Seq
 	aggregate.ReadinessVersion = current.ReadinessVersion
-	if readinessChanged {
+	if readinessChanged || aggregate.State != current.State || aggregate.Accepting != current.Accepting {
 		aggregate.ReadinessVersion++
 	}
-	if aggregate.State != current.State || aggregate.Cause != current.Cause || aggregate.Accepting != current.Accepting || aggregate.ReadinessVersion != current.ReadinessVersion || aggregate.RecoveryExecutor != current.RecoveryExecutor || aggregate.RecoveryPhase != current.RecoveryPhase || aggregate.BlockedBy != current.BlockedBy || aggregate.UsableCapacity != current.UsableCapacity || aggregate.Resource != current.Resource || aggregate.EpisodeID != current.EpisodeID || aggregate.Layer != current.Layer || aggregate.RecoveryRequired != current.RecoveryRequired || aggregate.PublisherID != current.PublisherID {
-		s.state.mu.Lock()
-		if s.state.current.State != SessionClosed {
-			s.state.publishEventWithReadinessLocked(aggregate, false)
-		}
-		s.state.mu.Unlock()
+	if aggregate != current {
+		s.state.publishLocked(aggregate)
 	}
 	return true
 }

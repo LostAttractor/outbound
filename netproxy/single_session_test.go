@@ -13,6 +13,34 @@ type singleSessionResource struct {
 	closes atomic.Int32
 }
 
+func TestSingleSessionCleanupDoesNotHideAbort(t *testing.T) {
+	cleanup := WrapFailure(net.ErrClosed, Failure{Origin: OriginLocalCleanup})
+	fatal := errors.New("owner confirmed resource failure")
+	for _, tc := range []struct {
+		name  string
+		cause error
+		abort bool
+	}{
+		{"cleanup", cleanup, false},
+		{"cleanup then failure", errors.Join(cleanup, fatal), true},
+		{"failure then cleanup", errors.Join(fatal, cleanup), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := NewSingleSession(SingleSessionConfig[int]{Establish: func(context.Context) (int, error) { return 1, nil }})
+			defer session.Close()
+			if err := session.Connect(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			handle, _ := session.CurrentHandle()
+			stream := handle.NewStreamLease()
+			handle.Disconnect(tc.cause)
+			if cause := stream.AbortCause(); (cause != nil) != tc.abort || tc.abort && !errors.Is(cause, fatal) {
+				t.Fatalf("abort cause = %v, want abort = %v", cause, tc.abort)
+			}
+		})
+	}
+}
+
 func TestSingleSessionLifecycle(t *testing.T) {
 	resource := new(singleSessionResource)
 	observed := make(chan *SingleSessionHandle[*singleSessionResource], 1)
@@ -251,46 +279,56 @@ func TestSingleSessionRecoveryDoesNotOverwriteNewerState(t *testing.T) {
 }
 
 func TestSingleSessionRecoveryUsesLiveStateAfterObserverChange(t *testing.T) {
-	resource := new(singleSessionResource)
-	recoveryStarted := make(chan struct{})
-	recoveryRelease := make(chan struct{})
-	observed := make(chan *SingleSessionHandle[*singleSessionResource], 1)
-	var ready atomic.Bool
-	ready.Store(true)
-	session := NewSingleSession(SingleSessionConfig[*singleSessionResource]{
-		Establish:   func(context.Context) (*singleSessionResource, error) { return resource, nil },
-		IsConnected: func(*singleSessionResource) bool { return ready.Load() },
-		Recover: func(context.Context, *singleSessionResource) (bool, error) {
-			close(recoveryStarted)
-			<-recoveryRelease
-			return false, nil
-		},
-		Observe: func(ctx context.Context, handle *SingleSessionHandle[*singleSessionResource]) {
-			observed <- handle
-			<-ctx.Done()
-		},
-	})
-	if err := session.Connect(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	handle := <-observed
-	ready.Store(false)
-	connectResult := make(chan error, 1)
-	go func() { connectResult <- session.Connect(context.Background()) }()
-	<-recoveryStarted
-	if !handle.Transition(SessionDisconnected, errors.New("transient")) {
-		t.Fatal("observer was treated as stale")
-	}
-	ready.Store(true)
-	close(recoveryRelease)
-	if err := <-connectResult; err != nil {
-		t.Fatalf("Connect rejected a recovered live resource: %v", err)
-	}
-	if state := session.Snapshot().State; state != SessionConnected {
-		t.Fatalf("state = %s, want connected", state)
-	}
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
+	for _, action := range []string{"transient", "abort"} {
+		t.Run(action, func(t *testing.T) {
+			resource := new(singleSessionResource)
+			recoveryStarted := make(chan struct{})
+			recoveryRelease := make(chan struct{})
+			var ready atomic.Bool
+			ready.Store(true)
+			session := NewSingleSession(SingleSessionConfig[*singleSessionResource]{
+				Establish:   func(context.Context) (*singleSessionResource, error) { return resource, nil },
+				IsConnected: func(*singleSessionResource) bool { return ready.Load() },
+				Recover: func(context.Context, *singleSessionResource) (bool, error) {
+					close(recoveryStarted)
+					<-recoveryRelease
+					return false, nil
+				},
+			})
+			defer session.Close()
+			if err := session.Connect(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			handle, err := session.CurrentHandle()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease := handle.Lease()
+			ready.Store(false)
+			connectResult := make(chan error, 1)
+			go func() { connectResult <- session.Connect(context.Background()) }()
+			<-recoveryStarted
+			cause := errors.New("owner changed resource state during recovery")
+			var changed bool
+			if action == "abort" {
+				changed = handle.Invalidate(cause)
+			} else {
+				changed = handle.Transition(SessionDisconnected, cause)
+			}
+			ready.Store(true)
+			close(recoveryRelease)
+			if !changed {
+				t.Fatal("current owner transition was rejected")
+			}
+			err = <-connectResult
+			if action == "abort" {
+				if !errors.Is(err, cause) || session.Snapshot().Accepting || handle.Lease() != lease || !errors.Is(lease.AbortCause(), cause) {
+					t.Fatalf("recovery revived a revoked resource: err=%v state=%+v", err, session.Snapshot())
+				}
+			} else if err != nil || session.Snapshot().State != SessionConnected {
+				t.Fatalf("recovery rejected a retained live resource: err=%v state=%+v", err, session.Snapshot())
+			}
+		})
 	}
 }
 

@@ -243,5 +243,7 @@ func (r *Runtime) Wait(ctx context.Context) error {
 	}
 }
 
+// Forward the established connection's owner-issued lifetime signal. Runtime
+// retirement only drains references; it never turns into a dependency abort.
 func (c *runtimeConn) DependencyLease() *Lease       { return DependencyOf(c.Conn) }
 func (c *runtimePacketConn) DependencyLease() *Lease { return DependencyOf(c.PacketConn) }

@@ -37,7 +37,6 @@ type SingleSessionHandle[T any] struct {
 	cancel        context.CancelFunc
 	ref           ResourceRef
 	lease         *Lease
-	dependencies  []*Lease
 	disconnecting bool
 }
 
@@ -63,38 +62,48 @@ func (h *SingleSessionHandle[T]) Transition(state SessionState, cause error) boo
 	if state != SessionConnected {
 		h.lease.Invalidate(cause)
 	}
-	if state == SessionConnected && !h.lease.Valid() {
-		for _, parent := range h.dependencies {
-			if !parent.Valid() {
-				return false
-			}
-		}
-		h.lease = NewLease(h.ref, h.dependencies...)
+	if state == SessionConnected && !h.renewLeaseLocked() {
+		return false
 	}
 	s.transitionLocked(state, cause)
 	return true
 }
 
-// Disconnect invalidates and closes this handle's resource. It returns false
+// A retained logical channel needs a new lease when it becomes ready again.
+// The owner lock protects replacement; parent gates remain authoritative.
+func (h *SingleSessionHandle[T]) renewLeaseLocked() bool {
+	if h.lease.Valid() {
+		return true
+	}
+	lease := NewLease(h.ref, h.lease.parents...)
+	if !lease.Valid() {
+		return false
+	}
+	h.lease = lease
+	return true
+}
+
+// Disconnect aborts dependents and closes this handle's failed resource. It returns false
 // when the handle is stale or the lifecycle is already closed.
 func (h *SingleSessionHandle[T]) Disconnect(cause error) bool {
-	if !h.markDisconnected(cause, false) {
+	if !h.markDisconnected(cause) {
 		return false
 	}
 	h.cleanupDisconnected()
 	return true
 }
 
-// Invalidate synchronously revokes allocation and publishes the root cause,
-// then schedules blocking cleanup. Use this in data-plane Read/Write paths.
+// Invalidate synchronously revokes allocation, signals dependent work to abort,
+// and publishes the root cause, then schedules blocking cleanup. Only pure local
+// cleanup omits the abort signal. Use this in data-plane Read/Write paths.
 func (h *SingleSessionHandle[T]) Invalidate(cause error) bool {
-	if !h.markDisconnected(cause, true) {
+	if !h.markDisconnected(cause) {
 		return false
 	}
-	go func() { defer h.owner.observers.Done(); h.cleanupDisconnected() }()
+	go h.cleanupDisconnected()
 	return true
 }
-func (h *SingleSessionHandle[T]) markDisconnected(cause error, worker bool) bool {
+func (h *SingleSessionHandle[T]) markDisconnected(cause error) bool {
 	if h == nil {
 		return false
 	}
@@ -105,16 +114,24 @@ func (h *SingleSessionHandle[T]) markDisconnected(cause error, worker bool) bool
 		return false
 	}
 	h.disconnecting = true
-	h.lease.Invalidate(cause)
+	abort := cause == nil
+	for _, failure := range Failures(cause) {
+		abort = abort || failure.Origin != OriginLocalCleanup
+	}
+	if abort {
+		// Revoke established dependents before potentially blocking cleanup.
+		h.lease.Abort(cause)
+	} else {
+		h.lease.Invalidate(cause)
+	}
 	s.transitionLocked(SessionDisconnected, cause)
 	s.phaseLocked("cleanup", "")
-	if worker {
-		s.observers.Add(1)
-	}
+	s.observers.Add(1)
 	return true
 }
 func (h *SingleSessionHandle[T]) cleanupDisconnected() {
 	s := h.owner
+	defer s.observers.Done()
 	select {
 	case s.operation <- struct{}{}:
 		defer func() { <-s.operation }()
@@ -226,12 +243,13 @@ func (s *SingleSession[T]) Snapshot() StateEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.current != nil && !s.current.lease.Valid() && s.state.Snapshot().State == SessionConnected {
-		fact := ClassifyFailure(s.current.lease.Cause())
+		cause := s.current.lease.Cause()
+		fact := ClassifyFailure(cause)
 		fact.Resource, fact.Scope = s.current.Ref(), ScopeSharedResource
 		if fact.Layer == LayerUnknown || fact.Layer == "" {
 			fact.Layer = s.config.Layer
 		}
-		s.transitionLocked(SessionDisconnected, WrapFailure(s.current.lease.Cause(), fact))
+		s.transitionLocked(SessionDisconnected, WrapFailure(cause, fact))
 		s.phaseLocked("cleanup", "")
 	}
 	return s.state.Snapshot()
@@ -283,9 +301,10 @@ func (s *SingleSession[T]) Connect(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	}
+	canRecover := current != nil && !current.disconnecting && s.config.Recover != nil
 	s.mu.Unlock()
 
-	if current != nil && !current.disconnecting && s.config.Recover != nil {
+	if canRecover {
 		return s.recoverCurrent(connectCtx, current)
 	}
 
@@ -310,6 +329,11 @@ func (s *SingleSession[T]) recoverCurrent(ctx context.Context, current *SingleSe
 		s.mu.Unlock()
 		return net.ErrClosed
 	}
+	if current.disconnecting {
+		cause := current.lease.Cause()
+		s.mu.Unlock()
+		return cause
+	}
 	s.transitionLocked(SessionConnecting, nil)
 	s.mu.Unlock()
 	replace, err := s.config.Recover(ctx, current.resource)
@@ -320,34 +344,29 @@ func (s *SingleSession[T]) recoverCurrent(ctx context.Context, current *SingleSe
 		s.mu.Unlock()
 		return net.ErrClosed
 	}
+	if current.disconnecting {
+		cause := current.lease.Cause()
+		s.mu.Unlock()
+		return cause
+	}
 	if !replace {
 		if operationErr != nil {
 			s.transitionLocked(SessionDisconnected, operationErr)
 			s.mu.Unlock()
 			return operationErr
 		}
-		snapshot := s.state.Snapshot()
-		connected := err == nil
-		if s.config.IsConnected != nil {
-			connected = s.config.IsConnected(current.resource)
-		}
-		if connected {
-			for _, parent := range current.dependencies {
-				if !parent.Valid() {
-					s.transitionLocked(SessionDisconnected, ErrDependencyInvalid)
-					s.mu.Unlock()
-					return ErrDependencyInvalid
-				}
-			}
-			if !current.lease.Valid() {
-				current.lease = NewLease(current.ref, current.dependencies...)
+		if s.config.IsConnected(current.resource) {
+			if !current.renewLeaseLocked() {
+				s.transitionLocked(SessionDisconnected, ErrDependencyInvalid)
+				s.mu.Unlock()
+				return ErrDependencyInvalid
 			}
 			s.transitionLocked(SessionConnected, nil)
 			s.mu.Unlock()
 			return nil
 		}
 		if err == nil {
-			err = snapshot.Cause
+			err = s.state.Snapshot().Cause
 			if err == nil {
 				err = ErrNotConnected
 			}
@@ -409,29 +428,21 @@ func (s *SingleSession[T]) establishAndInstall(ctx context.Context) error {
 		return operationErr
 	}
 	parents := dependencies.snapshot()
-	for _, parent := range parents {
-		if !parent.Valid() {
-			cause := WrapFailure(ErrDependencyInvalid, Failure{Scope: ScopeSharedResource, Layer: s.config.Layer, Phase: OpHandshake})
-			s.transitionLocked(SessionDisconnected, cause)
-			s.mu.Unlock()
-			s.recordCloseError(s.closeResource(resource))
-			return cause
-		}
-	}
 	s.ref.Generation++
 	ref := s.ref
 	if s.config.LogicalChannel {
 		ref = ResourceRef{}
 	}
-	observerCtx, observerCancel := context.WithCancel(context.Background())
-	handle := &SingleSessionHandle[T]{owner: s, resource: resource, ref: ref, lease: NewLease(ref, parents...), dependencies: parents, cancel: observerCancel}
-	if !handle.lease.Valid() {
-		observerCancel()
-		s.transitionLocked(SessionDisconnected, ErrDependencyInvalid)
+	lease := NewLease(ref, parents...)
+	if !lease.Valid() {
+		cause := WrapFailure(ErrDependencyInvalid, Failure{Scope: ScopeSharedResource, Layer: s.config.Layer, Phase: OpHandshake})
+		s.transitionLocked(SessionDisconnected, cause)
 		s.mu.Unlock()
 		s.recordCloseError(s.closeResource(resource))
-		return ErrDependencyInvalid
+		return cause
 	}
+	observerCtx, observerCancel := context.WithCancel(context.Background())
+	handle := &SingleSessionHandle[T]{owner: s, resource: resource, ref: ref, lease: lease, cancel: observerCancel}
 	s.current = handle
 	s.transitionLocked(SessionConnected, nil)
 	if s.config.Observe != nil {
@@ -487,8 +498,6 @@ func (s *SingleSession[T]) detachLocked() *SingleSessionHandle[T] {
 	s.current = nil
 	if current != nil {
 		current.lease.Invalidate(WrapFailure(net.ErrClosed, Failure{Resource: current.Ref(), Origin: OriginLocalCleanup, Scope: ScopeSharedResource, Layer: s.config.Layer}))
-	}
-	if current != nil && current.cancel != nil {
 		current.cancel()
 	}
 	return current

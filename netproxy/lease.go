@@ -22,8 +22,8 @@ type Lease struct {
 	ref      ResourceRef
 	stream   *StreamRef
 	mu       sync.Mutex
-	invalid  bool
-	cause    error
+	aborted  bool
+	cause    error // nil until the first invalidation
 	children map[*Lease]struct{}
 	parents  []*Lease
 	done     chan struct{}
@@ -38,16 +38,16 @@ func newLease(ref ResourceRef, stream *StreamRef, parents []*Lease) *Lease {
 		}
 		parent.mu.Lock()
 		l.mu.Lock()
-		if l.invalid {
+		if l.cause != nil {
 			l.mu.Unlock()
 			parent.mu.Unlock()
 			break
 		}
-		if parent.invalid {
-			cause := parent.cause
+		if parent.cause != nil {
+			cause, aborted := parent.cause, parent.aborted
 			l.mu.Unlock()
 			parent.mu.Unlock()
-			l.Invalidate(cause)
+			l.invalidate(cause, aborted)
 			break
 		}
 		parent.children[l] = struct{}{}
@@ -70,23 +70,8 @@ func (l *Lease) Stream() *StreamRef {
 	return &v
 }
 func (l *Lease) Valid() bool {
-	if l == nil {
-		return true
-	}
-	l.mu.Lock()
-	invalid := l.invalid
-	l.mu.Unlock()
-	if invalid {
-		return false
-	}
-	// Parent gates are authoritative even while recursive invalidation has not
-	// yet reached this child. No allocation may cross that propagation window.
-	for _, parent := range l.parents {
-		if !parent.Valid() {
-			return false
-		}
-	}
-	return true
+	cause, _ := l.termination()
+	return cause == nil
 }
 func (l *Lease) Done() <-chan struct{} {
 	if l == nil {
@@ -95,39 +80,66 @@ func (l *Lease) Done() <-chan struct{} {
 	return l.done
 }
 func (l *Lease) Cause() error {
-	if l == nil {
-		return nil
-	}
-	l.mu.Lock()
-	cause := l.cause
-	l.mu.Unlock()
-	if cause == nil {
-		for _, parent := range l.parents {
-			if !parent.Valid() {
-				return parent.Cause()
-			}
-		}
-	}
+	cause, _ := l.termination()
 	return cause
 }
+
+// AbortCause reports the owner's instruction to terminate dependent work.
+// Ordinary invalidation and local cleanup do not issue that instruction.
+func (l *Lease) AbortCause() error {
+	if cause, aborted := l.termination(); aborted {
+		return cause
+	}
+	return nil
+}
+
+// Consult parent gates until propagation reaches this lease. All readers use
+// the same cause and action, and a finished child keeps its original result.
+func (l *Lease) termination() (cause error, aborted bool) {
+	if l == nil {
+		return nil, false
+	}
+	l.mu.Lock()
+	cause, aborted = l.cause, l.aborted
+	l.mu.Unlock()
+	if cause != nil {
+		return cause, aborted
+	}
+	for _, parent := range l.parents {
+		if cause, aborted = parent.termination(); cause != nil {
+			return cause, aborted
+		}
+	}
+	return nil, false
+}
+
 func (l *Lease) NewStream() *Lease {
 	ref := l.Resource()
 	return newLease(ref, &StreamRef{Parent: ref, ID: identity.Add(1)}, []*Lease{l})
 }
 func (l *Lease) Invalidate(cause error) bool {
+	return l.invalidate(cause, false)
+}
+
+// Abort invalidates this dependency subtree and instructs its active consumers
+// to terminate immediately. The first invalidation fixes both cause and action.
+func (l *Lease) Abort(cause error) bool {
+	return l.invalidate(cause, true)
+}
+
+func (l *Lease) invalidate(cause error, aborted bool) bool {
 	if l == nil {
 		return false
 	}
 	l.mu.Lock()
-	if l.invalid {
+	if l.cause != nil {
 		l.mu.Unlock()
 		return false
 	}
-	l.invalid = true
 	if cause == nil {
 		cause = ErrDependencyInvalid
 	}
-	l.cause = cause
+	l.cause, l.aborted = cause, aborted
 	children := make([]*Lease, 0, len(l.children))
 	for c := range l.children {
 		children = append(children, c)
@@ -136,7 +148,7 @@ func (l *Lease) Invalidate(cause error) bool {
 	close(l.done)
 	l.mu.Unlock()
 	for _, child := range children {
-		child.Invalidate(cause)
+		child.invalidate(cause, aborted)
 	}
 	for _, parent := range l.parents {
 		if parent != nil {

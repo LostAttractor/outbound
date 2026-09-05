@@ -33,6 +33,75 @@ func TestLeaseStreamInvalidationOnlyAffectsActualSubtree(t *testing.T) {
 	}
 }
 
+func TestLeaseAbortFollowsActualDependencies(t *testing.T) {
+	parent := NewLease(NewResourceRef())
+	failed, healthy := parent.NewStream(), parent.NewStream()
+	resource := NewLease(NewResourceRef(), failed)
+	stream := resource.NewStream()
+	cause := errors.New("owner confirmed unusable resource")
+	if !failed.Abort(cause) {
+		t.Fatal("first abort rejected")
+	}
+	lateStream := resource.NewStream()
+	for _, lease := range []*Lease{failed, resource, stream, lateStream} {
+		if lease.Valid() || !errors.Is(lease.AbortCause(), cause) {
+			t.Fatalf("dependent lease missed abort: valid=%v cause=%v", lease.Valid(), lease.AbortCause())
+		}
+		select {
+		case <-lease.Done():
+		default:
+			t.Fatal("dependent consumer was not notified")
+		}
+	}
+	for _, lease := range []*Lease{parent, healthy} {
+		if !lease.Valid() || lease.AbortCause() != nil {
+			t.Fatal("abort crossed the failed dependency subtree")
+		}
+	}
+	laterCause := errors.New("parent failed later")
+	parent.Abort(laterCause)
+	if !errors.Is(healthy.AbortCause(), laterCause) || !errors.Is(stream.AbortCause(), cause) {
+		t.Fatal("parent abort missed remaining consumer or rewrote earlier cause")
+	}
+}
+
+func TestLeaseInvalidationDoesNotBecomeAbort(t *testing.T) {
+	parent := NewLease(NewResourceRef())
+	stream := parent.NewStream()
+	// An error's metadata never substitutes for the owner's explicit action.
+	cause := WrapFailure(errors.New("diagnostic only"), Failure{Scope: ScopeSharedResource})
+	if !parent.Invalidate(cause) || parent.Abort(errors.New("late abort")) {
+		t.Fatal("first invalidation did not remain authoritative")
+	}
+	for _, lease := range []*Lease{parent, stream, parent.NewStream()} {
+		if lease.Valid() || lease.AbortCause() != nil || !errors.Is(lease.Cause(), cause) {
+			t.Fatalf("invalidation changed action or cause: valid=%v abort=%v cause=%v", lease.Valid(), lease.AbortCause(), lease.Cause())
+		}
+	}
+
+	parent = NewLease(NewResourceRef())
+	stream = parent.NewStream()
+	stream.Invalidate(nil)
+	parent.Abort(errors.New("failure after stream closed"))
+	if stream.AbortCause() != nil {
+		t.Fatal("parent aborted an already closed stream")
+	}
+}
+
+func TestLeaseAbortNilCauseAndNilLease(t *testing.T) {
+	var absent *Lease
+	if absent.Abort(nil) || absent.Invalidate(nil) || absent.AbortCause() != nil || absent.Done() != nil {
+		t.Fatal("absent dependency has a lifecycle signal")
+	}
+	lease := NewLease(NewResourceRef())
+	if !lease.Abort(nil) || !errors.Is(lease.AbortCause(), ErrDependencyInvalid) {
+		t.Fatal("abort without a diagnostic lost its termination signal")
+	}
+	if lease.Invalidate(errors.New("cleanup")) || !errors.Is(lease.AbortCause(), ErrDependencyInvalid) {
+		t.Fatal("cleanup replaced the owner's abort")
+	}
+}
+
 func TestSingleSessionRejectsDependencyInvalidatedDuringEstablish(t *testing.T) {
 	parent := NewLease(NewResourceRef())
 	started, release := make(chan struct{}), make(chan struct{})

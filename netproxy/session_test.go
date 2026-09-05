@@ -201,6 +201,17 @@ func TestStateBroadcasterPublishesEveryTransitionToEveryWatcher(t *testing.T) {
 			}
 		}
 	}
+	cancel()
+	for name, watcher := range map[string]<-chan StateEvent{"a": a, "b": bw} {
+		select {
+		case _, ok := <-watcher:
+			if ok {
+				t.Fatalf("%s received an extra event after cancellation", name)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s watcher did not stop after cancellation", name)
+		}
+	}
 }
 
 func TestStateBroadcasterClosedIsTerminal(t *testing.T) {
@@ -480,31 +491,16 @@ func TestRuntimePreservesParentSessionThroughStatelessData(t *testing.T) {
 	if _, ok := runtime.Dialer().(Session); ok {
 		t.Fatal("stateless child dialer acquired session methods")
 	}
+	if _, ok := runtime.Dialer().(io.Closer); ok {
+		t.Fatal("data-plane view exposed runtime ownership")
+	}
+	if _, ok := session.(io.Closer); ok {
+		t.Fatal("session view exposed runtime ownership")
+	}
 	retireRuntime(t, runtime)
 	if state := parentSession.Snapshot().State; state != SessionClosed {
 		t.Fatalf("parent session state after Close = %s", state)
 	}
-}
-
-func TestRuntimeDialerHidesOwnedLifecycle(t *testing.T) {
-	owner := newTestSession()
-	runtime := NewRuntime(Layer{
-		Data:      testDialer{},
-		Sessions:  []Session{owner},
-		Resources: []io.Closer{owner},
-	})
-	if _, ok := runtime.Dialer().(Session); ok {
-		t.Fatal("Runtime.Dialer exposed Session")
-	}
-	if _, ok := runtime.Dialer().(io.Closer); ok {
-		t.Fatal("Runtime.Dialer exposed Close")
-	}
-	if session, ok := runtime.Session(); !ok {
-		t.Fatal("Runtime lost Session")
-	} else if _, ok := session.(io.Closer); ok {
-		t.Fatal("Runtime.Session exposed Close")
-	}
-	retireRuntime(t, runtime)
 }
 
 func newPacketCapableTestConn(t *testing.T) *packetCapableTestConn {

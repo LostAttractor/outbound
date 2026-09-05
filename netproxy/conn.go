@@ -6,6 +6,9 @@ import (
 
 var UnsupportedTunnelTypeError = net.UnknownNetworkError("unsupported tunnel type")
 
+// CloseWriter sends a write-side EOF while preserving reads. Implementations
+// that cannot half-close return errors.ErrUnsupported directly; wrapped or
+// joined errors report a failed close operation.
 type CloseWriter interface {
 	CloseWrite() error
 }
