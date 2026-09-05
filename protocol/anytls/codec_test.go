@@ -84,6 +84,9 @@ func TestPeerAlertAndMalformedControlAreResourceFailures(t *testing.T) {
 			if failure.Scope != netproxy.ScopeSharedResource || failure.Reason != test.reason || failure.Origin != netproxy.OriginPeer || s.lease.Valid() {
 				t.Fatalf("peer failure: %+v", failure)
 			}
+			if !errors.Is(s.lease.AbortCause(), err) {
+				t.Fatalf("peer failure did not issue abort: %v", s.lease.AbortCause())
+			}
 		})
 	}
 }

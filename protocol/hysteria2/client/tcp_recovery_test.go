@@ -160,6 +160,9 @@ func TestRecoveryOpenStreamFatalInvalidatesAndCleansSession(t *testing.T) {
 	if handle.Lease().Valid() || c.Snapshot().State == netproxy.SessionConnected {
 		t.Fatal("failed stream admission did not synchronously gate session")
 	}
+	if !errors.Is(handle.Lease().AbortCause(), err) {
+		t.Fatalf("fatal stream admission did not issue abort: %v", handle.Lease().AbortCause())
+	}
 	select {
 	case <-closed:
 	case <-ctx.Done():

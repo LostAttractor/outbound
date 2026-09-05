@@ -55,6 +55,9 @@ func TestSessionCloseWithActiveStreamDoesNotDeadlock(t *testing.T) {
 	if !stream.closed.Load() {
 		t.Fatal("Session.Close left its stream open")
 	}
+	if session.lease.AbortCause() != nil || stream.lease.AbortCause() != nil {
+		t.Fatal("intentional session close issued abort")
+	}
 }
 
 func TestNewStreamCannotPublishAfterSessionClose(t *testing.T) {

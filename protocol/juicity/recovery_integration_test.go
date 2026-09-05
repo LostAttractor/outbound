@@ -112,6 +112,9 @@ func TestRecoveryStreamResetDoesNotKillSharedQUICConnection(t *testing.T) {
 	if d.Snapshot().State != netproxy.SessionConnected {
 		t.Fatalf("stream reset disconnected pool: %+v", d.Snapshot())
 	}
+	if netproxy.DependencyOf(first).AbortCause() != nil || old.lease.AbortCause() != nil {
+		t.Fatal("single stream reset issued resource abort")
+	}
 	if _, err := remoteSecond.Write([]byte("ok")); err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +160,11 @@ func TestRecoveryStreamResetDoesNotKillSharedQUICConnection(t *testing.T) {
 	var appErr *quic.ApplicationError
 	if failure := netproxy.ClassifyFailure(err); failure.Scope != netproxy.ScopeSharedResource || !errors.As(err, &appErr) {
 		t.Fatalf("connection error=%+v", failure)
+	}
+	for _, lease := range []*netproxy.Lease{old.lease, netproxy.DependencyOf(second)} {
+		if !errors.As(lease.AbortCause(), &appErr) || appErr.ErrorCode != 0x321 {
+			t.Fatalf("connection failure lost abort signal: %v", lease.AbortCause())
+		}
 	}
 	select {
 	case err := <-underlayDone:

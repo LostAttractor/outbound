@@ -156,16 +156,19 @@ func TestRotationKeepsStableLeaseAndCurrentFailureKeepsCause(t *testing.T) {
 	hopper.hop()
 	hopper.hop()
 	waitClosed(t, conns[0].done)
-	if !lease.Valid() || lease != hopper.DependencyLease() {
+	if !lease.Valid() || lease != hopper.DependencyLease() || lease.AbortCause() != nil {
 		t.Fatal("retiring first hop invalidated stable hopper lease")
 	}
 	cause := netproxy.WrapFailure(syscall.ECONNRESET, netproxy.Failure{Resource: conns[2].lease.Resource(), Scope: netproxy.ScopeSharedResource, Layer: netproxy.LayerTCP, Reason: netproxy.ReasonReset, Origin: netproxy.OriginPeer})
-	conns[2].lease.Invalidate(cause)
+	conns[2].lease.Abort(cause)
 	waitClosed(t, lease.Done())
 	closePromptly(t, hopper)
 	failure := netproxy.ClassifyFailure(lease.Cause())
 	if !errors.Is(lease.Cause(), syscall.ECONNRESET) || failure.Layer != netproxy.LayerTCP || failure.Resource != conns[2].lease.Resource() {
 		t.Fatalf("lost parent cause: %+v", failure)
+	}
+	if !errors.Is(lease.AbortCause(), cause) {
+		t.Fatalf("hopper lost current parent abort: %v", lease.AbortCause())
 	}
 	for _, c := range conns {
 		waitClosed(t, c.done)

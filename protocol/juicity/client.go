@@ -185,7 +185,7 @@ func (t *clientImpl) failConnection(cause error) {
 	failure.Scope = netproxy.ScopeSharedResource
 	wrapped := netproxy.WrapFailure(cause, failure)
 	if t.lease != nil {
-		t.lease.Invalidate(wrapped)
+		t.lease.Abort(wrapped)
 	}
 	if t.poolState != nil {
 		t.poolState.Failed(t.resource, wrapped)
@@ -200,11 +200,11 @@ func (t *clientImpl) Close() (err error) {
 	case <-t.Ctx.Done():
 		return
 	default:
-		t.Cancel()
 	}
 	if t.lease != nil {
 		t.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: t.resource, Scope: netproxy.ScopeSharedResource, Layer: netproxy.LayerQUIC, Origin: netproxy.OriginLocalCleanup, Reason: netproxy.ReasonClosed}))
 	}
+	t.Cancel()
 	if t.poolState != nil {
 		t.poolState.Failed(t.resource, net.ErrClosed)
 	}

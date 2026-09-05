@@ -117,7 +117,11 @@ func (u *udpHopPacketConn) watchCurrent(conn net.Conn) {
 		u.connMutex.Lock()
 		current := u.currentConn == conn && u.ctx.Err() == nil
 		if current {
-			u.lease.Invalidate(parent.Cause())
+			if cause := parent.AbortCause(); cause != nil {
+				u.lease.Abort(cause)
+			} else {
+				u.lease.Invalidate(parent.Cause())
+			}
 		}
 		u.connMutex.Unlock()
 		if current {

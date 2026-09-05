@@ -296,6 +296,9 @@ func TestH2RecoveryHealthySiblingKeepsReadinessAndCause(t *testing.T) {
 	proxy.pool.mu.Unlock()
 	cause := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
 	proxy.pool.failSlot(old, cause, netproxy.OpRead)
+	if !errors.Is(netproxy.DependencyOf(first).AbortCause(), cause) || netproxy.DependencyOf(second).AbortCause() != nil {
+		t.Fatal("failed H2 slot did not abort only its own streams")
+	}
 	failed := proxy.pool.Snapshot()
 	if !failed.Accepting || !failed.RecoveryRequired || failed.ReadinessVersion != before.ReadinessVersion || failed.Resource != before.Resource || failed.EpisodeID <= before.EpisodeID {
 		t.Fatalf("healthy sibling lost readiness: before=%+v after=%+v", before, failed)
@@ -348,7 +351,7 @@ func TestH2RecoveryDrainedRetirementDoesNotStartNewIncident(t *testing.T) {
 		t.Fatal("drained socket not retired")
 	}
 	f := netproxy.ClassifyFailure(old.lease.Cause())
-	if f.Scope != netproxy.ScopeOperation || f.Origin != netproxy.OriginLocalCleanup {
+	if f.Scope != netproxy.ScopeOperation || f.Origin != netproxy.OriginLocalCleanup || old.lease.AbortCause() != nil {
 		t.Fatalf("normal drain became fatal: %+v", f)
 	}
 	after := proxy.pool.Snapshot()

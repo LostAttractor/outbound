@@ -351,6 +351,7 @@ func (p *h2ConnsPool) failSlot(slot *h2Conn, cause error, op netproxy.Operation)
 	}
 	failure := netproxy.ClassifyFailure(cause)
 	failure.Resource, failure.Scope, failure.Phase = slot.ref, netproxy.ScopeSharedResource, op
+	drained := false
 	// A GOAWAY socket retired after every allowed request finished is cleanup.
 	// Independent resets and protocol errors retain their actual fatal scope.
 	if slot.draining.Load() && (cause == io.EOF || errors.Is(cause, net.ErrClosed)) {
@@ -358,6 +359,7 @@ func (p *h2ConnsPool) failSlot(slot *h2Conn, cause error, op netproxy.Operation)
 			state := cc.State()
 			if state.StreamsActive == 0 && state.StreamsReserved == 0 {
 				failure.Scope, failure.Origin, failure.Reason = netproxy.ScopeOperation, netproxy.OriginLocalCleanup, netproxy.ReasonClosed
+				drained = true
 			}
 		}
 	}
@@ -367,7 +369,11 @@ func (p *h2ConnsPool) failSlot(slot *h2Conn, cause error, op netproxy.Operation)
 	slot.unattributed.Store(cause == net.ErrClosed && failure.Origin != netproxy.OriginLocalCleanup)
 	cause = netproxy.WrapFailure(cause, failure)
 	slot.terminal.Store(&h2TerminalError{cause: cause})
-	slot.lease.Invalidate(cause)
+	if drained {
+		slot.lease.Invalidate(cause)
+	} else {
+		slot.lease.Abort(cause)
+	}
 	p.change(slot, false, cause, "")
 	go func() {
 		_ = slot.raw.Close()

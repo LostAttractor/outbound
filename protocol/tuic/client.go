@@ -211,7 +211,7 @@ func (t *clientImpl) failConnection(cause error) {
 	failure.Scope = netproxy.ScopeSharedResource
 	wrapped := netproxy.WrapFailure(cause, failure)
 	if t.lease != nil {
-		t.lease.Invalidate(wrapped)
+		t.lease.Abort(wrapped)
 	}
 	if t.poolState != nil {
 		t.poolState.Failed(t.resource, wrapped)

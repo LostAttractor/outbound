@@ -303,7 +303,7 @@ func (s *session) fail(err error, phase netproxy.Operation) error {
 		fact.Reason = netproxy.ReasonClosed
 	}
 	s.rootCause = netproxy.WrapFailure(err, fact)
-	s.lease.Invalidate(s.rootCause)
+	s.lease.Abort(s.rootCause)
 	return s.rootCause
 }
 func (s *session) failure(err error, phase netproxy.Operation) error {
