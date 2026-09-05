@@ -24,8 +24,7 @@ import (
 
 type salt []byte
 
-func (s salt) Get() []byte  { b := pool.GetBuffer(len(s)); copy(b, s); return b }
-func (s salt) Close() error { return nil }
+func (s salt) Get() []byte { b := pool.GetBuffer(len(s)); copy(b, s); return b }
 
 func encryptedClient(raw net.Conn, modern bool) net.Conn {
 	key := bytes.Repeat([]byte{0x11}, 16)

@@ -16,7 +16,6 @@ import (
 	"net/url"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 )
 
 // Version is socks5 version number.
@@ -24,10 +23,10 @@ const Version = 5
 
 // Socks5 is a base socks5 struct.
 type Socks5 struct {
-	protocol.StatelessDialer
-	addr     string
-	user     string
-	password string
+	ParentDialer netproxy.Dialer
+	addr         string
+	user         string
+	password     string
 }
 
 // NewSocks5 returns a Proxy that makes SOCKS v5 connections to the given address.

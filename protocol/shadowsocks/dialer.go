@@ -17,7 +17,7 @@ func init() {
 }
 
 type Dialer struct {
-	protocol.StatelessDialer
+	ParentDialer netproxy.Dialer
 	proxyAddress string
 	conf         *ciphers.CipherConf
 	key          []byte
@@ -30,10 +30,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		return nil, fmt.Errorf("unsupported shadowsocks cipher: %s", header.Cipher)
 	}
 	key := common.EVPBytesToKey(header.Password, conf.KeyLen)
-	sg, err := NewRandomSaltGenerator(conf.SaltLen)
-	if err != nil {
-		return nil, err
-	}
+	sg := RandomSaltGenerator(conf.SaltLen)
 	//log.Trace("shadowsocks.NewDialer: metadata: %v, password: %v", metadata, password)
 	return &Dialer{
 		ParentDialer: nextDialer,
@@ -97,5 +94,5 @@ func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn,
 	if err != nil {
 		return nil, err
 	}
-	return NewUdpConn(conn, d.conf, d.key, d.sg)
+	return NewUdpConn(conn, d.conf, d.key, d.sg), nil
 }

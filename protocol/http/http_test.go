@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -102,58 +101,73 @@ func (p http1Parent) ListenPacket(context.Context, string) (net.PacketConn, erro
 	return nil, errors.New("unexpected packet")
 }
 func http1Proxy(parent netproxy.Dialer) *HttpProxy {
-	return &HttpProxy{StatelessDialer: protocol.StatelessDialer{ParentDialer: parent}, Addr: "proxy.test:80", pool: newH2ConnsPool(parent, "proxy.test:80")}
+	return &HttpProxy{ParentDialer: parent, Addr: "proxy.test:80", pool: newH2ConnsPool(parent, "proxy.test:80")}
 }
 
 func TestHTTP1EagerConnectBuffersTunnelAndKeepsPayload(t *testing.T) {
-	client, server := net.Pipe()
-	defer server.Close()
-	lease := netproxy.NewLease(netproxy.NewResourceRef())
-	parent := http1Parent{&negotiatedTestConn{Conn: client, lease: lease}}
-	proxy := http1Proxy(parent)
-	defer proxy.Close()
-	payload := "GET /application HTTP/1.1\r\nHost: target.test\r\n\r\n"
-	result := make(chan error, 1)
-	go func() {
-		request, err := stdhttp.ReadRequest(bufio.NewReader(server))
-		if err != nil {
-			result <- err
-			return
-		}
-		if request.Method != "CONNECT" || request.Host != "target.test:80" {
-			result <- errors.New("not an eager CONNECT")
-			return
-		}
-		if _, err := io.WriteString(server, "HTTP/1.1 200 OK\r\n\r\nserver-first"); err != nil {
-			result <- err
-			return
-		}
-		got := make([]byte, len(payload))
-		_, err = io.ReadFull(server, got)
-		if err == nil && string(got) != payload {
-			err = errors.New("application request rewritten")
-		}
-		result <- err
-	}()
-	conn, err := proxy.DialContext(context.Background(), "tcp", "target.test:80")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if netproxy.DependencyOf(conn) != lease {
-		t.Fatal("missing eager lease")
-	}
-	got := make([]byte, len("server-first"))
-	if _, err := io.ReadFull(conn, got); err != nil || string(got) != "server-first" {
-		t.Fatalf("buffered data %q %v", got, err)
-	}
-	if _, err := io.WriteString(conn, payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-result; err != nil {
-		t.Fatal(err)
+	for _, secure := range []bool{false, true} {
+		t.Run(map[bool]string{false: "http", true: "https"}[secure], func(t *testing.T) {
+			client, server := net.Pipe()
+			defer server.Close()
+			lease := netproxy.NewLease(netproxy.NewResourceRef())
+			parent := http1Parent{&negotiatedTestConn{Conn: client, lease: lease, proto: "http/1.1"}}
+			proxy := http1Proxy(parent)
+			if secure {
+				proxy.https = true
+				// The TLS preflight selected HTTP/1, which uses a fresh carrier per dial.
+				proxy.pool.http1 = true
+				proxy.pool.publishLocked(nil, "")
+			}
+			defer proxy.Close()
+			payload := "GET /application HTTP/1.1\r\nHost: target.test\r\n\r\n"
+			result := make(chan error, 1)
+			go func() {
+				request, err := stdhttp.ReadRequest(bufio.NewReader(server))
+				if err != nil {
+					result <- err
+					return
+				}
+				if request.Method != "CONNECT" || request.Host != "target.test:80" {
+					result <- errors.New("not an eager CONNECT")
+					return
+				}
+				if _, err := io.WriteString(server, "HTTP/1.1 200 OK\r\n\r\nserver-first"); err != nil {
+					result <- err
+					return
+				}
+				got := make([]byte, len(payload))
+				_, err = io.ReadFull(server, got)
+				if err == nil && string(got) != payload {
+					err = errors.New("application request rewritten")
+				}
+				result <- err
+			}()
+			conn, err := proxy.DialContext(context.Background(), "tcp", "target.test:80")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, ok := conn.(netproxy.CloseWriter); ok {
+				t.Fatal("HTTP/1 advertised unsupported half-close")
+			}
+			if netproxy.DependencyOf(conn) != lease {
+				t.Fatal("missing eager lease")
+			}
+			got := make([]byte, len("server-first"))
+			if _, err := io.ReadFull(conn, got); err != nil || string(got) != "server-first" {
+				t.Fatalf("buffered data %q %v", got, err)
+			}
+			if _, err := io.WriteString(conn, payload); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+
+		})
 	}
 }
+
 func TestHTTP1CancelClosesHandshake(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()

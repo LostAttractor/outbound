@@ -14,17 +14,6 @@ import (
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/proto"
 )
 
-func init() {
-	register("tls1.2_ticket_auth", &constructor{
-		New:      func() IObfs { return newTLS12TicketAuth(false) },
-		Overhead: 5,
-	})
-	register("tls1.2_ticket_fastauth", &constructor{
-		New:      func() IObfs { return newTLS12TicketAuth(true) },
-		Overhead: 5,
-	})
-}
-
 type tlsAuthData struct {
 	localClientID [32]byte
 }

@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 	"io"
 	"net"
 	"net/http"
@@ -24,6 +23,9 @@ func TestMessageStreamAndClose(t *testing.T) {
 	peerDone := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(peerDone)
+		if r.Host != "front.example" {
+			t.Errorf("WebSocket Host = %q", r.Host)
+		}
 		peer, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -43,7 +45,7 @@ func TestMessageStreamAndClose(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ws := &Ws{StatelessDialer: protocol.StatelessDialer{ParentDialer: wsTestDialer{}}, wsAddr: "ws" + strings.TrimPrefix(server.URL, "http"), header: make(http.Header)}
+	ws := &Ws{ParentDialer: wsTestDialer{}, wsAddr: "ws" + strings.TrimPrefix(server.URL, "http"), host: "front.example"}
 	raw, err := ws.DialContext(context.Background(), "tcp", "")
 	if err != nil {
 		t.Fatal(err)
@@ -125,7 +127,7 @@ func TestGorillaPeerFragmentationControlAndLargeFrames(t *testing.T) {
 		received <- err
 	}))
 	defer server.Close()
-	ws := &Ws{StatelessDialer: protocol.StatelessDialer{ParentDialer: wsTestDialer{}}, wsAddr: "ws" + strings.TrimPrefix(server.URL, "http"), header: make(http.Header)}
+	ws := &Ws{ParentDialer: wsTestDialer{}, wsAddr: "ws" + strings.TrimPrefix(server.URL, "http")}
 	c, err := ws.DialContext(context.Background(), "tcp", "")
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +230,7 @@ func TestCancelDuringUpgradeClosesCarrier(t *testing.T) {
 	defer server.Close()
 	started := make(chan struct{})
 	parent := wsPipeDialer{conn: client, started: started}
-	ws := &Ws{StatelessDialer: protocol.StatelessDialer{ParentDialer: parent}, wsAddr: "ws://peer.test/", header: make(http.Header)}
+	ws := &Ws{ParentDialer: parent, wsAddr: "ws://peer.test/"}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { _, err := ws.DialContext(ctx, "tcp", ""); result <- err }()

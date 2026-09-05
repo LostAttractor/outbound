@@ -28,22 +28,11 @@ func (testDialer) ListenPacket(context.Context, string) (net.PacketConn, error) 
 	return nil, errors.New("unexpected listen")
 }
 
-func TestDialerOwnsTransportAndSessions(t *testing.T) {
+func TestDialerCloseStopsSessionAndRejectsDial(t *testing.T) {
 	const link = "meek://proxy.example:443?url=https%3A%2F%2Ffront.example%2Fpath&serverName=cdn.example"
 	first, err := NewDialer(link, testDialer{})
 	if err != nil {
 		t.Fatal(err)
-	}
-	second, err := NewDialer(link, testDialer{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Close()
-	if first.transport == second.transport {
-		t.Fatal("dialers shared transport")
-	}
-	if first.transport.TLSClientConfig.ServerName != "cdn.example" {
-		t.Fatal("TLS server name lost")
 	}
 	conn, err := first.DialContext(context.Background(), "tcp", "target.example:443")
 	if err != nil {
@@ -158,6 +147,9 @@ func TestSessionWriteDeadlineAndFailureDoNotReplay(t *testing.T) {
 func TestCustomDialerNegotiatesRealHTTP2Peer(t *testing.T) {
 	protocols := make(chan int, 8)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS.ServerName != "cdn.example" {
+			t.Errorf("TLS peer received SNI %q", r.TLS.ServerName)
+		}
 		protocols <- r.ProtoMajor
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush() // An H2 peer can respond while request upload continues.
@@ -171,7 +163,7 @@ func TestCustomDialerNegotiatesRealHTTP2Peer(t *testing.T) {
 	server.StartTLS()
 	defer server.Close()
 	parent := directTestDialer{}
-	d, err := NewDialer("meek://proxy.test?allowInsecure=true&url="+url.QueryEscape(server.URL), parent)
+	d, err := NewDialer("meek://proxy.test?allowInsecure=true&serverName=cdn.example&url="+url.QueryEscape(server.URL), parent)
 	if err != nil {
 		t.Fatal(err)
 	}

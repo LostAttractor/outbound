@@ -6,13 +6,12 @@ import (
 	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 )
 
 type Dialer struct {
-	protocol.StatelessDialer
-	param       ObfsParam
-	constructor *constructor
+	ParentDialer netproxy.Dialer
+	param        ObfsParam
+	constructor  constructor
 }
 
 type ObfsParam struct {
@@ -23,8 +22,8 @@ type ObfsParam struct {
 }
 
 func NewDialer(parent netproxy.Dialer, param *ObfsParam) (*Dialer, error) {
-	factory := NewObfs(param.Obfs)
-	if factory == nil {
+	factory, ok := constructors[param.Obfs]
+	if !ok {
 		return nil, fmt.Errorf("unsupported SSR obfuscation %q", param.Obfs)
 	}
 	return &Dialer{ParentDialer: parent, param: *param, constructor: factory}, nil

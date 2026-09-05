@@ -517,36 +517,6 @@ func newPacketCapableTestConn(t *testing.T) *packetCapableTestConn {
 	return &packetCapableTestConn{Conn: conn}
 }
 
-func TestRuntimeDialContextPreservesSyscallConn(t *testing.T) {
-	runtime := NewRuntime(Layer{Data: &streamTestDialer{conn: newPacketCapableTestConn(t)}})
-	conn, err := runtime.Dialer().DialContext(context.Background(), "udp", "example.com:53")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := conn.(syscall.Conn); !ok {
-		t.Fatal("DialContext hid syscall.Conn")
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	retireRuntime(t, runtime)
-}
-
-func TestRuntimeListenPacketPreservesSyscallConn(t *testing.T) {
-	runtime := NewRuntime(Layer{Data: &packetTestDialer{conn: newPacketCapableTestConn(t)}})
-	conn, err := runtime.Dialer().ListenPacket(context.Background(), "example.com:53")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := conn.(syscall.Conn); !ok {
-		t.Fatal("ListenPacket hid syscall.Conn")
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	retireRuntime(t, runtime)
-}
-
 func TestRuntimeDefersCloseForStreamLease(t *testing.T) {
 	resource := &ownedTestDialer{Dialer: &streamTestDialer{conn: newPacketCapableTestConn(t)}}
 	runtime := NewRuntime(Layer{
@@ -557,6 +527,10 @@ func TestRuntimeDefersCloseForStreamLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, ok := conn.(syscall.Conn); !ok {
+		t.Fatal("runtime hid syscall.Conn")
+	}
+
 	runtime.Retire()
 	if got := resource.closes.Load(); got != 0 {
 		t.Fatalf("resource closed with active stream lease: %d", got)
@@ -582,6 +556,10 @@ func TestRuntimeDefersCloseForPacketLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, ok := conn.(syscall.Conn); !ok {
+		t.Fatal("runtime hid syscall.Conn")
+	}
+
 	runtime.Retire()
 	if got := resource.closes.Load(); got != 0 {
 		t.Fatalf("resource closed with active packet lease: %d", got)

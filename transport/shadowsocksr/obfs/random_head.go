@@ -13,13 +13,6 @@ type randomHead struct {
 	dataBuffer       []byte
 }
 
-func init() {
-	register("random_head", &constructor{
-		New:      newRandomHead,
-		Overhead: 0,
-	})
-}
-
 func newRandomHead() IObfs {
 	p := &randomHead{}
 	return p

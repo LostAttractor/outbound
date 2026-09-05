@@ -4,10 +4,6 @@ import (
 	"bytes"
 )
 
-func init() {
-	register("origin", NewOrigin)
-}
-
 type origin struct {
 	ServerInfo
 }
@@ -19,10 +15,6 @@ func NewOrigin() IProtocol {
 
 func (o *origin) InitWithServerInfo(s *ServerInfo) {
 	o.ServerInfo = *s
-}
-
-func (o *origin) GetServerInfo() (s *ServerInfo) {
-	return &o.ServerInfo
 }
 
 func (a *origin) EncodePkt(buf *bytes.Buffer) (err error) {

@@ -142,15 +142,6 @@ func (p *h2ConnsPool) Connect(ctx context.Context) (err error) {
 	defer func() {
 		p.stateMu.Lock()
 		p.connecting--
-		if err == nil {
-			ready := 0
-			for _, usable := range p.members {
-				if usable {
-					ready++
-				}
-			}
-			p.recoveryRequired.Store(!p.http1 && ready < p.desired)
-		}
 		if !p.closed {
 			p.publishLocked(err, "")
 		}

@@ -16,11 +16,11 @@ import (
 func init() { protocol.Register("vmess", NewDialer) }
 
 type Dialer struct {
-	protocol.StatelessDialer
-	address    string
-	cipher     Cipher
-	key        [16]byte
-	packetAddr bool
+	ParentDialer netproxy.Dialer
+	address      string
+	cipher       Cipher
+	key          [16]byte
+	packetAddr   bool
 }
 
 func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -39,7 +39,7 @@ func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer,
 	if err != nil {
 		return nil, err
 	}
-	return &Dialer{StatelessDialer: protocol.StatelessDialer{ParentDialer: parent}, address: header.ProxyAddress, cipher: cipher, key: commandKey(id), packetAddr: header.Flags&protocol.Flags_VMess_UsePacketAddr != 0}, nil
+	return &Dialer{ParentDialer: parent, address: header.ProxyAddress, cipher: cipher, key: commandKey(id), packetAddr: header.Flags&protocol.Flags_VMess_UsePacketAddr != 0}, nil
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {

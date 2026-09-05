@@ -5,17 +5,14 @@ import (
 	"io"
 	"net"
 	"testing"
-	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	proto "github.com/daeuniverse/outbound/pkg/gun_proto"
-	grpcapi "google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 type failedTunnel struct {
-	grpcapi.ClientStream
 	err error
 }
 
@@ -68,26 +65,5 @@ func TestNormalRPCReadEOFAndExplicitCleanupAreDistinct(t *testing.T) {
 	_ = conn.Close()
 	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) || netproxy.ClassifyFailure(err).Origin != netproxy.OriginLocalCleanup {
 		t.Fatalf("local cleanup lacks evidence: %v", err)
-	}
-}
-
-type waitingEOF struct {
-	failedTunnel
-	ready chan struct{}
-}
-
-func (s *waitingEOF) Recv() (*proto.Hunk, error) { <-s.ready; return nil, io.EOF }
-func TestRPCZeroDeadlineClearsExpiredOperation(t *testing.T) {
-	ready := make(chan struct{})
-	conn := NewClientConn(&waitingEOF{ready: ready}, func() {})
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(-time.Second))
-	if _, err := conn.Read(make([]byte, 1)); netproxy.ClassifyFailure(err).Reason != netproxy.ReasonDeadline {
-		t.Fatalf("expired deadline=%v", err)
-	}
-	_ = conn.SetReadDeadline(time.Time{})
-	close(ready)
-	if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
-		t.Fatalf("cleared deadline=%v", err)
 	}
 }

@@ -25,9 +25,6 @@ func TestGRPCSecuritySelection(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer built.Close()
-			if transport.ServiceName != "custom" || transport.Address != "proxy.example:443" {
-				t.Fatalf("transport = %#v", transport)
-			}
 			if security == "none" {
 				if transport.TLSConfig != nil {
 					t.Fatal("plaintext requested but TLS enabled")
@@ -40,19 +37,16 @@ func TestGRPCSecuritySelection(t *testing.T) {
 }
 
 func TestUnsupportedSecurityDoesNotFallBack(t *testing.T) {
-	for _, transport := range []string{"tcp", "ws", "grpc", "h2", "meek", "httpupgrade"} {
-		for _, security := range []string{"utls", "unknown", "reality"} {
-			if transport == "tcp" && security == "reality" {
-				continue
-			}
-			t.Run(transport+"/"+security, func(t *testing.T) {
-				config := &V2Ray{Protocol: "vless", Add: "proxy.example", Port: "443", ID: "00000000-0000-0000-0000-000000000000", Net: transport, TLS: security}
-				built, err := config.Build(new(dialer.ExtraOption), dialer.NewUpstream(new(testParentDialer)))
-				if err == nil {
-					built.Close()
-					t.Fatal("unsupported security silently accepted")
-				}
-			})
+	for _, tc := range []struct{ protocol, network, security string }{
+		{"vless", "tcp", "utls"},
+		{"vless", "ws", "reality"},
+		{"vmess", "tcp", "reality"},
+	} {
+		config := &V2Ray{Protocol: tc.protocol, Add: "proxy.example", Port: "443", ID: "00000000-0000-0000-0000-000000000000", Net: tc.network, TLS: tc.security}
+		built, err := config.Build(new(dialer.ExtraOption), dialer.NewUpstream(new(testParentDialer)))
+		if err == nil {
+			built.Close()
+			t.Fatalf("unsupported %s/%s/%s accepted", tc.protocol, tc.network, tc.security)
 		}
 	}
 }

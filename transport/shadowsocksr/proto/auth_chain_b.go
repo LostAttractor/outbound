@@ -7,10 +7,6 @@ import (
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto"
 )
 
-func init() {
-	register("auth_chain_b", NewAuthChainB)
-}
-
 func NewAuthChainB() IProtocol {
 	a := &authChainA{
 		salt:       "auth_chain_b",

@@ -177,9 +177,9 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		}
 	case "grpc":
 		transport := &grpc.Dialer{
-			StatelessDialer: protocol.StatelessDialer{ParentDialer: layer.Data},
-			ServiceName:     s.Path,
-			Address:         proxyAddress,
+			ParentDialer: layer.Data,
+			ServiceName:  s.Path,
+			Address:      proxyAddress,
 		}
 		if s.TLS == "tls" {
 			transport.TLSConfig = &cryptotls.Config{ServerName: sni, InsecureSkipVerify: s.AllowInsecure || option.AllowInsecure}
@@ -187,7 +187,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		layer.Data = transport
 		layer.Sessions = append(layer.Sessions, transport)
 		layer.Resources = append(layer.Resources, transport)
-	case "http", "http2", "h2":
+	case "http", "h2":
 		sni := s.SNI
 		if sni == "" {
 			sni = s.Add
@@ -264,7 +264,6 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 		Cipher:       dataCipher,
 		Password:     s.ID,
 		Feature1:     s.Flow,
-		//Flags:        protocol.Flags_VMess_UsePacketAddr,
 	}))
 	return
 }
@@ -311,9 +310,6 @@ func ParseVlessURL(vless string) (data *V2Ray, err error) {
 	if data.TLS == "" {
 		data.TLS = "none"
 	}
-	if data.Type == "mkcp" || data.Type == "kcp" {
-		data.Path = u.Query().Get("seed")
-	}
 	return data, nil
 }
 
@@ -353,17 +349,14 @@ func ParseVmessURL(link string) (*V2Ray, error) {
 		if err != nil {
 			return nil, err
 		}
-		info.Ps = q.Get("remarks")
-		if info.Ps == "" {
-			info.Ps = q.Get("remark")
+		if q.Has("remark") || q.Has("aid") {
+			return nil, fmt.Errorf("%w: compact VMess uses remarks and alterId", dialer.UnexpectedFieldErr)
 		}
+		info.Ps = q.Get("remarks")
 		info.Net = q.Get("obfs")
 		info.Host = jsoniter.Get([]byte(q.Get("obfsParam")), "host").ToString()
 		info.Path = q.Get("path")
 		info.Aid = q.Get("alterId")
-		if info.Aid == "" {
-			info.Aid = q.Get("aid")
-		}
 		info.SNI = q.Get("peer")
 		switch q.Get("tls") {
 		case "", "0":
@@ -372,13 +365,6 @@ func ParseVmessURL(link string) (*V2Ray, error) {
 		default:
 			return nil, fmt.Errorf("%w: VMess TLS option", dialer.UnexpectedFieldErr)
 		}
-		if info.Net == "websocket" {
-			info.Net = "ws"
-		}
-	}
-	if strings.HasPrefix(info.Host, "/") && info.Path == "" {
-		info.Path = info.Host
-		info.Host = ""
 	}
 	if info.Aid == "" {
 		info.Aid = "0"
@@ -399,12 +385,9 @@ func (s *V2Ray) ExportToURL() string {
 		common.SetValue(&query, "security", s.TLS)
 		common.SetValue(&query, "encryption", s.Encryption)
 		switch s.Net {
-		case "websocket", "ws", "http", "h2", "httpupgrade":
+		case "ws", "http", "h2", "httpupgrade":
 			common.SetValue(&query, "path", s.Path)
 			common.SetValue(&query, "host", s.Host)
-		case "mkcp", "kcp":
-			common.SetValue(&query, "headerType", s.Type)
-			common.SetValue(&query, "seed", s.Path)
 		case "tcp":
 			common.SetValue(&query, "headerType", s.Type)
 			common.SetValue(&query, "host", s.Host)
@@ -415,7 +398,6 @@ func (s *V2Ray) ExportToURL() string {
 			common.SetValue(&query, "url", s.Host)
 		}
 
-		//TODO: QUIC
 		if s.TLS != "none" {
 			common.SetValue(&query, "sni", s.SNI)
 			common.SetValue(&query, "alpn", s.Alpn)
@@ -436,6 +418,5 @@ func (s *V2Ray) ExportToURL() string {
 		b, _ := jsoniter.Marshal(s)
 		return "vmess://" + strings.TrimSuffix(base64.StdEncoding.EncodeToString(b), "=")
 	}
-	//log.Warn("unexpected protocol: %v", v.Protocol)
 	return ""
 }

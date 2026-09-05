@@ -43,9 +43,9 @@ func parseRange(str string) (min, max int64, err error) {
 
 // Ws is a base Ws struct
 type Ws struct {
-	protocol.StatelessDialer
+	ParentDialer        netproxy.Dialer
 	wsAddr              string
-	header              http.Header
+	host                string
 	tlsClientConfig     *tls.Config
 	passthroughUdp      bool
 	tlsFragmentation    bool
@@ -124,16 +124,15 @@ func (s *WsConfig) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (
 		Path:   s.Path,
 	}
 	ws := &Ws{
-		StatelessDialer: protocol.StatelessDialer{ParentDialer: upstream},
-		wsAddr:          wsUrl.String(),
-		passthroughUdp:  s.PassthroughUdp,
-		header:          http.Header{},
+		ParentDialer:   upstream,
+		wsAddr:         wsUrl.String(),
+		passthroughUdp: s.PassthroughUdp,
+		host:           s.Hostname,
 		tlsClientConfig: &tls.Config{
 			ServerName:         s.Sni,
 			InsecureSkipVerify: s.AllowInsecure || option.AllowInsecure,
 		},
 	}
-	ws.header.Set("Host", s.Hostname)
 	if len(s.Alpn) > 0 {
 		ws.tlsClientConfig.NextProtos = strings.Split(s.Alpn, ",")
 	}
@@ -193,10 +192,9 @@ func (s *Ws) DialContext(ctx context.Context, network, addr string) (c net.Conn,
 				return err
 			}
 			key := base64.StdEncoding.EncodeToString(nonce[:])
-			request := &http.Request{Method: "GET", URL: endpoint, Host: endpoint.Host, Header: s.header.Clone()}
-			if host := request.Header.Get("Host"); host != "" {
-				request.Host = host
-				request.Header.Del("Host")
+			request := &http.Request{Method: "GET", URL: endpoint, Host: endpoint.Host, Header: make(http.Header)}
+			if s.host != "" {
+				request.Host = s.host
 			}
 			request.Header.Set("Upgrade", "websocket")
 			request.Header.Set("Connection", "Upgrade")

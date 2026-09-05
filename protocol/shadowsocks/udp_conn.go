@@ -19,13 +19,13 @@ type UdpConn struct {
 	sg         SaltGenerator
 }
 
-func NewUdpConn(conn net.Conn, conf *ciphers.CipherConf, masterKey []byte, sg SaltGenerator) (*UdpConn, error) {
+func NewUdpConn(conn net.Conn, conf *ciphers.CipherConf, masterKey []byte, sg SaltGenerator) *UdpConn {
 	return &UdpConn{
 		Conn:       conn,
 		cipherConf: conf,
 		masterKey:  masterKey,
 		sg:         sg,
-	}, nil
+	}
 }
 
 func (c *UdpConn) WriteTo(b []byte, addr net.Addr) (int, error) {

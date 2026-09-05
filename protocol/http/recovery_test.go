@@ -1,14 +1,12 @@
 package http
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	stdhttp "net/http"
 	"os"
 	"sync/atomic"
 	"syscall"
@@ -16,7 +14,6 @@ import (
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -139,7 +136,7 @@ func (*localH2Parent) ListenPacket(context.Context, string) (net.PacketConn, err
 func newRecoveryProxy(t *testing.T, max uint32) (*HttpProxy, *localH2Parent) {
 	t.Helper()
 	parent := &localH2Parent{max: max, servers: make(chan *localH2Server, 16)}
-	proxy := &HttpProxy{StatelessDialer: protocol.StatelessDialer{ParentDialer: parent}, https: true, Addr: "local:443", pool: newH2ConnsPool(parent, "local:443")}
+	proxy := &HttpProxy{ParentDialer: parent, https: true, Addr: "local:443", pool: newH2ConnsPool(parent, "local:443")}
 	t.Cleanup(func() { _ = proxy.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -392,69 +389,6 @@ func TestH2RecoveryPassiveGoAwayObserverFragmentedAndBounded(t *testing.T) {
 	var away http2.GoAwayError
 	if !errors.As(p.Snapshot().Cause, &away) || away.LastStreamID != 3 || away.ErrCode != http2.ErrCodeEnhanceYourCalm || len(away.DebugData) != 256 {
 		t.Fatalf("lost bounded GOAWAY metadata: %+v", away)
-	}
-}
-
-type localHTTP1Parent struct{ serverErr chan error }
-
-func (p *localHTTP1Parent) DialContext(context.Context, string, string) (net.Conn, error) {
-	client, server := net.Pipe()
-	go func() {
-		defer server.Close()
-		req, err := stdhttp.ReadRequest(bufio.NewReader(server))
-		if err != nil {
-			p.serverErr <- err
-			return
-		}
-		if req.Method != "CONNECT" {
-			p.serverErr <- fmt.Errorf("unexpected method %s", req.Method)
-			return
-		}
-		if _, err = io.WriteString(server, "HTTP/1.1 200 Connection Established\r\n\r\nhello"); err == nil {
-			data := make([]byte, 4)
-			_, err = io.ReadFull(server, data)
-			if err == nil && string(data) != "ping" {
-				err = fmt.Errorf("unexpected tunnel data %q", data)
-			}
-		}
-		p.serverErr <- err
-	}()
-	return &negotiatedTestConn{Conn: client, proto: "http/1.1", lease: netproxy.NewLease(netproxy.NewResourceRef())}, nil
-}
-func (*localHTTP1Parent) ListenPacket(context.Context, string) (net.PacketConn, error) {
-	return nil, errors.New("unexpected UDP")
-}
-func TestHTTP1RecoveryConnectPreservesBufferedTunnelData(t *testing.T) {
-	parent := &localHTTP1Parent{serverErr: make(chan error, 1)}
-	proxy := &HttpProxy{StatelessDialer: protocol.StatelessDialer{ParentDialer: parent}, https: true, Addr: "local:443", pool: newH2ConnsPool(parent, "local:443")}
-	// HTTP/1 is stateless after ALPN selected by the session preflight.
-	proxy.pool.stateMu.Lock()
-	proxy.pool.http1 = true
-	proxy.pool.publishLocked(nil, "")
-	proxy.pool.stateMu.Unlock()
-	defer proxy.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	conn, err := proxy.DialContext(ctx, "tcp", "target.test:443")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if netproxy.DependencyOf(conn) == nil {
-		t.Fatal("HTTP/1 wrapper lost actual dependency")
-	}
-	buf := make([]byte, 5)
-	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "hello" {
-		t.Fatalf("CONNECT read-ahead lost: %q %v", buf, err)
-	}
-	if _, err := conn.Write([]byte("ping")); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-parent.serverErr; err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := conn.(netproxy.CloseWriter); ok {
-		t.Fatal("HTTP/1 advertised unsupported half-close")
 	}
 }
 

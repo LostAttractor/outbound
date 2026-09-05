@@ -29,7 +29,7 @@ func TestStreamReadDeadlineIsolatedFromCarrierAndSibling(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	carrier := &deadlineSpyConn{Conn: client}
-	s := newSession(carrier, nil)
+	s := newSession(carrier, nil, nil)
 	defer s.Close()
 	first, second := newStream(s, 1), newStream(s, 2)
 	s.streams[1], s.streams[2] = first, second
@@ -78,7 +78,7 @@ func TestStreamWriteDeadlineBoundsPendingWorkAndOwnsBuffer(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	carrier := &blockedOwnedWriteConn{deadlineSpyConn: &deadlineSpyConn{Conn: client}, entered: make(chan struct{}), release: make(chan struct{}), captured: make(chan []byte, 8)}
-	s := newSession(carrier, nil)
+	s := newSession(carrier, nil, nil)
 	s.sendPadding = false
 	c := newStream(s, 1)
 	s.streams[1] = c
@@ -131,7 +131,7 @@ func TestClosedStreamsDoNotAccumulateWorkersBehindCarrierWrite(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	carrier := &blockedOwnedWriteConn{deadlineSpyConn: &deadlineSpyConn{Conn: client}, entered: make(chan struct{}), release: make(chan struct{}), captured: make(chan []byte, 8)}
-	s := newSession(carrier, nil)
+	s := newSession(carrier, nil, nil)
 	s.sendPadding = false
 	defer s.Close()
 	first := newStream(s, 1)
@@ -175,7 +175,7 @@ func TestCanceledOpenStreamsLeaveNoWorkBehindSharedWriter(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	carrier := &blockedOwnedWriteConn{deadlineSpyConn: &deadlineSpyConn{Conn: client}, entered: make(chan struct{}), release: make(chan struct{}), captured: make(chan []byte, 8)}
-	s := newSession(carrier, nil)
+	s := newSession(carrier, nil, nil)
 	s.sendPadding = false
 	defer s.Close()
 	first := newStream(s, 1)
@@ -226,7 +226,7 @@ func TestCanceledFirstPacketKeepsAddressHeaderForNextWrite(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	carrier := &capturedFrameConn{Conn: client, frames: make(chan []byte, 8)}
-	s := newSession(carrier, nil)
+	s := newSession(carrier, nil, nil)
 	s.sendPadding = false
 	defer s.Close()
 	stream := newStream(s, 1)

@@ -15,7 +15,6 @@ import (
 
 	"github.com/daeuniverse/outbound/netproxy"
 	gun "github.com/daeuniverse/outbound/pkg/gun_proto"
-	"github.com/daeuniverse/outbound/protocol"
 	grpcapi "google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/test/bufconn"
@@ -43,7 +42,7 @@ func newPeerDialer(t *testing.T, secure bool, handler func(any, grpcapi.ServerSt
 	t.Helper()
 	listener := bufconn.Listen(1 << 20)
 	options := []grpcapi.ServerOption{grpcapi.StaticStreamWindowSize(65535)}
-	d := &Dialer{StatelessDialer: protocol.StatelessDialer{ParentDialer: peerDialer{listener}}, Address: "passthrough:///peer", ServiceName: "custom"}
+	d := &Dialer{ParentDialer: peerDialer{listener}, Address: "passthrough:///peer", ServiceName: "custom"}
 	if secure {
 		certServer := httptest.NewTLSServer(nil)
 		options = append(options, grpcapi.Creds(credentials.NewTLS(&tls.Config{Certificates: certServer.TLS.Certificates})))

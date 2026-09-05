@@ -15,9 +15,9 @@ import (
 func init() { protocol.Register("shadowsocks_stream", NewDialer) }
 
 type Dialer struct {
-	protocol.StatelessDialer
-	address string
-	cipher  *ciphers.StreamCipher
+	ParentDialer netproxy.Dialer
+	address      string
+	cipher       *ciphers.StreamCipher
 }
 
 func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -25,7 +25,7 @@ func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer,
 	if err != nil {
 		return nil, err
 	}
-	return &Dialer{StatelessDialer: protocol.StatelessDialer{ParentDialer: parent}, address: header.ProxyAddress, cipher: cipher}, nil
+	return &Dialer{ParentDialer: parent, address: header.ProxyAddress, cipher: cipher}, nil
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {

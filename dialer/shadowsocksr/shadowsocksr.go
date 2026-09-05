@@ -18,7 +18,6 @@ import (
 )
 
 func init() {
-	dialer.FromLinkRegister("shadowsocksr", NewShadowsocksR)
 	dialer.FromLinkRegister("ssr", NewShadowsocksR)
 }
 
@@ -78,11 +77,11 @@ func (s *ShadowsocksR) Build(_ *dialer.ExtraOption, upstream dialer.Upstream) (n
 	return layer, nil
 }
 
-// ParseSSRURL accepts the standard URL-safe Base64 payload for both registered
-// scheme names. The server inside that payload is plain text, including IPv6.
+// ParseSSRURL accepts the standard ssr:// URL-safe Base64 payload.
+// The server inside that payload is plain text, including IPv6.
 func ParseSSRURL(link string) (*ShadowsocksR, error) {
 	scheme, encoded, ok := strings.Cut(link, "://")
-	if !ok || (strings.ToLower(scheme) != "ssr" && strings.ToLower(scheme) != "shadowsocksr") {
+	if !ok || scheme != "ssr" {
 		return nil, fmt.Errorf("%w: expected ssr:// link", dialer.InvalidParameterErr)
 	}
 	content, err := decodeURLBase64(encoded, "payload")

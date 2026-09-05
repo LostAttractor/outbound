@@ -62,8 +62,7 @@ func (c *memoryConn) SetWriteDeadline(time.Time) error { return nil }
 
 type fixedSalt []byte
 
-func (s fixedSalt) Get() []byte  { b := pool.GetBuffer(len(s)); copy(b, s); return b }
-func (s fixedSalt) Close() error { return nil }
+func (s fixedSalt) Get() []byte { b := pool.GetBuffer(len(s)); copy(b, s); return b }
 
 // Peer codecs live only in tests and use the specified BLAKE3/AES construction.
 func peerCipher(t *testing.T, key, salt []byte) cipher.AEAD {
@@ -246,10 +245,7 @@ func newUDPForTest(t *testing.T) (*UdpConn, *memoryConn) {
 		t.Fatal(err)
 	}
 	raw := new(memoryConn)
-	c, err := NewUdpConn(raw, conf, block, block, [][]byte{key}, key)
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewUdpConn(raw, conf, block, block, [][]byte{key}, key)
 	return c, raw
 }
 func TestClientUDPReplayWindowCommitsOnlyValidPackets(t *testing.T) {

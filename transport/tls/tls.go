@@ -9,13 +9,12 @@ import (
 
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 	utls "github.com/refraction-networking/utls"
 )
 
 // Tls is a base Tls struct
 type Tls struct {
-	protocol.StatelessDialer
+	ParentDialer        netproxy.Dialer
 	addr                string
 	tlsImplentation     string
 	utlsImitate         string

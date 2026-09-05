@@ -10,10 +10,6 @@ import (
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto"
 )
 
-func init() {
-	register("auth_sha1_v4", NewAuthSHA1v4)
-}
-
 type authSHA1v4 struct {
 	*ServerInfo
 	data          AuthData

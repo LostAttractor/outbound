@@ -44,3 +44,14 @@ func TestGRPCShadowsocksDeclaresSessionAndOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTrojanShareDoesNotGuessDeprecatedOptions(t *testing.T) {
+	for _, link := range []string{
+		"trojan://password@localhost:443?skipVerify=1",
+		"trojan-go://password@localhost:443?type=grpc&path=service",
+	} {
+		if _, _, err := NewTrojan(link); err == nil {
+			t.Fatalf("implicit compatibility accepted: %s", link)
+		}
+	}
+}

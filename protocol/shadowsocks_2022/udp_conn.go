@@ -70,10 +70,10 @@ func (s *serverSession) accept(packetID uint64) bool {
 	return true
 }
 
-func NewUdpConn(conn net.Conn, conf *ciphers.CipherConf2022, encrypt, decrypt cipher.Block, pskList [][]byte, uPSK []byte) (*UdpConn, error) {
+func NewUdpConn(conn net.Conn, conf *ciphers.CipherConf2022, encrypt, decrypt cipher.Block, pskList [][]byte, uPSK []byte) *UdpConn {
 	c := &UdpConn{Conn: conn, cipherConf: conf, blockCipherEncrypt: encrypt, blockCipherDecrypt: decrypt, pskList: pskList, uPSK: uPSK}
 	fastrand.Read(c.sessionID[:])
-	return c, nil
+	return c
 }
 
 func (c *UdpConn) writeIdentityHeader(buf *bytes.Buffer, separate []byte) error {

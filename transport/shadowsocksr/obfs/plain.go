@@ -1,12 +1,5 @@
 package obfs
 
-func init() {
-	register("plain", &constructor{
-		New:      newPlainObfs,
-		Overhead: 0,
-	})
-}
-
 type plain struct {
 	ServerInfo
 }

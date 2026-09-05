@@ -20,10 +20,6 @@ import (
 	"github.com/daeuniverse/outbound/transport/shadowsocksr/internal/crypto"
 )
 
-func init() {
-	register("auth_chain_a", NewAuthChainA)
-}
-
 type authChainA struct {
 	*ServerInfo
 	randomClient crypto.Shift128plusContext

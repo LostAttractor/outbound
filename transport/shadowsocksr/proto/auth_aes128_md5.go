@@ -14,10 +14,6 @@ import (
 	rand "github.com/daeuniverse/outbound/pkg/fastrand"
 )
 
-func init() {
-	register("auth_aes128_md5", NewAuthAES128MD5)
-}
-
 func NewAuthAES128MD5() IProtocol {
 	a := &authAES128{
 		salt:       "auth_aes128_md5",

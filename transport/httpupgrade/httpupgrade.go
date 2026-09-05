@@ -18,11 +18,11 @@ import (
 )
 
 type Dialer struct {
-	protocol.StatelessDialer
-	address   string
-	host      string
-	path      *url.URL
-	tlsConfig *tls.Config
+	ParentDialer netproxy.Dialer
+	address      string
+	host         string
+	path         *url.URL
+	tlsConfig    *tls.Config
 }
 
 func NewDialer(link string, parent netproxy.Dialer) (*Dialer, error) {

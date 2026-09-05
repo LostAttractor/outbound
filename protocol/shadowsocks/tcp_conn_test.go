@@ -94,9 +94,8 @@ func (g *fixedSaltGenerator) Get() []byte {
 	copy(salt, g.salt)
 	return salt
 }
-func (g *fixedSaltGenerator) Close() error { return nil }
 
-func TestTCPConnReleasesBufferedPayload(t *testing.T) {
+func TestTCPConnBufferedPayloadLifecycle(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	conn := &TCPConn{
@@ -118,23 +117,15 @@ func TestTCPConnReleasesBufferedPayload(t *testing.T) {
 	if conn.readBuf != nil || conn.readOffset != 0 {
 		t.Fatal("completed read retained its payload")
 	}
-}
-
-func TestTCPConnCloseReleasesBufferedPayload(t *testing.T) {
-	client, server := net.Pipe()
-	defer server.Close()
-	conn := &TCPConn{
-		Conn:       client,
-		readBuf:    pool.GetBuffer(16),
-		readOffset: 4,
-	}
-
+	conn.readBuf = pool.GetBuffer(16)
+	conn.readOffset = 4
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if conn.readBuf != nil || conn.readOffset != 0 {
 		t.Fatal("Close retained its payload")
 	}
+
 }
 
 func TestTCPConnCloseUnblocksRead(t *testing.T) {
@@ -451,7 +442,7 @@ func TestUDPShortCallerBufferStillAuthenticatesWholePacket(t *testing.T) {
 	wire := aead.Seal(append([]byte(nil), salt...), make([]byte, 12), plaintext, nil)
 	done := make(chan error, 1)
 	go func() { _, err := server.Write(wire); done <- err }()
-	c, _ := NewUdpConn(client, conf, key, &fixedSaltGenerator{salt: salt})
+	c := NewUdpConn(client, conf, key, &fixedSaltGenerator{salt: salt})
 	tiny := make([]byte, 2)
 	if n, addr, err := c.ReadFrom(tiny); err != nil || n != 2 || string(tiny) != "lo" || addr.String() != "127.0.0.1:53" {
 		t.Fatalf("ReadFrom=%d %v %v", n, addr, err)

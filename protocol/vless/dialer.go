@@ -17,7 +17,7 @@ const XRV = "xtls-rprx-vision"
 func init() { protocol.Register("vless", NewDialer) }
 
 type Dialer struct {
-	protocol.StatelessDialer
+	ParentDialer  netproxy.Dialer
 	address, flow string
 	key           []byte
 }
@@ -38,7 +38,7 @@ func NewDialer(parent netproxy.Dialer, header protocol.Header) (netproxy.Dialer,
 	if flow != "" && flow != XRV {
 		return nil, fmt.Errorf("unsupported VLESS flow: %s", flow)
 	}
-	return &Dialer{StatelessDialer: protocol.StatelessDialer{ParentDialer: parent}, address: header.ProxyAddress, flow: flow, key: key}, nil
+	return &Dialer{ParentDialer: parent, address: header.ProxyAddress, flow: flow, key: key}, nil
 }
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	switch network {

@@ -38,12 +38,9 @@ type session struct {
 	onIdle    func(*session)
 }
 
-func newSession(conn net.Conn, onIdle func(*session), dependencies ...*netproxy.Lease) *session {
-	if len(dependencies) == 0 {
-		dependencies = []*netproxy.Lease{netproxy.DependencyOf(conn)}
-	}
+func newSession(conn net.Conn, onIdle func(*session), dependency *netproxy.Lease) *session {
 	s := &session{
-		lease: netproxy.NewLease(netproxy.NewResourceRef(), dependencies...),
+		lease: netproxy.NewLease(netproxy.NewResourceRef(), dependency),
 		conn:  conn, writeGate: make(chan struct{}, 1), pendingFIN: make(chan uint32, 256),
 		streams:     map[uint32]*stream{},
 		onIdle:      onIdle,

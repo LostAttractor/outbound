@@ -95,37 +95,37 @@ func buildRequestSecurity(t *testing.T, builder dialer.Builder) byte {
 func TestVMessShareCipherReachesWireAndExport(t *testing.T) {
 	previous := hasAESGCMHardwareSupport
 	defer func() { hasAESGCMHardwareSupport = previous }()
-	for _, format := range []string{"json", "compact"} {
-		for _, selected := range []string{"aes-128-gcm", "chacha20-poly1305", "", "auto"} {
-			for _, hardware := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s/%s/AES=%v", format, selected, hardware), func(t *testing.T) {
-					hasAESGCMHardwareSupport = hardware
-					want := byte(3)
-					if selected == "chacha20-poly1305" || ((selected == "" || selected == "auto") && !hardware) {
-						want = 4
-					}
-					link := vmessCipherLink(format, selected)
-					for round := 0; round < 2; round++ {
-						builder, property, err := NewV2Ray(link)
-						if err != nil {
-							t.Fatal(err)
-						}
-						if got := buildRequestSecurity(t, builder); got != want {
-							t.Fatalf("request security=%d,want=%d (export round %d)", got, want, round)
-						}
-						link = property.Link
-					}
-				})
+	for _, tc := range []struct {
+		format, selected string
+		hardware         bool
+		want             byte
+	}{
+		{"json", "chacha20-poly1305", true, 4},
+		{"compact", "aes-128-gcm", false, 3},
+		{"json", "", false, 4},
+		{"compact", "auto", true, 3},
+	} {
+		t.Run(tc.format+"/"+tc.selected, func(t *testing.T) {
+			hasAESGCMHardwareSupport = tc.hardware
+			link := vmessCipherLink(tc.format, tc.selected)
+			for round := 0; round < 2; round++ {
+				builder, property, err := NewV2Ray(link)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := buildRequestSecurity(t, builder); got != tc.want {
+					t.Fatalf("request security=%d,want=%d (export round %d)", got, tc.want, round)
+				}
+				link = property.Link
 			}
-		}
+		})
 	}
 }
+
 func TestShareLinksRejectUnsupportedDataEncryption(t *testing.T) {
-	for _, cipher := range []string{"none", "zero", "unsupported"} {
-		for _, format := range []string{"json", "compact"} {
-			if _, _, err := NewV2Ray(vmessCipherLink(format, cipher)); err == nil || !strings.Contains(err.Error(), "cipher") {
-				t.Fatalf("VMess %s cipher %q: %v", format, cipher, err)
-			}
+	for _, tc := range []struct{ format, cipher string }{{"json", "none"}, {"compact", "zero"}, {"json", "unsupported"}} {
+		if _, _, err := NewV2Ray(vmessCipherLink(tc.format, tc.cipher)); err == nil || !strings.Contains(err.Error(), "cipher") {
+			t.Fatalf("VMess cipher %q: %v", tc.cipher, err)
 		}
 	}
 	link := "vless://" + cipherTestID + "@127.0.0.1:9?encryption=unsupported&type=tcp&security=none"

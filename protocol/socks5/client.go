@@ -19,8 +19,6 @@ const (
 	replyAddressTypeNotSupported = 8
 )
 
-func NewSocks5Dialer(s string, d netproxy.Dialer) (netproxy.Dialer, error) { return NewSocks5(s, d) }
-
 func (s *Socks5) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	switch network {
 	case "tcp":

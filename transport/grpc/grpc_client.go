@@ -14,7 +14,6 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/cert"
 	proto "github.com/daeuniverse/outbound/pkg/gun_proto"
-	"github.com/daeuniverse/outbound/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/connectivity"
@@ -254,10 +253,10 @@ func (c *ClientConn) LocalAddr() net.Addr  { return nil }
 func (c *ClientConn) RemoteAddr() net.Addr { return nil }
 
 type Dialer struct {
-	protocol.StatelessDialer
-	ServiceName string
-	Address     string
-	TLSConfig   *tls.Config // nil uses plaintext HTTP/2
+	ParentDialer netproxy.Dialer
+	ServiceName  string
+	Address      string
+	TLSConfig    *tls.Config // nil uses plaintext HTTP/2
 
 	initOnce  sync.Once
 	lifecycle *netproxy.SingleSession[*grpc.ClientConn]

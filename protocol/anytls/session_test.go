@@ -38,7 +38,7 @@ func (c *lateWriteConn) Write(p []byte) (int, error) {
 func TestSessionCloseWithActiveStreamDoesNotDeadlock(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
-	session := newSession(client, nil)
+	session := newSession(client, nil, nil)
 	stream := newStream(session, 1)
 	session.streams[stream.id] = stream
 
@@ -62,7 +62,7 @@ func TestNewStreamCannotPublishAfterSessionClose(t *testing.T) {
 		writeStarted: make(chan struct{}),
 		releaseWrite: make(chan struct{}),
 	}
-	session := newSession(conn, nil)
+	session := newSession(conn, nil, nil)
 	session.sendPadding = false
 	result := make(chan error, 1)
 	go func() {
@@ -111,7 +111,7 @@ func TestDialerCloseWaitsForStreamWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	carrier := &lateWriteConn{writeStarted: make(chan struct{}), releaseWrite: make(chan struct{})}
-	s := newSession(carrier, d.sessionIdle)
+	s := newSession(carrier, d.sessionIdle, nil)
 	s.sendPadding = false
 	d.sessions[s] = struct{}{}
 	d.idleSessions[s] = struct{}{}
@@ -145,7 +145,7 @@ func (testParentDialer) ListenPacket(context.Context, string) (net.PacketConn, e
 
 func TestClosedStreamDoesNotKillSessionReader(t *testing.T) {
 	client, server := net.Pipe()
-	s := newSession(client, nil)
+	s := newSession(client, nil, nil)
 	first, second := newStream(s, 1), newStream(s, 2)
 	s.streams[1], s.streams[2] = first, second
 	_ = first.pr.Close()
@@ -183,7 +183,7 @@ func TestClosedStreamDoesNotKillSessionReader(t *testing.T) {
 func TestTargetRejectionDoesNotInvalidateSharedSession(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
-	s := newSession(client, nil)
+	s := newSession(client, nil, nil)
 	defer s.Close()
 	first, second := newStream(s, 1), newStream(s, 2)
 	s.streams[1], s.streams[2] = first, second
@@ -219,7 +219,7 @@ func TestBusyAnyTLSPoolOnlyRequestsBackgroundExpansion(t *testing.T) {
 	}
 	client, server := net.Pipe()
 	defer server.Close()
-	s := newSession(client, nil)
+	s := newSession(client, nil, nil)
 	d.sessions[s] = struct{}{}
 	d.state.Transition(netproxy.SessionConnected, nil)
 	defer d.Close()
@@ -256,7 +256,7 @@ func TestBusyAnyTLSPoolOnlyRequestsBackgroundExpansion(t *testing.T) {
 func TestSessionCloseDoesNotSuppressIndependentProtocolFailure(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
-	s := newSession(client, nil)
+	s := newSession(client, nil, nil)
 	_ = s.Close()
 	failure := netproxy.ClassifyFailure(s.fail(&quic.TransportError{ErrorCode: 1}, netproxy.OpRead))
 	if failure.Scope != netproxy.ScopeSharedResource || failure.Layer != netproxy.LayerQUIC || failure.Origin == netproxy.OriginLocalCleanup {
@@ -266,7 +266,7 @@ func TestSessionCloseDoesNotSuppressIndependentProtocolFailure(t *testing.T) {
 func TestUnknownStreamFailureDoesNotInventCleanupOrigin(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
-	s := newSession(client, nil)
+	s := newSession(client, nil, nil)
 	defer s.Close()
 	failure := netproxy.ClassifyFailure(s.failure(errors.New("unknown peer failure"), netproxy.OpRead))
 	if failure.Origin == netproxy.OriginLocalCleanup {
@@ -285,7 +285,7 @@ func TestPoolResourceAndEpisodesStayStableAcrossMemberFailures(t *testing.T) {
 	for i := range members {
 		client, server := net.Pipe()
 		defer server.Close()
-		members[i] = newSession(client, nil)
+		members[i] = newSession(client, nil, nil)
 		d.sessions[members[i]] = struct{}{}
 	}
 	initial := d.Snapshot()

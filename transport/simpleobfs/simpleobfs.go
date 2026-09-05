@@ -6,7 +6,6 @@ import (
 	"net"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 )
 
 type ObfsType int
@@ -29,11 +28,11 @@ func NewObfsType(obfsType string) (ObfsType, error) {
 
 // SimpleObfs is a base http-obfs struct
 type SimpleObfs struct {
-	protocol.StatelessDialer
-	ObfsType ObfsType
-	Addr     string
-	Path     string
-	Host     string
+	ParentDialer netproxy.Dialer
+	ObfsType     ObfsType
+	Addr         string
+	Path         string
+	Host         string
 }
 
 func (s *SimpleObfs) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {

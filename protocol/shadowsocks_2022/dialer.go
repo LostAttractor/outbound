@@ -19,7 +19,7 @@ func init() {
 }
 
 type Dialer struct {
-	protocol.StatelessDialer
+	ParentDialer       netproxy.Dialer
 	proxyAddress       string
 	conf               *ciphers.CipherConf2022
 	pskList            [][]byte
@@ -52,10 +52,7 @@ func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.D
 	if err != nil {
 		return nil, err
 	}
-	sg, err := shadowsocks.NewRandomSaltGenerator(conf.SaltLen)
-	if err != nil {
-		return nil, err
-	}
+	sg := shadowsocks.RandomSaltGenerator(conf.SaltLen)
 	return &Dialer{
 		ParentDialer:       parentDialer,
 		proxyAddress:       header.ProxyAddress,
@@ -106,5 +103,5 @@ func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn,
 	if err != nil {
 		return nil, err
 	}
-	return NewUdpConn(conn, d.conf, d.blockCipherEncrypt, d.blockCipherDecrypt, d.pskList, d.uPSK)
+	return NewUdpConn(conn, d.conf, d.blockCipherEncrypt, d.blockCipherDecrypt, d.pskList, d.uPSK), nil
 }

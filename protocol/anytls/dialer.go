@@ -31,7 +31,7 @@ func init() {
 }
 
 type Dialer struct {
-	protocol.StatelessDialer
+	ParentDialer netproxy.Dialer
 	proxyAddress string
 	key          []byte
 	padding      atomic.Pointer[paddingFactory]
@@ -60,7 +60,7 @@ func NewDialer(ParentDialer netproxy.Dialer, header protocol.Header) (*Dialer, e
 	sum := sha256.Sum256([]byte(header.Password))
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Dialer{
-		poolRef: netproxy.NewResourceRef(), StatelessDialer: protocol.StatelessDialer{ParentDialer: ParentDialer},
+		poolRef: netproxy.NewResourceRef(), ParentDialer: ParentDialer,
 		proxyAddress: header.ProxyAddress,
 		key:          sum[:],
 		tlsConfig:    header.TlsConfig,

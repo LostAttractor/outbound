@@ -46,13 +46,6 @@ type httpSimplePost struct {
 	methodGet        bool // true for get, false for post
 }
 
-func init() {
-	register("http_simple", &constructor{
-		New:      newHttpSimple,
-		Overhead: 0,
-	})
-}
-
 // newHttpSimple create a http_simple object
 func newHttpSimple() IObfs {
 

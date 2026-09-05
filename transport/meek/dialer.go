@@ -14,14 +14,13 @@ import (
 )
 
 type Dialer struct {
-	nextDialer netproxy.Dialer
-	url        string
-	transport  *http.Transport
-	ctx        context.Context
-	cancel     context.CancelFunc
-	mu         sync.Mutex
-	workers    sync.WaitGroup
-	closeOnce  sync.Once
+	url       string
+	transport *http.Transport
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	workers   sync.WaitGroup
+	closeOnce sync.Once
 }
 
 var _ netproxy.Dialer = (*Dialer)(nil)
@@ -32,7 +31,7 @@ func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 		return nil, fmt.Errorf("NewMeek: %w", err)
 	}
 
-	m := &Dialer{nextDialer: d}
+	m := new(Dialer)
 
 	query := u.Query()
 	m.url = query.Get("url")
@@ -66,14 +65,8 @@ func NewDialer(s string, d netproxy.Dialer) (*Dialer, error) {
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.transport = &http.Transport{
 		ForceAttemptHTTP2: true,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := m.nextDialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, fmt.Errorf("[Meek]: dial to %s: %w", addr, err)
-			}
-			return conn, nil
-		},
-		TLSClientConfig: tlsConfig,
+		DialContext:       d.DialContext,
+		TLSClientConfig:   tlsConfig,
 	}
 
 	return m, nil

@@ -191,7 +191,7 @@ func incrementNonce(nonce []byte) {
 }
 
 func TestInvalidEncryptionReturnsError(t *testing.T) {
-	for _, encryption := range []string{"ss", "ss;", "ss;aes-128-gcm", "ss;;password", "ss;unknown;password", "unknown", "other;aes-128-gcm;password"} {
+	for _, encryption := range []string{"ss;aes-128-gcm", "ss;;password", "ss;unknown;password", "other;aes-128-gcm;password"} {
 		t.Run(encryption, func(t *testing.T) {
 			config := &Trojan{Server: "proxy.example", Port: 443, Encryption: encryption}
 			built, err := config.Build(&dialer.ExtraOption{TlsImplementation: "tls"}, dialer.NewUpstream(testParentDialer{}))

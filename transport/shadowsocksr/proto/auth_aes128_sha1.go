@@ -4,10 +4,6 @@ import (
 	"github.com/daeuniverse/outbound/common"
 )
 
-func init() {
-	register("auth_aes128_sha1", NewAuthAES128SHA1)
-}
-
 func NewAuthAES128SHA1() IProtocol {
 	a := &authAES128{
 		salt:       "auth_aes128_sha1",

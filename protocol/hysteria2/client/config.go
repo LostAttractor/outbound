@@ -1,7 +1,6 @@
 package client
 
 import (
-	"context"
 	"crypto/tls"
 	"net"
 	"time"
@@ -76,18 +75,6 @@ func (c *Config) verifyAndFill() error {
 
 	c.filled = true
 	return nil
-}
-
-type ConnFactory interface {
-	New(context.Context) (net.PacketConn, error)
-}
-
-type UdpConnFactory struct {
-	NewFunc func(ctx context.Context) (net.PacketConn, error)
-}
-
-func (f *UdpConnFactory) New(ctx context.Context) (net.PacketConn, error) {
-	return f.NewFunc(ctx)
 }
 
 // BandwidthConfig describes the maximum bandwidth that the server can use, in bytes per second.

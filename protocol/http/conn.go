@@ -164,7 +164,7 @@ func (h *http2Conn) Close() error {
 	return h.closeErr
 }
 func wrapH2StreamError(err error, slot *h2Conn, lease *netproxy.Lease, op netproxy.Operation, localClosed bool) error {
-	if err == nil || err == io.EOF || slot == nil {
+	if err == nil || err == io.EOF {
 		return err
 	}
 	if !localClosed {

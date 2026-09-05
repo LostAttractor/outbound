@@ -10,22 +10,21 @@ import (
 	"fmt"
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol"
 	tls2 "github.com/daeuniverse/outbound/transport/tls"
 )
 
 // HttpProxy is an HTTP/HTTPS proxy.
 type HttpProxy struct {
-	protocol.StatelessDialer
-	https     bool
-	transport bool
-	Addr      string
-	Host      string
-	Path      string
-	HaveAuth  bool
-	Username  string
-	Password  string
-	pool      *h2ConnsPool
+	ParentDialer netproxy.Dialer
+	https        bool
+	transport    bool
+	Addr         string
+	Host         string
+	Path         string
+	HaveAuth     bool
+	Username     string
+	Password     string
+	pool         *h2ConnsPool
 }
 
 func BuildHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netproxy.Dialer) (netproxy.Layer, error) {
@@ -63,12 +62,12 @@ func BuildHTTPProxy(u *url.URL, option *dialer.ExtraOption, parentDialer netprox
 	}
 	transport, _ := strconv.ParseBool(query.Get("transport"))
 	s := &HttpProxy{
-		StatelessDialer: protocol.StatelessDialer{ParentDialer: layer.Data},
-		https:           https,
-		transport:       transport,
-		Addr:            u.Host,
-		Path:            path,
-		Host:            query.Get("host"),
+		ParentDialer: layer.Data,
+		https:        https,
+		transport:    transport,
+		Addr:         u.Host,
+		Path:         path,
+		Host:         query.Get("host"),
 	}
 	if u.User != nil {
 		s.HaveAuth = true

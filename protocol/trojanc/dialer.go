@@ -13,7 +13,7 @@ import (
 func init() { protocol.Register("trojanc", NewDialer) }
 
 type Dialer struct {
-	protocol.StatelessDialer
+	ParentDialer netproxy.Dialer
 	proxyAddress string
 	password     string
 }

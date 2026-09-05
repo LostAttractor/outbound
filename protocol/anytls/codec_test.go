@@ -40,7 +40,7 @@ func TestClientPreambleOnceAndUint16StreamFraming(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
 	carrier := &capturedFrameConn{Conn: client, frames: make(chan []byte, 8)}
-	session := newSession(carrier, nil)
+	session := newSession(carrier, nil, nil)
 	session.sendPadding = false
 	defer session.Close()
 	first, err := session.newStreamContext(context.Background(), "target.test:443")
@@ -76,7 +76,7 @@ func TestPeerAlertAndMalformedControlAreResourceFailures(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client, server := net.Pipe()
 			defer server.Close()
-			s := newSession(client, nil)
+			s := newSession(client, nil, nil)
 			defer s.Close()
 			go func() { _, _ = server.Write([]byte{test.command, 0, 0, 0, 1, 0, 3, 'b', 'a', 'd'}) }()
 			err := s.run()
@@ -94,7 +94,7 @@ func TestPaddingUpdateBelongsToOneClient(t *testing.T) {
 	defer second.Close()
 	client, server := net.Pipe()
 	defer server.Close()
-	s := newSession(client, nil)
+	s := newSession(client, nil, nil)
 	s.padding = &first.padding
 	done := make(chan error, 1)
 	go func() { done <- s.run() }()
@@ -116,7 +116,7 @@ func TestPaddingUpdateBelongsToOneClient(t *testing.T) {
 func TestDatagramFramingSurvivesReadDeadlineAndShortBuffer(t *testing.T) {
 	client, server := net.Pipe()
 	defer server.Close()
-	s := newSession(client, nil)
+	s := newSession(client, nil, nil)
 	defer s.Close()
 	stream := newStream(s, 1)
 	s.streams[1] = stream
