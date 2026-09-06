@@ -103,7 +103,7 @@ func (c *Client) openStream(ctx context.Context, resource *clientResource) (*uti
 	if handle.Resource() != resource {
 		return nil, netproxy.ErrNotConnected
 	}
-	fail := func(err error) { handle.Invalidate(err) }
+	fail := func(err error) { handle.Abort(err) }
 	stream, err := resource.conn.OpenStream()
 	if err != nil {
 		return nil, tuiccommon.WrapQUICError(err, handle.Ref(), nil, netproxy.OpOpenStream, fail)
@@ -174,7 +174,7 @@ func (c *Client) ListenPacket(ctx context.Context, _ string) (net.PacketConn, er
 	if handle.Resource() != resource {
 		return nil, netproxy.ErrNotConnected
 	}
-	return resource.udpSM.NewUDP(handle.NewStreamLease(), func(err error) { handle.Invalidate(err) })
+	return resource.udpSM.NewUDP(handle.NewStreamLease(), func(err error) { handle.Abort(err) })
 }
 
 func (c *Client) DialContext(ctx context.Context, network, address string) (conn net.Conn, err error) {
@@ -341,7 +341,7 @@ func (c *Client) observe(ctx context.Context, handle *netproxy.SingleSessionHand
 	failure := netproxy.ClassifyFailure(cause)
 	failure.Scope = netproxy.ScopeSharedResource
 	cause = netproxy.WrapFailure(cause, failure)
-	handle.Disconnect(cause)
+	handle.Abort(cause)
 }
 
 func (c *Client) Close() error {

@@ -251,8 +251,14 @@ func (s *SessionGroup) aggregateLocked() StateEvent {
 	for i, child := range s.states {
 		required = required || child.RecoveryRequired
 		gate := child.State == SessionConnected && child.Accepting
-		if child.RecoveryExecutor != RecoveryLibraryManaged {
-			executor = RecoveryDaemon
+		// Recovery follows the first blocked dependency. A healthy daemon-owned
+		// layer must not add an external retry loop around a blocked gRPC channel.
+		if accepting {
+			if !gate {
+				executor = child.RecoveryExecutor
+			} else if child.RecoveryExecutor != RecoveryLibraryManaged {
+				executor = RecoveryDaemon
+			}
 		}
 		if child.State == SessionClosed {
 			selected = i
@@ -281,6 +287,9 @@ func (s *SessionGroup) aggregateLocked() StateEvent {
 				selectedFailure = true
 			}
 		}
+	}
+	if executor == "" {
+		executor = RecoveryDaemon
 	}
 	aggregate = s.states[selected]
 	aggregate.State, aggregate.Accepting, aggregate.RecoveryExecutor = state, accepting, executor

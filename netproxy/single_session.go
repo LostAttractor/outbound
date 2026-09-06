@@ -9,7 +9,7 @@ import (
 
 // SingleSession owns one shared transport resource. Callbacks must honor
 // cancellation and must not synchronously call Connect or Close. Observe may
-// use its handle to publish transitions or disconnect its resource.
+// use its handle to publish transitions or abort its resource.
 type SingleSession[T any] struct {
 	config SingleSessionConfig[T]
 
@@ -83,30 +83,10 @@ func (h *SingleSessionHandle[T]) renewLeaseLocked() bool {
 	return true
 }
 
-// Disconnect aborts dependents and closes this handle's failed resource. It returns false
-// when the handle is stale or the lifecycle is already closed.
-func (h *SingleSessionHandle[T]) Disconnect(cause error) bool {
-	if !h.markDisconnected(cause) {
-		return false
-	}
-	h.cleanupDisconnected()
-	return true
-}
-
-// Invalidate synchronously revokes allocation, signals dependent work to abort,
-// and publishes the root cause, then schedules blocking cleanup. Only pure local
-// cleanup omits the abort signal. Use this in data-plane Read/Write paths.
-func (h *SingleSessionHandle[T]) Invalidate(cause error) bool {
-	if !h.markDisconnected(cause) {
-		return false
-	}
-	go h.cleanupDisconnected()
-	return true
-}
-func (h *SingleSessionHandle[T]) markDisconnected(cause error) bool {
-	if h == nil {
-		return false
-	}
+// Abort revokes this resource and its dependents before returning. Cleanup runs
+// asynchronously; Connect waits for it before replacement and Close waits for it
+// before returning. Ordinary shutdown uses SingleSession.Close, not Abort.
+func (h *SingleSessionHandle[T]) Abort(cause error) bool {
 	s := h.owner
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -114,21 +94,14 @@ func (h *SingleSessionHandle[T]) markDisconnected(cause error) bool {
 		return false
 	}
 	h.disconnecting = true
-	abort := cause == nil
-	for _, failure := range Failures(cause) {
-		abort = abort || failure.Origin != OriginLocalCleanup
-	}
-	if abort {
-		// Revoke established dependents before potentially blocking cleanup.
-		h.lease.Abort(cause)
-	} else {
-		h.lease.Invalidate(cause)
-	}
+	h.lease.Abort(cause)
 	s.transitionLocked(SessionDisconnected, cause)
 	s.phaseLocked("cleanup", "")
 	s.observers.Add(1)
+	go h.cleanupDisconnected()
 	return true
 }
+
 func (h *SingleSessionHandle[T]) cleanupDisconnected() {
 	s := h.owner
 	defer s.observers.Done()
@@ -463,7 +436,7 @@ func (s *SingleSession[T]) establishAndInstall(ctx context.Context) error {
 			if fact.Layer == LayerUnknown || fact.Layer == "" {
 				fact.Layer = s.config.Layer
 			}
-			handle.Disconnect(WrapFailure(parent.Cause(), fact))
+			handle.Abort(WrapFailure(parent.Cause(), fact))
 		}(parent)
 	}
 	s.mu.Unlock()

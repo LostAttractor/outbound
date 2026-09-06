@@ -296,7 +296,7 @@ func (s *Smux) observe(ctx context.Context, handle *netproxy.SingleSessionHandle
 	if cause == smux.ErrInvalidProtocol {
 		fact.Reason = netproxy.ReasonProtocol
 	}
-	handle.Disconnect(netproxy.WrapFailure(cause, fact))
+	handle.Abort(netproxy.WrapFailure(cause, fact))
 }
 
 func (s *Smux) Close() error {

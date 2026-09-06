@@ -367,7 +367,7 @@ func (p *smuxPool) OpenStream(ctx context.Context) (net.Conn, error) {
 				err = cause
 			}
 			fact.Scope = netproxy.ScopeSharedResource
-			handle.Invalidate(netproxy.WrapFailure(err, fact))
+			handle.Abort(netproxy.WrapFailure(err, fact))
 		} else if fact.Scope == netproxy.ScopeUnknown {
 			fact.Scope = netproxy.ScopeStream
 		}

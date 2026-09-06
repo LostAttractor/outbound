@@ -120,7 +120,7 @@ func (c *leasedStream) failure(err error, phase netproxy.Operation) error {
 	}
 	wrapped := netproxy.WrapFailure(err, fact)
 	if fact.Scope == netproxy.ScopeSharedResource {
-		c.handle.Invalidate(wrapped)
+		c.handle.Abort(wrapped)
 	} else if fact.Scope == netproxy.ScopeStream {
 		c.lease.Invalidate(wrapped)
 	}

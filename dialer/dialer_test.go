@@ -94,7 +94,7 @@ func TestBuildRuntimeKeepsParentLifecycleOutOfBuilder(t *testing.T) {
 	if builder.sawParentSession || builder.sawParentCloser {
 		t.Fatal("builder received the parent's lifecycle capability")
 	}
-	if _, ok := runtime.Session(); !ok {
+	if runtime.Session() == nil {
 		t.Fatal("runtime lost the explicitly declared parent session")
 	}
 	runtime.Retire()

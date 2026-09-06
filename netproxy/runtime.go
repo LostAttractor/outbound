@@ -49,15 +49,6 @@ func (c *runtimeSyscallConn) SyscallConn() (syscall.RawConn, error) {
 	return c.raw.SyscallConn()
 }
 
-type runtimeCloseWriteSyscallConn struct {
-	*runtimeSyscallConn
-	closeWriter CloseWriter
-}
-
-func (c *runtimeCloseWriteSyscallConn) CloseWrite() error {
-	return c.closeWriter.CloseWrite()
-}
-
 type runtimeSyscallPacketConn struct {
 	*runtimePacketConn
 	raw syscall.Conn
@@ -98,17 +89,8 @@ func (d *runtimeDialer) DialContext(ctx context.Context, network, address string
 		return nil, net.ErrClosed
 	}
 	tracked := &runtimeConn{Conn: conn, release: sync.OnceFunc(r.release)}
-	closeWriter, hasCloseWriter := conn.(CloseWriter)
-	raw, hasSyscallConn := conn.(syscall.Conn)
-	if hasSyscallConn {
-		withSyscall := &runtimeSyscallConn{runtimeConn: tracked, raw: raw}
-		if hasCloseWriter {
-			return &runtimeCloseWriteSyscallConn{runtimeSyscallConn: withSyscall, closeWriter: closeWriter}, nil
-		}
-		return withSyscall, nil
-	}
-	if hasCloseWriter {
-		return &CloseWriteConn{Conn: tracked, CloseWriter: closeWriter}, nil
+	if raw, ok := conn.(syscall.Conn); ok {
+		return &runtimeSyscallConn{runtimeConn: tracked, raw: raw}, nil
 	}
 	return tracked, nil
 }
@@ -134,6 +116,8 @@ func (d *runtimeDialer) ListenPacket(ctx context.Context, address string) (net.P
 	}
 	return tracked, nil
 }
+
+func (c *runtimeConn) CloseWrite() error { return CloseWrite(c.Conn) }
 
 func (c *runtimeConn) Close() error {
 	defer c.release()
@@ -166,9 +150,9 @@ func NewRuntime(layer Layer) *Runtime {
 // Dialer returns the data-plane view. It does not expose Session or ownership.
 func (r *Runtime) Dialer() Dialer { return r.dialer }
 
-// Session returns the optional shared-connection controller without exposing
-// resource ownership.
-func (r *Runtime) Session() (Session, bool) { return r.session, r.session != nil }
+// Session returns the shared-connection controller, or nil for a stateless
+// chain. The controller does not expose resource ownership.
+func (r *Runtime) Session() Session { return r.session }
 
 func (r *Runtime) acquire() bool {
 	r.mu.Lock()

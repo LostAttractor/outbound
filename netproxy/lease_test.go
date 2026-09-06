@@ -176,7 +176,7 @@ func TestResourceGenerationAndCleanupPhase(t *testing.T) {
 	}
 	first, _ := session.CurrentHandle()
 	disconnected := make(chan bool, 1)
-	go func() { disconnected <- first.Disconnect(errors.New("lost")) }()
+	go func() { disconnected <- first.Abort(errors.New("lost")) }()
 	<-closing
 	snapshot := session.Snapshot()
 	if snapshot.Accepting || snapshot.RecoveryPhase != "cleanup" {
@@ -199,7 +199,7 @@ func TestResourceGenerationAndCleanupPhase(t *testing.T) {
 		t.Fatalf("resource refs = %+v / %+v", first.Ref(), second.Ref())
 	}
 	ready := session.Snapshot()
-	if first.Disconnect(errors.New("late")) {
+	if first.Abort(errors.New("late")) {
 		t.Fatal("stale generation disconnected replacement")
 	}
 	if session.Snapshot() != ready {
@@ -229,7 +229,7 @@ func TestStaleObserverCannotRewriteReplacement(t *testing.T) {
 	}
 }
 
-func TestInvalidateReturnsBeforeBlockingCleanup(t *testing.T) {
+func TestAbortReturnsBeforeBlockingCleanup(t *testing.T) {
 	closing, release := make(chan struct{}), make(chan struct{})
 	session := NewSingleSession(SingleSessionConfig[int]{
 		Establish: func(context.Context) (int, error) { return 1, nil },
@@ -241,7 +241,7 @@ func TestInvalidateReturnsBeforeBlockingCleanup(t *testing.T) {
 	}
 	handle, _ := session.CurrentHandle()
 	returned := make(chan bool, 1)
-	go func() { returned <- handle.Invalidate(errors.New("TCP reset")) }()
+	go func() { returned <- handle.Abort(errors.New("TCP reset")) }()
 	select {
 	case ok := <-returned:
 		if !ok {
@@ -302,8 +302,13 @@ func TestSessionGroupPreservesDegradedPoolFactsWithoutChangingReadiness(t *testi
 	blocked := outer.Snapshot()
 	blocked.Accepting = false
 	outer.state.Publish(blocked)
-	if actual := group.Snapshot(); actual.Accepting || actual.UsableCapacity != 0 {
-		t.Fatalf("ignored child allocation gate: %+v", actual)
+	if actual := group.Snapshot(); actual.Accepting || actual.UsableCapacity != 0 || actual.RecoveryExecutor != RecoveryLibraryManaged {
+		t.Fatalf("blocked library channel did not own chain recovery: %+v", actual)
+	}
+	blocked.Accepting = true
+	outer.state.Publish(blocked)
+	if actual := group.Snapshot(); !actual.Accepting || actual.RecoveryExecutor != RecoveryDaemon || !actual.RecoveryRequired {
+		t.Fatalf("ready library channel did not return replenishment to the daemon: %+v", actual)
 	}
 }
 

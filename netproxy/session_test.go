@@ -270,7 +270,7 @@ func TestRuntimeClosesResourceThroughStatelessWrapper(t *testing.T) {
 		Data:      testDialer{},
 		Resources: []io.Closer{resource},
 	})
-	if _, ok := runtime.Session(); ok {
+	if runtime.Session() != nil {
 		t.Fatal("resource-only runtime exposed a session")
 	}
 	retireRuntime(t, runtime)
@@ -282,7 +282,7 @@ func TestRuntimeClosesResourceThroughStatelessWrapper(t *testing.T) {
 func TestRuntimeDoesNotInferLifecycleFromData(t *testing.T) {
 	data := &statefulTestDialer{testSession: newTestSession()}
 	runtime := NewRuntime(Layer{Data: data})
-	if _, ok := runtime.Session(); ok {
+	if runtime.Session() != nil {
 		t.Fatal("Runtime inferred a Session from Layer.Data")
 	}
 	retireRuntime(t, runtime)
@@ -351,8 +351,8 @@ func TestRuntimeConnectsSessionsFromInnerToOuter(t *testing.T) {
 		Sessions:  []Session{inner, outer},
 		Resources: []io.Closer{inner, outer},
 	})
-	session, ok := runtime.Session()
-	if !ok {
+	session := runtime.Session()
+	if session == nil {
 		t.Fatal("Runtime lost sessions")
 	}
 	if err := session.Connect(context.Background()); err != nil {
@@ -450,8 +450,8 @@ func TestRuntimeRetireWaitsForConnect(t *testing.T) {
 		Sessions:  []Session{owner},
 		Resources: []io.Closer{owner},
 	})
-	session, ok := runtime.Session()
-	if !ok {
+	session := runtime.Session()
+	if session == nil {
 		t.Fatal("Runtime lost Session")
 	}
 	connected := make(chan error, 1)
@@ -484,8 +484,8 @@ func TestRuntimePreservesParentSessionThroughStatelessData(t *testing.T) {
 		Sessions:  []Session{parentSession},
 		Resources: []io.Closer{parentSession},
 	})
-	session, ok := runtime.Session()
-	if !ok || session.Snapshot() != parentSession.Snapshot() {
+	session := runtime.Session()
+	if session == nil || session.Snapshot() != parentSession.Snapshot() {
 		t.Fatal("composed runtime lost the parent session")
 	}
 	if _, ok := runtime.Dialer().(Session); ok {

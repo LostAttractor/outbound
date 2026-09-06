@@ -1,6 +1,7 @@
 package netproxy
 
 import (
+	"errors"
 	"net"
 )
 
@@ -11,6 +12,15 @@ var UnsupportedTunnelTypeError = net.UnknownNetworkError("unsupported tunnel typ
 // joined errors report a failed close operation.
 type CloseWriter interface {
 	CloseWrite() error
+}
+
+// CloseWrite preserves reads when supported. ErrUnsupported means the caller
+// must decide how long to drain the reverse direction.
+func CloseWrite(conn net.Conn) error {
+	if writer, ok := conn.(CloseWriter); ok {
+		return writer.CloseWrite()
+	}
+	return errors.ErrUnsupported
 }
 
 type CloseWriteConn struct {

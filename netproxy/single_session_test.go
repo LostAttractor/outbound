@@ -3,6 +3,7 @@ package netproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -13,19 +14,9 @@ type singleSessionResource struct {
 	closes atomic.Int32
 }
 
-func TestSingleSessionCleanupDoesNotHideAbort(t *testing.T) {
-	cleanup := WrapFailure(net.ErrClosed, Failure{Origin: OriginLocalCleanup})
-	fatal := errors.New("owner confirmed resource failure")
-	for _, tc := range []struct {
-		name  string
-		cause error
-		abort bool
-	}{
-		{"cleanup", cleanup, false},
-		{"cleanup then failure", errors.Join(cleanup, fatal), true},
-		{"failure then cleanup", errors.Join(fatal, cleanup), true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+func TestSingleSessionAbortIsExplicit(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		t.Run(fmt.Sprintf("abort=%v", abort), func(t *testing.T) {
 			session := NewSingleSession(SingleSessionConfig[int]{Establish: func(context.Context) (int, error) { return 1, nil }})
 			defer session.Close()
 			if err := session.Connect(context.Background()); err != nil {
@@ -33,9 +24,14 @@ func TestSingleSessionCleanupDoesNotHideAbort(t *testing.T) {
 			}
 			handle, _ := session.CurrentHandle()
 			stream := handle.NewStreamLease()
-			handle.Disconnect(tc.cause)
-			if cause := stream.AbortCause(); (cause != nil) != tc.abort || tc.abort && !errors.Is(cause, fatal) {
-				t.Fatalf("abort cause = %v, want abort = %v", cause, tc.abort)
+			if abort {
+				// The owner's action is authoritative, irrespective of diagnostic labels.
+				handle.Abort(WrapFailure(net.ErrClosed, Failure{Origin: OriginLocalCleanup}))
+			} else {
+				_ = session.Close()
+			}
+			if stream.Valid() || (stream.AbortCause() != nil) != abort {
+				t.Fatalf("termination: valid=%v abort=%v", stream.Valid(), stream.AbortCause())
 			}
 		})
 	}
@@ -64,17 +60,17 @@ func TestSingleSessionLifecycle(t *testing.T) {
 		t.Fatalf("Current() = %p, %v", current, err)
 	}
 	handle := <-observed
-	if !handle.Disconnect(errors.New("lost")) {
+	if !handle.Abort(errors.New("lost")) {
 		t.Fatal("current resource was treated as stale")
 	}
 	if state := session.Snapshot().State; state != SessionDisconnected {
 		t.Fatalf("state = %s, want disconnected", state)
 	}
-	if got := resource.closes.Load(); got != 1 {
-		t.Fatalf("resource closes = %d, want 1", got)
-	}
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if got := resource.closes.Load(); got != 1 {
+		t.Fatalf("resource closes = %d, want 1", got)
 	}
 	if state := session.Snapshot().State; state != SessionClosed {
 		t.Fatalf("state = %s, want closed", state)
@@ -311,7 +307,7 @@ func TestSingleSessionRecoveryUsesLiveStateAfterObserverChange(t *testing.T) {
 			cause := errors.New("owner changed resource state during recovery")
 			var changed bool
 			if action == "abort" {
-				changed = handle.Invalidate(cause)
+				changed = handle.Abort(cause)
 			} else {
 				changed = handle.Transition(SessionDisconnected, cause)
 			}
@@ -355,7 +351,7 @@ func TestSingleSessionCloseWaitsForCleanupAndReportsError(t *testing.T) {
 	}
 	handle := <-observed
 	disconnected := make(chan bool, 1)
-	go func() { disconnected <- handle.Disconnect(errors.New("lost")) }()
+	go func() { disconnected <- handle.Abort(errors.New("lost")) }()
 	<-cleanupStarted
 	closed := make(chan error, 1)
 	go func() { closed <- session.Close() }()
