@@ -391,7 +391,8 @@ func (d *Dialer) observe(ctx context.Context, handle *netproxy.SingleSessionHand
 		case connectivity.TransientFailure:
 			current = handle.Transition(netproxy.SessionDisconnected, fmt.Errorf("grpc transport entered transient failure"))
 		case connectivity.Shutdown:
-			current = handle.Transition(netproxy.SessionDisconnected, net.ErrClosed)
+			// A terminal channel has no library worker left to recover it.
+			current = handle.Abort(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Layer: netproxy.LayerGRPC, Scope: netproxy.ScopeSharedResource}))
 		}
 		d.stateMu.Unlock()
 		if !current {

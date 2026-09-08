@@ -127,7 +127,9 @@ func (h *SingleSessionHandle[T]) cleanupDisconnected() {
 }
 
 type SingleSessionConfig[T any] struct {
-	Layer            FailureLayer
+	Layer FailureLayer
+	// RecoveryExecutor applies to a retained resource. Establishing or replacing
+	// a resource always requires a daemon Connect attempt.
 	RecoveryExecutor RecoveryExecutor
 	// LogicalChannel reports no physical resource identity: library-owned
 	// transports may be replaced without an observable one-to-one channel mapping.
@@ -163,7 +165,7 @@ func NewSingleSession[T any](config SingleSessionConfig[T]) *SingleSession[T] {
 		s.config.RecoveryExecutor = RecoveryDaemon
 	}
 	initial := s.state.current
-	initial.Layer, initial.RecoveryExecutor = s.config.Layer, s.config.RecoveryExecutor
+	initial.Layer, initial.RecoveryExecutor = s.config.Layer, RecoveryDaemon
 	s.state.current = initial
 	return s
 }
@@ -174,9 +176,13 @@ func (s *SingleSession[T]) transitionLocked(state SessionState, cause error) {
 	if s.config.LogicalChannel {
 		ref = ResourceRef{}
 	}
+	executor := s.config.RecoveryExecutor
+	if s.current == nil || s.current.disconnecting {
+		executor = RecoveryDaemon
+	}
 	accepting := state == SessionConnected
 	newFailure := cause != nil && !accepting && state != SessionClosed && !s.failureEpisode
-	if event.State == state && event.Resource == ref && event.Accepting == accepting && !newFailure {
+	if event.State == state && event.Resource == ref && event.Accepting == accepting && event.RecoveryExecutor == executor && !newFailure {
 		return
 	}
 	if newFailure {
@@ -196,12 +202,12 @@ func (s *SingleSession[T]) transitionLocked(state SessionState, cause error) {
 		event.RecoveryPhase = "stopped"
 	case SessionDisconnected:
 		event.RecoveryPhase = "queued"
-		if s.config.RecoveryExecutor == RecoveryLibraryManaged {
+		if executor == RecoveryLibraryManaged {
 			event.RecoveryPhase = "connecting"
 		}
 	}
 	event.Accepting, event.UsableCapacity = accepting, boolCapacity(accepting)
-	event.Layer, event.RecoveryExecutor = s.config.Layer, s.config.RecoveryExecutor
+	event.Layer, event.RecoveryExecutor = s.config.Layer, executor
 	s.state.Publish(event)
 }
 func (s *SingleSession[T]) phaseLocked(phase, blockedBy string) {

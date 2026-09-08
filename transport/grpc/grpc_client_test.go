@@ -53,3 +53,29 @@ func TestCloseCancelsConnect(t *testing.T) {
 		t.Fatalf("state = %s, want closed", state)
 	}
 }
+
+func TestShutdownChannelReturnsRecoveryToDaemon(t *testing.T) {
+	listener, server := carrierPeer(t, "ready")
+	defer server.Stop()
+	d := &Dialer{ParentDialer: leasedCarrierParent{listener: listener}, Address: "passthrough:///peer"}
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := d.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := d.session().CurrentHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Resource().Close(); err != nil {
+		t.Fatal(err)
+	}
+	for ctx.Err() == nil {
+		if state := d.Snapshot(); !state.Accepting && state.RecoveryExecutor == netproxy.RecoveryDaemon {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("terminal channel still claims library recovery: %+v", d.Snapshot())
+}

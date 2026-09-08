@@ -14,6 +14,51 @@ type singleSessionResource struct {
 	closes atomic.Int32
 }
 
+func TestSingleSessionRecoveryExecutorFollowsResource(t *testing.T) {
+	establishErr := errors.New("unavailable")
+	session := NewSingleSession(SingleSessionConfig[int]{
+		RecoveryExecutor: RecoveryLibraryManaged,
+		LogicalChannel:   true,
+		Establish: func(context.Context) (int, error) {
+			return 1, establishErr
+		},
+	})
+	defer session.Close()
+	if got := session.Snapshot().RecoveryExecutor; got != RecoveryDaemon {
+		t.Fatalf("executor without a channel = %s", got)
+	}
+	if err := session.Connect(context.Background()); !errors.Is(err, establishErr) {
+		t.Fatalf("initial connect: %v", err)
+	}
+	if state := session.Snapshot(); state.RecoveryExecutor != RecoveryDaemon || state.RecoveryPhase != "queued" {
+		t.Fatalf("failed establishment: %+v", state)
+	}
+	establishErr = nil
+	if err := session.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := session.CurrentHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle.Transition(SessionDisconnected, errors.New("carrier failed"))
+	retained := session.Snapshot()
+	if retained.RecoveryExecutor != RecoveryLibraryManaged || retained.RecoveryPhase != "connecting" {
+		t.Fatalf("retained channel: %+v", retained)
+	}
+	// The channel can stop recovering while its readiness is already false.
+	handle.Abort(net.ErrClosed)
+	if state := session.Snapshot(); state.RecoveryExecutor != RecoveryDaemon || state.Seq <= retained.Seq {
+		t.Fatalf("discarded channel: %+v", state)
+	}
+	if err := session.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state := session.Snapshot(); !state.Accepting || state.RecoveryExecutor != RecoveryLibraryManaged {
+		t.Fatalf("replacement channel: %+v", state)
+	}
+}
+
 func TestSingleSessionAbortIsExplicit(t *testing.T) {
 	for _, abort := range []bool{false, true} {
 		t.Run(fmt.Sprintf("abort=%v", abort), func(t *testing.T) {
