@@ -254,7 +254,7 @@ func (s *V2Ray) Build(option *dialer.ExtraOption, upstream dialer.Upstream) (lay
 func ParseVlessURL(vless string) (data *V2Ray, err error) {
 	u, err := url.Parse(vless)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse VLESS proxy URL: %w", err.(*url.Error).Err)
 	}
 	data = &V2Ray{
 		Ps:            u.Fragment,

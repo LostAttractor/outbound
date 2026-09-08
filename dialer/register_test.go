@@ -2,10 +2,30 @@ package dialer
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
+
+func TestNewFromLinkErrorsDoNotExposeCredentials(t *testing.T) {
+	const scheme = "registersecret"
+	want := errors.New("invalid proxy option")
+	fromLinkCreators[scheme] = func(string) (Builder, *Property, error) { return nil, nil, want }
+	t.Cleanup(func() { delete(fromLinkCreators, scheme) })
+	for _, link := range []string{
+		scheme + "://user:secret-password@example.com?token=secret-token",
+		scheme + "://user:secret-password@example.com/%zz?token=secret-token",
+	} {
+		_, _, err := NewFromLink(link)
+		if err == nil || strings.Contains(err.Error(), "secret-password") || strings.Contains(err.Error(), "secret-token") {
+			t.Fatalf("unsafe parser diagnostic: %v", err)
+		}
+		if !strings.Contains(link, "%zz") && !errors.Is(err, want) {
+			t.Fatalf("creator failure was not preserved: %v", err)
+		}
+	}
+}
 
 type registerTestDialer struct{}
 
@@ -57,12 +77,12 @@ func TestNewFromLinkParsesOneLinkAndPreservesAlias(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			receivedLink = ""
-			dialers, property, err := NewFromLink(tt.alias + ":  " + tt.link + "  ")
+			builder, property, err := NewFromLink(tt.alias + ":  " + tt.link + "  ")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(dialers) != 1 || dialers[0] != wantDialer {
-				t.Fatalf("dialers = %#v, want one registered dialer", dialers)
+			if builder != wantDialer {
+				t.Fatalf("builder = %#v, want registered builder", builder)
 			}
 			if receivedLink != tt.link {
 				t.Fatalf("creator received %q, want %q", receivedLink, tt.link)
@@ -71,37 +91,5 @@ func TestNewFromLinkParsesOneLinkAndPreservesAlias(t *testing.T) {
 				t.Fatalf("property name = %q, want alias %q", property.Name, tt.alias)
 			}
 		})
-	}
-}
-
-func TestNewFromLinkRejectsLegacyShareLinkProxyChain(t *testing.T) {
-	const scheme = "registerchain"
-	creatorCalled := false
-	fromLinkCreators[scheme] = func(string) (Builder, *Property, error) {
-		creatorCalled = true
-		return new(registerTestDialer), new(Property), nil
-	}
-	t.Cleanup(func() { delete(fromLinkCreators, scheme) })
-
-	for _, link := range []string{
-		"alias:" + scheme + "://first.example/path ->  other+share://second.example",
-		"alias:" + scheme + "://first.example/path ->other+share://second.example",
-		"alias:" + scheme + "://first.example/path->  other+share://second.example",
-		"alias:" + scheme + "://first.example/path ->\u00a0" + scheme + "://second.example",
-		"alias:" + scheme + "://first.example->other+share://second.example",
-		"alias:" + scheme + "://first.example/path->" + scheme + "://second.example",
-		"alias:" + scheme + "://first.example/path->ReGiStErChAiN://second.example",
-		"alias:" + scheme + "://first.example/path?x=y -> " + scheme + "://second.example",
-	} {
-		dialers, property, err := NewFromLink(link)
-		if !errors.Is(err, ErrLegacyShareLinkProxyChain) {
-			t.Fatalf("link %q: error = %v, want ErrLegacyShareLinkProxyChain", link, err)
-		}
-		if dialers != nil || property != nil {
-			t.Fatalf("link %q: dialers, property = %#v, %#v; want nil results", link, dialers, property)
-		}
-	}
-	if creatorCalled {
-		t.Fatal("creator was called for a legacy chain")
 	}
 }

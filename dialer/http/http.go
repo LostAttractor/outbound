@@ -43,8 +43,11 @@ func NewHTTP(link string) (dialer.Builder, *dialer.Property, error) {
 
 func ParseHTTPURL(link string) (data *HTTP, err error) {
 	u, err := url.Parse(link)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, fmt.Errorf("%w: %v", dialer.InvalidParameterErr, err)
+	if err != nil {
+		return nil, fmt.Errorf("%w: HTTP proxy URL: %v", dialer.InvalidParameterErr, err.(*url.Error).Err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, dialer.InvalidParameterErr
 	}
 	pwd, _ := u.User.Password()
 	strPort := u.Port()

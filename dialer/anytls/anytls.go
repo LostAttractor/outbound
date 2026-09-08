@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"crypto/tls"
+	"fmt"
 	"net/url"
 	"strings"
 
@@ -43,7 +44,7 @@ func NewAnytls(link string) (dialer.Builder, *dialer.Property, error) {
 func parseAnytlsURL(link string) (*Anytls, error) {
 	u, err := url.ParseRequestURI(link)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse AnyTLS proxy URL: %w", err.(*url.Error).Err)
 	}
 	antls := &Anytls{
 		link:     link,

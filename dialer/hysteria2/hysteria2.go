@@ -116,7 +116,7 @@ func normalizeCertHash(hash string) string {
 func ParseHysteria2URL(link string) (*Hysteria2, error) {
 	u, err := url.Parse(link)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse Hysteria2 proxy URL: %w", err.(*url.Error).Err)
 	}
 	q := u.Query()
 	if q.Get("obfs") != "" || q.Get("obfs-password") != "" {

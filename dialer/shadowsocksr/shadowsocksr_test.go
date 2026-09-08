@@ -25,11 +25,11 @@ func share(payload string) string {
 func TestSSRIPv6ShareRoundTrip(t *testing.T) {
 	for _, server := range []string{"2001:db8::1", "[2001:db8::1]"} {
 		link := share(server + ":8388:origin:aes-128-cfb:plain:cGFzc3dvcmQ/?remarks=5rWL6K-V&protoparam=dGVzdA&obfsparam=aG9zdC50ZXN0")
-		builders, property, err := dialer.NewFromLink(link)
+		builder, property, err := dialer.NewFromLink(link)
 		if err != nil {
 			t.Fatal(err)
 		}
-		result := builders[0].(*ShadowsocksR)
+		result := builder.(*ShadowsocksR)
 		if property.Address != "[2001:db8::1]:8388" || result.Name != "测试" || result.Password != "password" {
 			t.Fatalf("IPv6 share=%+v", result)
 		}
@@ -127,14 +127,14 @@ func TestRegisteredSSRBuildExchangesWithAESCFBPeer(t *testing.T) {
 	}()
 	host, port, _ := net.SplitHostPort(listener.Addr().String())
 	link := share(host + ":" + port + ":origin:aes-128-cfb:plain:cGFzc3dvcmQ/?remarks=cGVlcg")
-	builders, property, err := dialer.NewFromLink(link)
+	builder, property, err := dialer.NewFromLink(link)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if property.Address != listener.Addr().String() {
 		t.Fatal("server hostname was decoded again")
 	}
-	layer, err := builders[0].Build(&dialer.ExtraOption{}, dialer.NewUpstream(directParent{}))
+	layer, err := builder.Build(&dialer.ExtraOption{}, dialer.NewUpstream(directParent{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestRegisteredSSRBuildExchangesWithAESCFBPeer(t *testing.T) {
 	if err := <-serverResult; err != nil {
 		t.Fatal(err)
 	}
-	config := builders[0].(*ShadowsocksR)
+	config := builder.(*ShadowsocksR)
 	config.Port = 65536
 	if _, err := config.Build(&dialer.ExtraOption{}, dialer.NewUpstream(directParent{})); !errors.Is(err, dialer.InvalidParameterErr) {
 		t.Fatalf("port overflow %s: %v", strconv.Itoa(config.Port), err)
