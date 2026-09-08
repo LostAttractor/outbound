@@ -212,6 +212,10 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 }
 
 func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn, error) {
+	return protocol.NewPacketAssociation(ctx, addr, d.openPacket)
+}
+
+func (d *Dialer) openPacket(ctx context.Context, addr string) (net.PacketConn, error) {
 	ctx, finish, err := d.begin(ctx)
 	if err != nil {
 		return nil, err

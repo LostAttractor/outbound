@@ -69,7 +69,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 				address = netip.AddrPortFrom(ips[0].Unmap(), target.Port).String()
 			}
 		}
-		conn, err := d.ListenPacket(ctx, address)
+		conn, err := d.openPacket(ctx, address)
 		if err != nil {
 			return nil, err
 		}
@@ -109,6 +109,13 @@ func (d *Dialer) open(ctx context.Context, network, address string) (*Conn, erro
 // ListenPacket creates a packet association. In packet-address mode each
 // WriteTo destination must be an IP; it never starts an implicit DNS lookup.
 func (d *Dialer) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	if d.packetAddr {
+		return d.openPacket(ctx, address)
+	}
+	return protocol.NewPacketAssociation(ctx, address, d.openPacket)
+}
+
+func (d *Dialer) openPacket(ctx context.Context, address string) (net.PacketConn, error) {
 	conn, err := d.open(ctx, "udp", address)
 	if err != nil {
 		return nil, err

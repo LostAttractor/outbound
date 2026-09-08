@@ -45,7 +45,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	case "tcp":
 		return d.open(ctx, network, address)
 	case "udp":
-		c, err := d.ListenPacket(ctx, address)
+		c, err := d.openPacket(ctx, address)
 		if err != nil {
 			return nil, err
 		}
@@ -122,6 +122,13 @@ func (d *Dialer) open(ctx context.Context, network, address string) (net.Conn, e
 	return result, nil
 }
 func (d *Dialer) ListenPacket(ctx context.Context, address string) (net.PacketConn, error) {
+	if d.flow == XRV {
+		return d.openPacket(ctx, address)
+	}
+	return protocol.NewPacketAssociation(ctx, address, d.openPacket)
+}
+
+func (d *Dialer) openPacket(ctx context.Context, address string) (net.PacketConn, error) {
 	conn, err := d.open(ctx, "udp", address)
 	if err != nil {
 		return nil, err

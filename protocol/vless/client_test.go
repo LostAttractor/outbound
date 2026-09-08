@@ -69,7 +69,7 @@ func TestRequestHeaderServerFirstAndHalfClose(t *testing.T) {
 }
 func TestUDPTruncationConsumesOneDatagram(t *testing.T) {
 	raw := &testConn{input: bytes.NewReader([]byte{0, 0, 0, 3, 'a', 'b', 'c', 0, 2, 'd', 'e'})}
-	c, err := clientDialer(t, raw, "").ListenPacket(context.Background(), "[2001:db8::1]:53")
+	c, err := clientDialer(t, raw, "").(*Dialer).openPacket(context.Background(), "[2001:db8::1]:53")
 	if err != nil {
 		t.Fatal(err)
 	}
