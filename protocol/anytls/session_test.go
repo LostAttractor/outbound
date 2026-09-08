@@ -151,7 +151,7 @@ func TestClosedStreamDoesNotKillSessionReader(t *testing.T) {
 	s := newSession(client, nil, nil)
 	first, second := newStream(s, 1), newStream(s, 2)
 	s.streams[1], s.streams[2] = first, second
-	_ = first.pr.Close()
+	_ = first.Close()
 	done := make(chan error, 1)
 	go func() { done <- s.run() }()
 	defer func() { _ = s.Close(); _ = server.Close(); <-done }()

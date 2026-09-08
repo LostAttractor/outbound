@@ -13,13 +13,17 @@ import (
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/infra/socks"
 )
 
 type stream struct {
 	*session
-	pr net.Conn
-	pw net.Conn
+	receiveMu    sync.Mutex
+	received     *bytes.Buffer
+	receiveErr   error
+	receiveReady chan struct{}
+	readDeadline protocol.Deadline
 
 	writeRequests   chan streamWriteRequest
 	writeAdmission  chan struct{}
@@ -33,7 +37,6 @@ type stream struct {
 	readMutex       sync.Mutex
 
 	closed        atomic.Bool
-	remoteEOF     atomic.Bool
 	lease         *netproxy.Lease
 	failureMu     sync.Mutex
 	terminalCause error
@@ -54,8 +57,8 @@ type streamWriteRequest struct {
 }
 
 func newStream(session *session, id uint32) *stream {
-	pr, pw := net.Pipe()
-	c := &stream{lease: session.lease.NewStream(), session: session, pr: pr, pw: pw, id: id,
+	c := &stream{lease: session.lease.NewStream(), session: session, id: id,
+		receiveReady: make(chan struct{}, 1), readDeadline: protocol.MakeDeadline(),
 		writeRequests: make(chan streamWriteRequest), writeAdmission: make(chan struct{}, 1), writeStop: make(chan struct{}), writeDone: make(chan struct{}), deadlineChanged: make(chan struct{})}
 	c.writeAdmission <- struct{}{}
 	go c.writeLoop()
@@ -172,49 +175,41 @@ func (c *stream) writeOperation(p []byte, write func([]byte, <-chan struct{}) (i
 
 func (c *stream) Read(b []byte) (n int, err error) {
 	defer func() { err = c.streamFailure(err, netproxy.OpRead) }()
-	if c.remoteEOF.Load() {
-		return 0, io.EOF
-	}
-	if c.closed.Load() {
-		return 0, net.ErrClosed
-	}
 	c.readMutex.Lock()
 	defer c.readMutex.Unlock()
-	return c.pr.Read(b)
+	return c.read(b)
 }
 
 func (c *stream) remoteClose() error {
-	c.remoteEOF.Store(true)
 	c.stopWrites()
 	c.lease.Invalidate(netproxy.WrapFailure(io.EOF, netproxy.Failure{Resource: c.lease.Resource(), Stream: c.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerAnyTLS, Reason: netproxy.ReasonClosed}))
 	if c.closed.CompareAndSwap(false, true) {
 		c.session.removeStream(c.id)
-		c.pw.Close()
-		return c.pr.Close()
+		c.stopReads(io.EOF, false)
 	}
 	return nil
 }
 
 func (c *stream) Close() error {
 	c.localClosed.Store(true)
+	c.stopReads(net.ErrClosed, true)
 	c.sendFIN.Store(true)
 	c.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: c.lease.Resource(), Stream: c.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerAnyTLS, Origin: netproxy.OriginLocalCleanup}))
 	if c.closed.CompareAndSwap(false, true) {
 		c.session.removeStream(c.id)
-		c.stopWrites()
-		_ = c.pw.Close()
-		return c.pr.Close()
 	}
 	c.stopWrites()
 	return nil
 }
 func (c *stream) sessionClose() {
-	c.lease.Invalidate(netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: c.lease.Resource(), Stream: c.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerAnyTLS, Origin: netproxy.OriginLocalCleanup}))
-	if c.closed.CompareAndSwap(false, true) {
-		c.stopWrites()
-		_ = c.pw.Close()
-		_ = c.pr.Close()
-	}
+	cause := netproxy.WrapFailure(net.ErrClosed, netproxy.Failure{Resource: c.lease.Resource(), Stream: c.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerAnyTLS, Origin: netproxy.OriginLocalCleanup})
+	cause = c.session.failure(cause, netproxy.OpRead)
+	// A peer failure follows frames already accepted by the reader. Preserve
+	// those bytes until consumed; explicit local cleanup releases them at once.
+	c.stopReads(cause, netproxy.ClassifyFailure(cause).Origin == netproxy.OriginLocalCleanup)
+	c.lease.Invalidate(cause)
+	c.closed.Store(true)
+	c.stopWrites()
 }
 
 func (c *stream) LocalAddr() net.Addr {
@@ -229,7 +224,7 @@ func (c *stream) SetDeadline(t time.Time) error {
 	_ = c.SetWriteDeadline(t)
 	return c.SetReadDeadline(t)
 }
-func (c *stream) SetReadDeadline(t time.Time) error { return c.pr.SetReadDeadline(t) }
+func (c *stream) SetReadDeadline(t time.Time) error { c.readDeadline.Set(t); return nil }
 func (c *stream) SetWriteDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
 	c.writeDeadline = t
@@ -255,7 +250,7 @@ func (ps *packetStream) ReadFrom(p []byte) (n int, from net.Addr, err error) {
 	ps.readMutex.Lock()
 	defer ps.readMutex.Unlock()
 	for ps.headerRead < len(ps.header) {
-		count, e := ps.pr.Read(ps.header[ps.headerRead:])
+		count, e := ps.read(ps.header[ps.headerRead:])
 		ps.headerRead += count
 		if e != nil {
 			return 0, nil, e
@@ -268,7 +263,7 @@ func (ps *packetStream) ReadFrom(p []byte) (n int, from net.Addr, err error) {
 	}
 	for ps.packet.Len() < length {
 		data := ps.packet.AvailableBuffer()[:length-ps.packet.Len()]
-		count, e := ps.pr.Read(data)
+		count, e := ps.read(data)
 		_, _ = ps.packet.Write(data[:count])
 		if e != nil {
 			return 0, nil, e
@@ -350,14 +345,17 @@ func (c *stream) streamFailure(err error, phase netproxy.Operation) error {
 
 func (c *stream) reject(cause error) {
 	failure := netproxy.WrapFailure(cause, netproxy.Failure{Resource: c.lease.Resource(), Stream: c.lease.Stream(), Scope: netproxy.ScopeStream, Layer: netproxy.LayerAnyTLS, Origin: netproxy.OriginTarget, Reason: netproxy.ReasonRejected, Phase: netproxy.OpDial})
+	c.failStream(failure)
+}
+
+func (c *stream) failStream(failure error) {
 	c.failureMu.Lock()
 	c.terminalCause = failure
 	c.failureMu.Unlock()
 	c.lease.Invalidate(failure)
+	c.stopReads(failure, true)
 	c.stopWrites()
 	if c.closed.CompareAndSwap(false, true) {
 		c.session.removeStream(c.id)
-		_ = c.pw.Close()
-		_ = c.pr.Close()
 	}
 }

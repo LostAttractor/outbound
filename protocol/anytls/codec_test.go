@@ -130,10 +130,10 @@ func TestDatagramFramingSurvivesReadDeadlineAndShortBuffer(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = stream.pw.Write([]byte{0})
+		stream.receive([]byte{0})
 		close(firstByte)
 		<-continueWrite
-		_, _ = stream.pw.Write([]byte{3, 'a', 'b', 'c', 0, 4, 'd', 'r', 'o', 'p', 0, 2, 'o', 'k'})
+		stream.receive([]byte{3, 'a', 'b', 'c', 0, 4, 'd', 'r', 'o', 'p', 0, 2, 'o', 'k'})
 	}()
 	_ = packet.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	if _, _, err := packet.ReadFrom(make([]byte, 8)); !errors.Is(err, os.ErrDeadlineExceeded) {

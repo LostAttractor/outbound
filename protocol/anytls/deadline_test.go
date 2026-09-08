@@ -38,7 +38,7 @@ func TestStreamReadDeadlineIsolatedFromCarrierAndSibling(t *testing.T) {
 		t.Fatalf("read deadline=%v", err)
 	}
 	_ = first.SetReadDeadline(time.Time{})
-	go func() { _, _ = second.pw.Write([]byte("b")) }()
+	go func() { second.receive([]byte("b")) }()
 	var result [1]byte
 	_ = second.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := second.Read(result[:]); err != nil || result[0] != 'b' {

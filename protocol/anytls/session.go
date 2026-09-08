@@ -141,7 +141,7 @@ func (s *session) run() (err error) {
 		case cmdWaste:
 		case cmdPSH:
 			if stream != nil && length != 0 {
-				_, _ = stream.pw.Write(data)
+				stream.receive(data)
 			}
 		case cmdFIN, cmdHeartRequest, cmdHeartResponse:
 			if length != 0 {
