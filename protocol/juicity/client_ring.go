@@ -25,7 +25,7 @@ type clientRing struct {
 }
 
 type clientRingNode struct {
-	// capability is protected by quic RWMutex.
+	// capability is updated by the QUIC callback and read atomically.
 	capability int64
 	cli        *clientImpl
 }
@@ -49,13 +49,6 @@ func (r *clientRing) DialContext(ctx context.Context, metadata *Metadata) (conn 
 	stop := context.AfterFunc(r.ctx, cancel)
 	defer stop()
 	defer cancel()
-	if !r.mu.TryLock() {
-		return nil, netproxy.WrapFailure(common.ErrHoldOn, netproxy.Failure{Scope: netproxy.ScopeOperation, Layer: netproxy.LayerQUIC, Phase: netproxy.OpOpenStream, Reason: netproxy.ReasonCapacity})
-	}
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil, common.ErrClientClosed
-	}
 	if r.state.Snapshot().State != netproxy.SessionConnected {
 		return nil, netproxy.ErrNotConnected
 	}
@@ -67,6 +60,10 @@ func (r *clientRing) DialContext(ctx context.Context, metadata *Metadata) (conn 
 		conn, err = node.cli.DialContext(ctx, metadata)
 		return err
 	})
+	if err != nil && conn != nil {
+		_ = conn.Close()
+		conn = nil
+	}
 	return conn, err
 }
 
@@ -78,44 +75,68 @@ func (r *clientRing) DialAuth(ctx context.Context, metadata *Metadata) (auth *Un
 	stop := context.AfterFunc(r.ctx, cancel)
 	defer stop()
 	defer cancel()
-	if !r.mu.TryLock() {
-		return nil, netproxy.WrapFailure(common.ErrHoldOn, netproxy.Failure{Scope: netproxy.ScopeOperation, Layer: netproxy.LayerQUIC, Phase: netproxy.OpOpenStream, Reason: netproxy.ReasonCapacity})
-	}
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil, common.ErrClientClosed
-	}
 	if !r.state.Snapshot().Accepting {
 		return nil, netproxy.ErrNotConnected
 	}
 	err = r.tryNext(func(node *clientRingNode) error { auth, err = node.cli.DialAuth(ctx, metadata); return err })
+	if err != nil && auth != nil {
+		auth.lease.Invalidate(err)
+		auth = nil
+	}
 	return auth, err
 }
 
 // tryNext only allocates from established members. Physical connection work
 // belongs to Connect, including expansion after an admission-capacity failure.
 func (r *clientRing) tryNext(f func(*clientRingNode) error) error {
-	elem := r.current
-	if elem == nil {
-		elem = r.ring.Front()
+	// Only selection touches the ring. Opening a stream may block on peer IO,
+	// and must not serialize unrelated allocations or session cleanup.
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return common.ErrClientClosed
 	}
-	for remaining := r.ring.Len(); remaining > 0; remaining-- {
+	type candidate struct {
+		elem *list.Element
+		node *clientRingNode
+	}
+	candidates := make([]candidate, 0, r.ring.Len())
+	elem := r.current
+	for range r.ring.Len() {
 		if elem == nil {
 			elem = r.ring.Front()
 		}
-		node, ok := elem.Value.(*clientRingNode)
-		next := elem.Next()
-		if ok && r.state.IsReady(node.cli.resource) {
-			err := f(node)
-			if err == nil {
-				r.current = elem
-				return nil
-			}
-			if !common.IsCapacityError(err) && !errors.Is(err, common.ErrClientClosed) {
-				return err
-			}
+		candidates = append(candidates, candidate{elem, elem.Value.(*clientRingNode)})
+		elem = elem.Next()
+	}
+	r.mu.Unlock()
+	for _, candidate := range candidates {
+		if !r.state.IsReady(candidate.node.cli.resource) {
+			continue
 		}
-		elem = next
+		err := f(candidate.node)
+		if err == nil {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			// Close or a member failure may finish while allocation is outside
+			// the lock. Reject that handoff; the caller releases its new stream.
+			if r.closed {
+				return common.ErrClientClosed
+			}
+			if cause := candidate.node.cli.lease.Cause(); cause != nil {
+				return cause
+			}
+			if candidate.elem.Value == candidate.node {
+				r.current = candidate.elem
+			}
+			return nil
+		}
+		if !common.IsCapacityError(err) && !errors.Is(err, common.ErrClientClosed) {
+			return err
+		}
+	}
+	if r.ctx.Err() != nil {
+		return common.ErrClientClosed
 	}
 	r.state.RequestCapacity()
 	return netproxy.WrapFailure(common.ErrHoldOn, netproxy.Failure{Scope: netproxy.ScopeOperation, Layer: netproxy.LayerQUIC, Phase: netproxy.OpOpenStream, Reason: netproxy.ReasonCapacity})
@@ -152,7 +173,7 @@ func (r *clientRing) passiveRemove(elem *list.Element) {
 }
 
 func (r *clientRing) Close() error {
-	r.cancel() // Cancel handshakes before waiting for allocation to release its lock.
+	r.cancel() // Interrupt handshakes and in-flight allocations.
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()

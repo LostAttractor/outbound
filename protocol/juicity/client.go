@@ -266,6 +266,9 @@ func (t *clientImpl) DialAuth(ctx context.Context, metadata *Metadata) (*Underla
 	_, _ = fastrand.Read(auth.Psk)
 	select {
 	case t.UnderlayAuth <- auth:
+		if !auth.lease.Valid() {
+			return nil, auth.lease.Cause()
+		}
 		return auth, nil
 	case <-ctx.Done():
 		auth.lease.Invalidate(ctx.Err())

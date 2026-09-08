@@ -52,13 +52,13 @@ func TestReplenishmentKeepsHealthyMemberAvailable(t *testing.T) {
 		<-done
 		t.Fatal("handshake blocked healthy member allocation")
 	}
+	r.mu.Unlock()
 	err := r.tryNext(func(node *clientRingNode) error {
 		if node != member {
 			t.Fatal("allocated unready replacement")
 		}
 		return nil
 	})
-	r.mu.Unlock()
 	close(release)
 	if err != nil {
 		t.Fatal(err)
