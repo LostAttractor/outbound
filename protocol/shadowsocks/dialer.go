@@ -31,7 +31,6 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 	key := common.EVPBytesToKey(header.Password, conf.KeyLen)
 	sg := RandomSaltGenerator(conf.SaltLen)
-	//log.Trace("shadowsocks.NewDialer: metadata: %v, password: %v", metadata, password)
 	return &Dialer{
 		ParentDialer: nextDialer,
 		proxyAddress: header.ProxyAddress,

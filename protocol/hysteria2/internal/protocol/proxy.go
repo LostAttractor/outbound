@@ -3,11 +3,11 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/quic-go/quicvarint"
-	"github.com/samber/oops"
 )
 
 const (
@@ -58,7 +58,7 @@ func ReadTCPResponse(r io.Reader) (bool, string, error) {
 		return false, "", err
 	}
 	if msgLen > MaxMessageLength {
-		return false, "", oops.Tags("protocol error").New("invalid message length")
+		return false, "", errors.New("invalid message length")
 	}
 	var msgBuf []byte
 	// No message is fine
@@ -74,7 +74,7 @@ func ReadTCPResponse(r io.Reader) (bool, string, error) {
 		return false, "", err
 	}
 	if paddingLen > MaxPaddingLength {
-		return false, "", oops.Tags("protocol error").New("invalid padding length")
+		return false, "", errors.New("invalid padding length")
 	}
 	if paddingLen > 0 {
 		_, err = io.CopyN(io.Discard, r, int64(paddingLen))
@@ -131,7 +131,7 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 		return nil, err
 	}
 	if addrLen == 0 || addrLen > MaxAddressLength || addrLen >= uint64(reader.Len()) {
-		return nil, oops.Tags("protocol error").New("invalid UDP address or payload length")
+		return nil, errors.New("invalid UDP address or payload length")
 	}
 	offset := len(msg) - reader.Len()
 	return &UDPMessage{

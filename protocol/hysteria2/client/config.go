@@ -2,13 +2,13 @@ package client
 
 import (
 	"crypto/tls"
+	"errors"
 	"net"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/pmtud"
 	"github.com/daeuniverse/quic-go"
-	"github.com/samber/oops"
 )
 
 const (
@@ -38,37 +38,37 @@ func (c *Config) verifyAndFill() error {
 		return nil
 	}
 	if c.NextDialer == nil {
-		return oops.In("Hysteria2 Config Verify").With("field", "NextDialer").With("reason", "must be set").New("invalid config")
+		return errors.New("Hysteria2 config: NextDialer must be set")
 	}
 	if c.QUICConfig.InitialStreamReceiveWindow == 0 {
 		c.QUICConfig.InitialStreamReceiveWindow = defaultStreamReceiveWindow
 	} else if c.QUICConfig.InitialStreamReceiveWindow < 16384 {
-		return oops.In("Hysteria2 Config Verify").With("field", "QUICConfig.InitialStreamReceiveWindow").With("reason", "must be at least 16384").New("invalid config")
+		return errors.New("Hysteria2 config: QUICConfig.InitialStreamReceiveWindow must be at least 16384")
 	}
 	if c.QUICConfig.MaxStreamReceiveWindow == 0 {
 		c.QUICConfig.MaxStreamReceiveWindow = defaultStreamReceiveWindow
 	} else if c.QUICConfig.MaxStreamReceiveWindow < 16384 {
-		return oops.In("Hysteria2 Config Verify").With("field", "QUICConfig.MaxStreamReceiveWindow").With("reason", "must be at least 16384").New("invalid config")
+		return errors.New("Hysteria2 config: QUICConfig.MaxStreamReceiveWindow must be at least 16384")
 	}
 	if c.QUICConfig.InitialConnectionReceiveWindow == 0 {
 		c.QUICConfig.InitialConnectionReceiveWindow = defaultConnReceiveWindow
 	} else if c.QUICConfig.InitialConnectionReceiveWindow < 16384 {
-		return oops.In("Hysteria2 Config Verify").With("field", "QUICConfig.InitialConnectionReceiveWindow").With("reason", "must be at least 16384").New("invalid config")
+		return errors.New("Hysteria2 config: QUICConfig.InitialConnectionReceiveWindow must be at least 16384")
 	}
 	if c.QUICConfig.MaxConnectionReceiveWindow == 0 {
 		c.QUICConfig.MaxConnectionReceiveWindow = defaultConnReceiveWindow
 	} else if c.QUICConfig.MaxConnectionReceiveWindow < 16384 {
-		return oops.In("Hysteria2 Config Verify").With("field", "QUICConfig.MaxConnectionReceiveWindow").With("reason", "must be at least 16384").New("invalid config")
+		return errors.New("Hysteria2 config: QUICConfig.MaxConnectionReceiveWindow must be at least 16384")
 	}
 	if c.QUICConfig.MaxIdleTimeout == 0 {
 		c.QUICConfig.MaxIdleTimeout = defaultMaxIdleTimeout
 	} else if c.QUICConfig.MaxIdleTimeout < 4*time.Second || c.QUICConfig.MaxIdleTimeout > 120*time.Second {
-		return oops.In("Hysteria2 Config Verify").With("field", "QUICConfig.MaxIdleTimeout").With("reason", "must be between 4s and 120s").New("invalid config")
+		return errors.New("Hysteria2 config: QUICConfig.MaxIdleTimeout must be between 4s and 120s")
 	}
 	if c.QUICConfig.KeepAlivePeriod == 0 {
 		c.QUICConfig.KeepAlivePeriod = defaultKeepAlivePeriod
 	} else if c.QUICConfig.KeepAlivePeriod < 2*time.Second || c.QUICConfig.KeepAlivePeriod > 60*time.Second {
-		return oops.In("Hysteria2 Config Verify").With("field", "QUICConfig.KeepAlivePeriod").With("reason", "must be between 2s and 60s").New("invalid config")
+		return errors.New("Hysteria2 config: QUICConfig.KeepAlivePeriod must be between 2s and 60s")
 	}
 	c.QUICConfig.DisablePathMTUDiscovery = c.QUICConfig.DisablePathMTUDiscovery || pmtud.DisablePathMTUDiscovery
 	c.QUICConfig.EnableDatagrams = true

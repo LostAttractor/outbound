@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -15,7 +16,6 @@ import (
 	"github.com/daeuniverse/outbound/pool"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/socks5"
-	"github.com/samber/oops"
 )
 
 const (
@@ -99,14 +99,11 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 		}
 		c.cipherRead, err = CreateCipher(c.masterKey, salt, c.cipherConf)
 		if err != nil {
-			c.readErr = oops.Wrapf(err, "fail to initiate cipher")
+			c.readErr = fmt.Errorf("fail to initiate cipher: %w", err)
 			return 0, c.readErr
 		}
 
 		c.onceRead = true
-	}
-	if c.cipherRead == nil {
-		return 0, oops.Wrapf(err, "cipher is not initialized")
 	}
 
 	// Chunk
@@ -210,7 +207,7 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		defer pool.PutBuffer(salt)
 		c.cipherWrite, err = CreateCipher(c.masterKey, salt, c.cipherConf)
 		if err != nil {
-			return 0, oops.Wrapf(err, "fail to initiate cipher")
+			return 0, fmt.Errorf("fail to initiate cipher: %w", err)
 		}
 		// Add salt for first write
 		buf.Write(salt)
@@ -222,9 +219,6 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		}
 
 		c.onceWrite = true
-	}
-	if c.cipherWrite == nil {
-		return 0, oops.Wrapf(err, "cipher is not initialized")
 	}
 	payload.Write(b)
 	c.seal(buf, payload.Bytes())

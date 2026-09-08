@@ -170,12 +170,10 @@ func (a *authSHA1v4) Decode(plainData []byte, dst *bytes.Buffer) (int, error) {
 	for dataLength > 4 {
 		crc32 := crypto.CalcCRC32(plainData, 2, 0xFFFFFFFF)
 		if binary.LittleEndian.Uint16(plainData[2:4]) != uint16(crc32&0xFFFF) {
-			//common.Error("auth_sha1_v4 post decrypt data crc32 error")
 			return 0, ErrAuthSHA1v4CRC32Error
 		}
 		length := int(binary.BigEndian.Uint16(plainData[0:2]))
 		if length >= 8192 || length < 8 {
-			//common.Error("auth_sha1_v4 post decrypt data length error")
 			dataLength = 0
 			plainData = nil
 			return 0, ErrAuthSHA1v4DataLengthError
@@ -199,7 +197,6 @@ func (a *authSHA1v4) Decode(plainData []byte, dst *bytes.Buffer) (int, error) {
 			dataLength -= length
 			plainData = plainData[length:]
 		} else {
-			//common.Error("auth_sha1_v4 post decrypt incorrect checksum")
 			dataLength = 0
 			plainData = nil
 			return 0, ErrAuthSHA1v4IncorrectChecksum

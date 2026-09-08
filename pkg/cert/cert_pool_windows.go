@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package cert
@@ -16,8 +17,7 @@ func GetSystemCertPool() (*x509.CertPool, error) {
 	}
 	storeHandle, err := syscall.CertOpenSystemStore(0, rootU16Ptr)
 	if err != nil {
-		fmt.Println(syscall.GetLastError())
-		return nil, err
+		return nil, fmt.Errorf("open system certificate store: %w", err)
 	}
 
 	var certs []*x509.Certificate
@@ -30,8 +30,7 @@ func GetSystemCertPool() (*x509.CertPool, error) {
 					break
 				}
 			}
-			fmt.Println(syscall.GetLastError())
-			return nil, err
+			return nil, fmt.Errorf("enumerate system certificates: %w", err)
 		}
 		if cert == nil {
 			break

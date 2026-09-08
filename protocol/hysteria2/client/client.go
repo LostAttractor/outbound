@@ -3,15 +3,13 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 
-	"github.com/samber/oops"
-
-	"errors"
 	"github.com/daeuniverse/outbound/netproxy"
 	P "github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/internal/protocol"
@@ -19,7 +17,6 @@ import (
 	"github.com/daeuniverse/outbound/protocol/hysteria2/udphop"
 	tuiccommon "github.com/daeuniverse/outbound/protocol/tuic/common"
 	"github.com/daeuniverse/outbound/protocol/tuic/congestion"
-
 	"github.com/daeuniverse/quic-go"
 	"github.com/daeuniverse/quic-go/http3"
 )
@@ -165,7 +162,7 @@ func (c *Client) ListenPacket(ctx context.Context, _ string) (net.PacketConn, er
 		return nil, err
 	}
 	if resource.udpSM == nil {
-		return nil, oops.In("Hysteria2").Errorf("%w: UDP not enabled", netproxy.UnsupportedTunnelTypeError)
+		return nil, fmt.Errorf("Hysteria2 UDP not enabled: %w", netproxy.UnsupportedTunnelTypeError)
 	}
 	handle, err := c.lifecycle.CurrentHandle()
 	if err != nil {
@@ -262,10 +259,7 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
 	if err != nil {
-		return nil, oops.
-			In("HTTP3 handshake").
-			WithContext(ctx).
-			Wrapf(err, "failed to create HTTP request")
+		return nil, fmt.Errorf("create HTTP3 handshake request: %w", err)
 	}
 	req.Header = make(http.Header)
 	protocol.AuthRequestToHeader(req.Header, protocol.AuthRequest{
@@ -275,7 +269,7 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		_ = rt.Close()
-		return nil, oops.In("HTTP3 Handshake").Wrap(err)
+		return nil, fmt.Errorf("HTTP3 handshake: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != protocol.StatusAuthOK {
@@ -287,7 +281,7 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 			Scope: netproxy.ScopeOperation, Layer: netproxy.LayerH3, Phase: netproxy.OpHandshake,
 			Origin: netproxy.OriginPeer, Reason: reason, Code: strconv.Itoa(resp.StatusCode),
 		})
-		return nil, oops.In("HTTP3 Handshake").Wrap(err)
+		return nil, fmt.Errorf("HTTP3 handshake: %w", err)
 	}
 	// Auth OK
 	authResp := protocol.AuthResponseFromHeader(resp.Header)
