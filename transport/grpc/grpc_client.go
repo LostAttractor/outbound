@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/common"
@@ -20,6 +21,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/peer"
 )
 
 type ClientConn struct {
@@ -225,7 +227,15 @@ func (c *ClientConn) SetWriteDeadline(t time.Time) error {
 }
 func (c *ClientConn) DependencyLease() *netproxy.Lease { return c.lease }
 func (c *ClientConn) failure(err error, phase netproxy.Operation) error {
+	if err != nil {
+		if cause := c.lease.AbortCause(); cause != nil {
+			return cause
+		}
+	}
 	if err == nil || phase == netproxy.OpRead && err == io.EOF {
+		if err == io.EOF {
+			c.lease.Invalidate(netproxy.WrapFailure(err, netproxy.Failure{Layer: netproxy.LayerGRPC, Scope: netproxy.ScopeStream, Reason: netproxy.ReasonClosed}))
+		}
 		return err
 	}
 	fact := netproxy.ClassifyFailure(err)
@@ -258,6 +268,10 @@ type Dialer struct {
 	Address      string
 	TLSConfig    *tls.Config // nil uses plaintext HTTP/2
 
+	closed    atomic.Bool
+	carrier   atomic.Pointer[carrier]
+	handle    atomic.Pointer[netproxy.SingleSessionHandle[*grpc.ClientConn]]
+	stateMu   sync.Mutex // orders Ready observations against carrier invalidation
 	initOnce  sync.Once
 	lifecycle *netproxy.SingleSession[*grpc.ClientConn]
 }
@@ -266,11 +280,13 @@ func (d *Dialer) session() *netproxy.SingleSession[*grpc.ClientConn] {
 	d.initOnce.Do(func() {
 		d.lifecycle = netproxy.NewSingleSession(netproxy.SingleSessionConfig[*grpc.ClientConn]{
 			Layer: netproxy.LayerGRPC, RecoveryExecutor: netproxy.RecoveryLibraryManaged, LogicalChannel: true,
-			Establish:   d.establish,
-			IsConnected: func(cc *grpc.ClientConn) bool { return cc.GetState() == connectivity.Ready },
-			Recover:     d.recover,
-			Observe:     d.observe,
-			Close:       (*grpc.ClientConn).Close,
+			Establish: d.establish,
+			IsConnected: func(cc *grpc.ClientConn) bool {
+				return cc.GetState() == connectivity.Ready && d.carrier.Load().lease.Valid()
+			},
+			Recover: d.recover,
+			Observe: d.observe,
+			Close:   (*grpc.ClientConn).Close,
 		})
 	})
 	return d.lifecycle
@@ -302,7 +318,7 @@ func (d *Dialer) dialOptions() ([]grpc.DialOption, error) {
 		grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
 			conn, err := d.ParentDialer.DialContext(ctx, "tcp", address)
 			if err == nil {
-				netproxy.CaptureDependency(ctx, conn)
+				conn = d.trackCarrier(conn)
 			}
 			return conn, err
 		}),
@@ -357,12 +373,19 @@ func (d *Dialer) recover(ctx context.Context, cc *grpc.ClientConn) (bool, error)
 
 func (d *Dialer) observe(ctx context.Context, handle *netproxy.SingleSessionHandle[*grpc.ClientConn]) {
 	cc := handle.Resource()
+	d.handle.Store(handle)
 	for {
+		d.stateMu.Lock()
 		state := cc.GetState()
 		var current bool
 		switch state {
 		case connectivity.Ready:
-			current = handle.Transition(netproxy.SessionConnected, nil)
+			carrier := d.carrier.Load()
+			if cause := carrier.lease.Cause(); cause != nil {
+				current = handle.Transition(netproxy.SessionDisconnected, carrier.sharedFailure(cause, netproxy.OpRead))
+			} else {
+				current = handle.Transition(netproxy.SessionConnected, nil)
+			}
 		case connectivity.Idle, connectivity.Connecting:
 			current = handle.Transition(netproxy.SessionConnecting, nil)
 		case connectivity.TransientFailure:
@@ -370,8 +393,14 @@ func (d *Dialer) observe(ctx context.Context, handle *netproxy.SingleSessionHand
 		case connectivity.Shutdown:
 			current = handle.Transition(netproxy.SessionDisconnected, net.ErrClosed)
 		}
+		d.stateMu.Unlock()
 		if !current {
 			return
+		}
+		if state == connectivity.Idle {
+			// This channel was explicitly started by Connect. A GOAWAY or
+			// failed carrier must not leave library-owned recovery asleep.
+			cc.Connect()
 		}
 		if state == connectivity.Shutdown || !cc.WaitForStateChange(ctx, state) {
 			return
@@ -386,19 +415,22 @@ func (d *Dialer) DialContext(ctx context.Context, network string, address string
 		if err != nil {
 			return nil, err
 		}
-		lease := handle.NewStreamLease()
-		if !lease.Valid() {
-			return nil, netproxy.ErrNotConnected
-		}
 		// ctx is the lifetime of the tun
 		ctxStream, streamCloser := context.WithCancel(context.Background())
 		tun, err := common.Invoke(ctx, func() (proto.Tunnel, error) {
 			return proto.Open(ctxStream, handle.Resource(), d.ServiceName)
 		}, streamCloser)
 		if err != nil {
-			lease.Invalidate(err)
-			return nil, netproxy.WrapFailure(err, netproxy.Failure{Layer: netproxy.LayerGRPC, Scope: netproxy.ScopeStream, Phase: netproxy.OpOpenStream, Stream: lease.Stream()})
+			return nil, netproxy.WrapFailure(err, netproxy.Failure{Layer: netproxy.LayerGRPC, Scope: netproxy.ScopeStream, Phase: netproxy.OpOpenStream})
 		}
+		// Context commits this RPC to its selected transport, disabling replay.
+		// The channel's readiness lease only gates new work, not draining RPCs.
+		remote, ok := peer.FromContext(tun.Context())
+		if !ok || netproxy.DependencyOf(remote.Addr) == nil {
+			streamCloser()
+			return nil, fmt.Errorf("grpc stream has no carrier dependency")
+		}
+		lease := netproxy.DependencyOf(remote.Addr).NewStream()
 		conn := NewClientConn(tun, streamCloser)
 		conn.lease = lease
 		if !lease.Valid() {
@@ -418,5 +450,6 @@ func (d *Dialer) ListenPacket(ctx context.Context, addr string) (net.PacketConn,
 }
 
 func (d *Dialer) Close() error {
+	d.closed.Store(true)
 	return d.session().Close()
 }

@@ -13,6 +13,7 @@ import (
 type Hunk struct{ Data []byte }
 
 type Tunnel interface {
+	Context() context.Context
 	Send(*Hunk) error
 	Recv() (*Hunk, error)
 	CloseSend() error

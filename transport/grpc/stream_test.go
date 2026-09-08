@@ -140,6 +140,8 @@ type blockedSend struct {
 	canceled chan struct{}
 }
 
+func (*blockedSend) Context() context.Context { return context.Background() }
+
 func (s *blockedSend) Send(*gun.Hunk) error     { close(s.started); <-s.canceled; return context.Canceled }
 func (s *blockedSend) Recv() (*gun.Hunk, error) { <-s.canceled; return nil, context.Canceled }
 func (*blockedSend) CloseSend() error           { return nil }

@@ -1,6 +1,7 @@
 package grpc
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -15,6 +16,8 @@ import (
 type failedTunnel struct {
 	err error
 }
+
+func (*failedTunnel) Context() context.Context { return context.Background() }
 
 func (s *failedTunnel) Recv() (*proto.Hunk, error) { return nil, s.err }
 func (s *failedTunnel) Send(*proto.Hunk) error     { return s.err }
