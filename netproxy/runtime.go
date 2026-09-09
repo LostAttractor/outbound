@@ -218,12 +218,7 @@ func (r *Runtime) Wait(ctx context.Context) error {
 	case <-r.done:
 		return r.closeErr
 	case <-ctx.Done():
-		select {
-		case <-r.done:
-			return r.closeErr
-		default:
-			return ctx.Err()
-		}
+		return ctx.Err()
 	}
 }
 

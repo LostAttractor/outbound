@@ -5,10 +5,6 @@ import (
 )
 
 func Invoke[R any](ctx context.Context, fn func() (R, error), cb func()) (res R, err error) {
-	return invoke(ctx, fn, cb, nil)
-}
-
-func invoke[R any](ctx context.Context, fn func() (R, error), cb func(), workerDone chan<- struct{}) (res R, err error) {
 	type result struct {
 		value R
 		err   error
@@ -22,9 +18,6 @@ func invoke[R any](ctx context.Context, fn func() (R, error), cb func(), workerD
 	resultChan := make(chan result, 1)
 
 	go func() {
-		if workerDone != nil {
-			defer close(workerDone)
-		}
 		value, err := fn()
 		resultChan <- result{value, err}
 	}()

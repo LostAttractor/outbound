@@ -339,10 +339,6 @@ func (d *Dialer) createSession(ctx context.Context) (*session, error) {
 
 	s := newSession(tlsConn, d.sessionIdle, netproxy.DependencyOf(conn))
 	s.padding = &d.padding
-	if !s.lease.Valid() {
-		_ = s.Close()
-		return nil, netproxy.ErrDependencyInvalid
-	}
 	d.idleSessionLock.Lock()
 	if d.ctx.Err() != nil {
 		d.idleSessionLock.Unlock()

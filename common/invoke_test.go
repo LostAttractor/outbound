@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
+	"testing/synctest"
 )
 
 func TestInvokeReturnsResult(t *testing.T) {
@@ -20,38 +20,30 @@ func TestInvokeReturnsResult(t *testing.T) {
 }
 
 func TestInvokeCancellationDoesNotBlockWorker(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	started := make(chan struct{})
-	release := make(chan struct{})
-	callback := make(chan struct{})
-	workerDone := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		_, err := invoke(ctx, func() (int, error) {
-			close(started)
-			<-release
-			return 42, nil
-		}, func() { close(callback) }, workerDone)
-		done <- err
-	}()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		started := make(chan struct{})
+		release := make(chan struct{})
+		callback := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			_, err := Invoke(ctx, func() (int, error) {
+				close(started)
+				<-release
+				return 42, nil
+			}, func() { close(callback) })
+			done <- err
+		}()
 
-	<-started
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, want context.Canceled", err)
-	}
-	select {
-	case <-callback:
-	case <-time.After(time.Second):
-		t.Fatal("cancellation callback was not called")
-	}
-
-	close(release)
-	select {
-	case <-workerDone:
-	case <-time.After(time.Second):
-		t.Fatal("worker blocked publishing its result after Invoke returned")
-	}
+		<-started
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+		<-callback
+		// The bubble must finish even though Invoke no longer receives results.
+		close(release)
+	})
 }
 
 func TestInvokeAlreadyCanceledDoesNotStartWorker(t *testing.T) {
