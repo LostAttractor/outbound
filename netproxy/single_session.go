@@ -221,6 +221,9 @@ func (s *SingleSession[T]) phaseLocked(phase, blockedBy string) {
 func (s *SingleSession[T]) Snapshot() StateEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Reconcile a revoked dependency before reporting admission readiness.
+	// Publishing here keeps Snapshot and WatchState on the same revision;
+	// physical cleanup still belongs to the dependency observer.
 	if s.current != nil && !s.current.lease.Valid() && s.state.Snapshot().State == SessionConnected {
 		cause := s.current.lease.Cause()
 		fact := ClassifyFailure(cause)
@@ -317,6 +320,9 @@ func (s *SingleSession[T]) recoverCurrent(ctx context.Context, current *SingleSe
 	s.mu.Unlock()
 	replace, err := s.config.Recover(ctx, current.resource)
 	operationErr := ctx.Err()
+	if operationErr != nil && !errors.Is(err, operationErr) {
+		err = errors.Join(err, operationErr)
+	}
 
 	s.mu.Lock()
 	if s.ctx.Err() != nil {
@@ -330,9 +336,9 @@ func (s *SingleSession[T]) recoverCurrent(ctx context.Context, current *SingleSe
 	}
 	if !replace {
 		if operationErr != nil {
-			s.transitionLocked(SessionDisconnected, operationErr)
+			s.transitionLocked(SessionDisconnected, err)
 			s.mu.Unlock()
-			return operationErr
+			return err
 		}
 		if s.config.IsConnected(current.resource) {
 			if !current.renewLeaseLocked() {
@@ -356,18 +362,13 @@ func (s *SingleSession[T]) recoverCurrent(ctx context.Context, current *SingleSe
 	}
 
 	resource := s.detachLocked()
-	if operationErr != nil {
-		s.transitionLocked(SessionDisconnected, operationErr)
-	} else if err != nil {
+	if err != nil {
 		s.transitionLocked(SessionDisconnected, err)
 	} else {
 		s.transitionLocked(SessionConnecting, nil)
 	}
 	s.mu.Unlock()
 	s.recordCloseError(s.closeHandle(resource))
-	if operationErr != nil {
-		return operationErr
-	}
 	if err != nil {
 		return err
 	}
@@ -386,10 +387,9 @@ func (s *SingleSession[T]) establishAndInstall(ctx context.Context) error {
 			s.mu.Unlock()
 			return net.ErrClosed
 		}
-		if operationErr := ctx.Err(); operationErr != nil {
-			s.transitionLocked(SessionDisconnected, operationErr)
-			s.mu.Unlock()
-			return operationErr
+		// Cancellation bounds the operation; it must not erase its diagnosis.
+		if operationErr := ctx.Err(); operationErr != nil && !errors.Is(err, operationErr) {
+			err = errors.Join(err, operationErr)
 		}
 		s.transitionLocked(SessionDisconnected, err)
 		s.mu.Unlock()

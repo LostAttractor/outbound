@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -300,7 +301,24 @@ func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
 	return d.session().WatchState(ctx)
 }
 
-func (d *Dialer) dialOptions() ([]grpc.DialOption, error) {
+// gRPC otherwise exposes only the blocking dial's deadline, losing the typed
+// parent/TLS error that determines whether the daemon should retry.
+type recordingCredentials struct {
+	credentials.TransportCredentials
+	record func(error)
+}
+
+func (c recordingCredentials) ClientHandshake(ctx context.Context, authority string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	secured, info, err := c.TransportCredentials.ClientHandshake(ctx, authority, conn)
+	c.record(netproxy.WrapFailure(err, netproxy.Failure{Phase: netproxy.OpHandshake, Origin: netproxy.OriginPeer}))
+	return secured, info, err
+}
+
+func (c recordingCredentials) Clone() credentials.TransportCredentials {
+	return recordingCredentials{TransportCredentials: c.TransportCredentials.Clone(), record: c.record}
+}
+
+func (d *Dialer) dialOptions(record func(error)) ([]grpc.DialOption, error) {
 	var transportCredentials credentials.TransportCredentials = insecure.NewCredentials()
 	if d.TLSConfig != nil {
 		config := d.TLSConfig.Clone()
@@ -314,9 +332,10 @@ func (d *Dialer) dialOptions() ([]grpc.DialOption, error) {
 		transportCredentials = credentials.NewTLS(config)
 	}
 	return []grpc.DialOption{
-		grpc.WithTransportCredentials(transportCredentials),
+		grpc.WithTransportCredentials(recordingCredentials{TransportCredentials: transportCredentials, record: record}),
 		grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
 			conn, err := d.ParentDialer.DialContext(ctx, "tcp", address)
+			record(err)
 			if err == nil {
 				conn = d.trackCarrier(conn)
 			}
@@ -348,11 +367,28 @@ func (d *Dialer) establish(ctx context.Context) (*grpc.ClientConn, error) {
 	if d.Address == "" {
 		return nil, fmt.Errorf("grpc proxy address is empty")
 	}
-	options, err := d.dialOptions()
+	var mu sync.Mutex
+	var lastError error
+	options, err := d.dialOptions(func(err error) {
+		for _, failure := range netproxy.Failures(err) {
+			if failure.Reason != netproxy.ReasonCanceled && failure.Reason != netproxy.ReasonDeadline {
+				mu.Lock()
+				lastError = err
+				mu.Unlock()
+				return
+			}
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
-	return grpc.DialContext(ctx, d.Address, options...)
+	cc, err := grpc.DialContext(ctx, d.Address, options...)
+	if err != nil {
+		mu.Lock()
+		err = errors.Join(lastError, err)
+		mu.Unlock()
+	}
+	return cc, err
 }
 
 func (d *Dialer) recover(ctx context.Context, cc *grpc.ClientConn) (bool, error) {

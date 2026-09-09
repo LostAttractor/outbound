@@ -2,13 +2,19 @@ package grpc
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	grpcapi "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 type blockingDialer struct {
@@ -78,4 +84,38 @@ func TestShutdownChannelReturnsRecoveryToDaemon(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("terminal channel still claims library recovery: %+v", d.Snapshot())
+}
+
+func TestInitialTLSFailurePreservesCertificateError(t *testing.T) {
+	certificate := httptest.NewTLSServer(nil)
+	certificate.Close()
+	listener := bufconn.Listen(1 << 20)
+	defer listener.Close()
+	server := grpcapi.NewServer(grpcapi.Creds(credentials.NewTLS(&tls.Config{Certificates: certificate.TLS.Certificates})))
+	defer server.Stop()
+	go server.Serve(listener)
+	d := &Dialer{
+		ParentDialer: peerDialer{listener}, Address: "passthrough:///peer",
+		TLSConfig: &tls.Config{RootCAs: x509.NewCertPool(), ServerName: "example.com"},
+	}
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	err := d.Connect(ctx)
+	for _, cause := range []error{err, d.Snapshot().Cause} {
+		var certificateError x509.UnknownAuthorityError
+		if !errors.As(cause, &certificateError) || !errors.Is(cause, context.DeadlineExceeded) {
+			t.Fatalf("lost TLS diagnosis: %v", cause)
+		}
+	}
+	// A later establishment must not carry the failed attempt's diagnosis.
+	d.TLSConfig.RootCAs.AddCert(certificate.Certificate())
+	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := d.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if state := d.Snapshot(); !state.Accepting || state.Cause != nil {
+		t.Fatalf("stale establishment error: %+v", state)
+	}
 }
