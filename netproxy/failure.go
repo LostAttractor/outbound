@@ -107,7 +107,11 @@ func (f *Failure) Error() string {
 	if reason == "" {
 		reason = ReasonUnknown
 	}
-	return fmt.Sprintf("%s %s (%s/%s): %v", layer, f.Phase, scope, reason, f.Cause)
+	prefix := string(layer)
+	if f.Phase != "" {
+		prefix += " " + string(f.Phase)
+	}
+	return fmt.Sprintf("%s(%s/%s): %v", prefix, scope, reason, f.Cause)
 }
 func (f *Failure) Unwrap() error {
 	if f == nil {
