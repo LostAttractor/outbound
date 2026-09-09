@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -14,12 +15,14 @@ import (
 )
 
 type targetPackets struct {
-	addr      net.Addr
-	lease     *netproxy.Lease
-	input     chan []byte
-	closed    chan struct{}
-	once      sync.Once
-	closeWait <-chan struct{}
+	addr         net.Addr
+	lease        *netproxy.Lease
+	input        chan []byte
+	closed       chan struct{}
+	once         sync.Once
+	closeWait    <-chan struct{}
+	writeStarted chan struct{}
+	writeWait    <-chan struct{}
 }
 
 func newTargetPackets(address string) *targetPackets {
@@ -51,8 +54,44 @@ func (c *targetPackets) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if addr.String() != c.addr.String() {
 		return 0, errors.New("wrong bound destination")
 	}
+	if c.writeStarted != nil {
+		close(c.writeStarted)
+		<-c.writeWait
+	}
 	c.input <- append([]byte(nil), p...)
 	return len(p), nil
+}
+
+func TestPacketAssociationExpiryDoesNotInterruptWrite(t *testing.T) {
+	child := newTargetPackets("target:53")
+	child.writeStarted = make(chan struct{})
+	release := make(chan struct{})
+	child.writeWait = release
+	conn, err := NewPacketAssociation(context.Background(), "target:53", func(context.Context, string) (net.PacketConn, error) {
+		return child, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	defer close(release)
+	written := make(chan error, 1)
+	go func() { _, err := conn.WriteTo([]byte("reply"), child.addr); written <- err }()
+	<-child.writeStarted
+	conn.(*packetAssociation).expireIdleTargets(time.Now().Add(2 * packetTargetIdleTimeout))
+	select {
+	case <-child.closed:
+		t.Fatal("expiry interrupted an active write")
+	default:
+	}
+	// Let the write complete without closing the release channel twice.
+	release <- struct{}{}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := conn.ReadFrom(make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPacketAssociationReusesTargetsAndPreservesReplies(t *testing.T) {
@@ -221,5 +260,78 @@ func TestPacketAssociationAbortCancelsOpenBeforeCleanup(t *testing.T) {
 	case <-written:
 	case <-time.After(time.Second):
 		t.Fatal("target write waited for unrelated target cleanup")
+	}
+}
+
+func TestPacketAssociationBoundsAndExpiresTargets(t *testing.T) {
+	var opened []*targetPackets
+	conn, err := NewPacketAssociation(context.Background(), "target:0", func(_ context.Context, address string) (net.PacketConn, error) {
+		child := newTargetPackets(address)
+		opened = append(opened, child)
+		return child, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	c := conn.(*packetAssociation)
+	exchange := func(address string) {
+		t.Helper()
+		if _, err := conn.WriteTo([]byte("x"), netproxy.NewAddr("udp", address)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := conn.ReadFrom(make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range maxPacketTargets {
+		exchange(fmt.Sprintf("target:%d", i))
+	}
+	if _, err := conn.WriteTo([]byte("x"), netproxy.NewAddr("udp", "new:53")); netproxy.ClassifyFailure(err).Reason != netproxy.ReasonCapacity {
+		t.Fatalf("capacity error = %v", err)
+	}
+	if len(opened) != maxPacketTargets || !c.lease.Valid() {
+		t.Fatal("capacity changed association lifetime")
+	}
+	exchange("target:0") // Existing targets still work at capacity.
+
+	c.mu.Lock()
+	for _, target := range c.conns {
+		target.lastUsed = time.Now().Add(-2 * packetTargetIdleTimeout)
+	}
+	// A reply refreshes the idle timer even without an outbound write.
+	c.mu.Unlock()
+	opened[0].input <- []byte("reply")
+	if _, _, err := conn.ReadFrom(make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	c.expireIdleTargets(time.Now())
+	c.mu.Lock()
+	retained := len(c.conns)
+	c.mu.Unlock()
+	if retained != 1 {
+		t.Fatalf("retained %d targets after expiry", retained)
+	}
+	for _, child := range opened[1:] {
+		select {
+		case <-child.closed:
+		default:
+			t.Fatal("idle target remains open")
+		}
+		child.lease.Abort(errors.New("retired target failed"))
+	}
+	if !c.lease.Valid() {
+		t.Fatal("local target expiry aborted the association")
+	}
+	exchange("target:1")
+	if len(opened) != maxPacketTargets+1 {
+		t.Fatal("expired target was not reopened")
+	}
+
+	cause := errors.New("active carrier failed")
+	opened[len(opened)-1].lease.Abort(cause)
+	_ = conn.Close()
+	if !errors.Is(c.lease.AbortCause(), cause) {
+		t.Fatal("lost active target failure")
 	}
 }
