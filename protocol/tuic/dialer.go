@@ -84,7 +84,7 @@ func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
 	return d.clientRing.WatchState(ctx)
 }
 func (d *Dialer) Connect(ctx context.Context) error {
-	proxyAddr, err := C.ResolveUDPAddr(d.proxyAddress)
+	proxyAddr, err := C.ResolveUDPAddrWithResolver(C.BootstrapResolver, d.proxyAddress)
 	if err != nil {
 		return err
 	}

@@ -12,7 +12,10 @@ import (
 	"strconv"
 )
 
-// TODO: Fallback DNS
+// BootstrapResolver resolves proxy-server addresses independently of DNS routed
+// through those proxies. Embedders may install it before concurrent work starts.
+var BootstrapResolver = net.DefaultResolver
+
 func ResolveIPAddrWithResolver(resolver *net.Resolver, address string) (*net.IPAddr, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {

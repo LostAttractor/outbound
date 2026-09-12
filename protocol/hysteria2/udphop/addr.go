@@ -51,7 +51,7 @@ func ResolveUDPHopAddr(addr string) (*UDPHopAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-	ip, err := common.ResolveIPAddr(host)
+	ip, err := common.ResolveIPAddrWithResolver(common.BootstrapResolver, host)
 	if err != nil {
 		return nil, err
 	}
