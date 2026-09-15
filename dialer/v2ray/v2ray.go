@@ -3,6 +3,8 @@ package v2ray
 import (
 	cryptotls "crypto/tls"
 	"encoding/base64"
+	jsonv1 "encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net"
@@ -19,7 +21,6 @@ import (
 	"github.com/daeuniverse/outbound/transport/meek"
 	"github.com/daeuniverse/outbound/transport/tls"
 	"github.com/daeuniverse/outbound/transport/ws"
-	jsoniter "github.com/json-iterator/go"
 )
 
 func init() {
@@ -311,7 +312,7 @@ func ParseVmessURL(link string) (*V2Ray, error) {
 	}
 	var info V2Ray
 	if strings.HasPrefix(strings.TrimSpace(raw), "{") {
-		if err := jsoniter.Unmarshal([]byte(raw), &info); err != nil {
+		if err := json.Unmarshal([]byte(raw), &info, jsonv1.DefaultOptionsV1(), json.WithUnmarshalers(vmessUnmarshalers)); err != nil {
 			return nil, err
 		}
 	} else {
@@ -337,7 +338,7 @@ func ParseVmessURL(link string) (*V2Ray, error) {
 		}
 		info.Ps = q.Get("remarks")
 		info.Net = q.Get("obfs")
-		info.Host = jsoniter.Get([]byte(q.Get("obfsParam")), "host").ToString()
+		info.Host = vmessObfsHost(q.Get("obfsParam"))
 		info.Path = q.Get("path")
 		info.Aid = q.Get("alterId")
 		info.SNI = q.Get("peer")
@@ -398,7 +399,7 @@ func (s *V2Ray) ExportToURL() string {
 		return U.String()
 	case "vmess":
 		s.V = "2"
-		b, _ := jsoniter.Marshal(s)
+		b, _ := json.Marshal(s, jsonv1.DefaultOptionsV1())
 		return "vmess://" + strings.TrimSuffix(base64.StdEncoding.EncodeToString(b), "=")
 	}
 	return ""

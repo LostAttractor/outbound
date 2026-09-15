@@ -19,6 +19,10 @@ Recovery follows the first unavailable dependency and never replays data.
 
 HTTP proxies use CONNECT; HTTP transport mode uses PUT. VMess requires
 `alterId=0` and supports AES-GCM or ChaCha20-Poly1305 body encryption.
+VMess JSON share links accept numeric or string fields such as `port`, `aid`
+and `v`. Their legacy `allowInsecure` conversion is local to the parser: numeric
+zero, `null`, `false`, `""` and `"0"` are false; other strings (including
+`"false"`) are true. Parsing does not depend on daemon-wide JSON initialization.
 
 Tests use local wire peers and real TLS/HTTP2/gRPC/QUIC implementations. Run from
 the dae checkout with its outbound and quic-go replacements:
