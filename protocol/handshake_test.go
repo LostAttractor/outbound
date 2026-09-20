@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -45,14 +46,30 @@ func TestHandshakeExpiredDeadlineIsNotEvidenceOfLocalClose(t *testing.T) {
 }
 
 func TestHandshakeCancellationRetainsCauseAndStopsIO(t *testing.T) {
+	for _, wrapped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("wrapped=%t", wrapped), func(t *testing.T) {
+			testHandshakeCancellation(t, wrapped)
+		})
+	}
+}
+
+func testHandshakeCancellation(t *testing.T, wrapped bool) {
+	t.Helper()
 	conn, peer := net.Pipe()
 	defer peer.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- Handshake(ctx, conn, func() error { close(started); _, err := conn.Write([]byte("blocked")); return err })
+		done <- Handshake(ctx, conn, func() error {
+			close(started)
+			_, err := conn.Write([]byte("blocked"))
+			if wrapped {
+				return fmt.Errorf("socks5 read reply: %w", err)
+			}
+			return err
+		})
 	}()
 	<-started
 	cancel()
@@ -97,7 +114,11 @@ func TestHandshakeCancellationDoesNotHideIndependentFatal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fatal := &quic.TransportError{Remote: true, ErrorCode: 1}
-	err := Handshake(ctx, conn, func() error { cancel(); return fatal })
+	err := Handshake(ctx, conn, func() error {
+		cancel()
+		_, _ = conn.Write([]byte("wait for cancellation callback"))
+		return fmt.Errorf("socks5 read reply: %w", fatal)
+	})
 	found := false
 	for _, f := range netproxy.Failures(err) {
 		if errors.Is(f.Cause, fatal) {

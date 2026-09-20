@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"os"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -72,10 +71,11 @@ func handshakeClosed(err error) bool {
 		return true
 	}
 	switch err := err.(type) {
-	case *net.OpError:
-		return handshakeClosed(err.Err)
-	case *os.SyscallError:
-		return handshakeClosed(err.Err)
+	case interface{ Unwrap() error }:
+		// Protocols add context with %w (for example, "socks5 read reply").
+		// Follow the concrete chain without treating compatibility Is methods
+		// as proof of a local close.
+		return handshakeClosed(err.Unwrap())
 	}
 	return false
 }
