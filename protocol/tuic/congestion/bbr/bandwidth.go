@@ -23,5 +23,8 @@ const (
 
 // BandwidthFromDelta calculates the bandwidth from a number of bytes and a time delta
 func BandwidthFromDelta(bytes congestion.ByteCount, delta time.Duration) Bandwidth {
-	return Bandwidth(bytes) * Bandwidth(time.Second) / Bandwidth(delta) * BytesPerSecond
+	if bytes <= 0 || delta <= 0 {
+		return 0
+	}
+	return Bandwidth(min(float64(math.MaxUint64/4), float64(bytes)*8/delta.Seconds()))
 }

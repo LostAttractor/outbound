@@ -118,24 +118,6 @@ func (p *packetNumberIndexedQueue[T]) Remove(packetNumber congestion.PacketNumbe
 	return true
 }
 
-// RemoveUpTo, but not including |packet_number|.
-// Unused slots in the front are also removed, which means when the function
-// returns, |first_packet()| can be larger than |packet_number|.
-func (p *packetNumberIndexedQueue[T]) RemoveUpTo(packetNumber congestion.PacketNumber) {
-	for !p.entries.Empty() &&
-		p.firstPacket != invalidPacketNumber &&
-		p.firstPacket < packetNumber {
-		if p.entries.Front().present {
-			p.numberOfPresentEntries--
-		}
-		p.entries.PopFront()
-		p.firstPacket++
-	}
-	p.clearup()
-
-	return
-}
-
 // IsEmpty return if queue is empty.
 func (p *packetNumberIndexedQueue[T]) IsEmpty() bool {
 	return p.numberOfPresentEntries == 0

@@ -199,9 +199,10 @@ func (m *maxAckHeightTracker) Update(
 	// Compute how many extra bytes were delivered vs max bandwidth.
 	extraBytesAcked := m.aggregationEpochBytes - expectedBytesAcked
 	newEvent := extraAckedEvent{
-		extraAcked: expectedBytesAcked,
+		extraAcked: extraBytesAcked,
 		bytesAcked: m.aggregationEpochBytes,
 		timeDelta:  aggregationDelta,
+		round:      roundTripCount,
 	}
 	m.maxAckHeightFilter.Update(newEvent, roundTripCount)
 	return extraBytesAcked
@@ -425,6 +426,8 @@ type congestionEventSample struct {
 	// empty. If acked_packets is empty, it's the send state of the largest
 	// packet in lost_packets.
 	lastPacketSendState sendTimeState
+	// Round counting must use an ACKed packet even if a later packet was lost.
+	lastAckedPacketSendState sendTimeState
 	// The number of extra bytes acked from this ack event, compared to what is
 	// expected from the flow's bandwidth. Larger value means more ack
 	// aggregation.
@@ -446,9 +449,6 @@ type bandwidthSampler struct {
 
 	// The total number of congestion controlled bytes which were lost.
 	totalBytesLost congestion.ByteCount
-
-	// The total number of congestion controlled bytes which have been neutered.
-	totalBytesNeutered congestion.ByteCount
 
 	// The value of |total_bytes_sent_| at the time the last acknowledged packet
 	// was sent. Valid only when |last_acked_packet_sent_time_| is valid.
@@ -607,6 +607,10 @@ func (b *bandwidthSampler) OnCongestionEvent(
 	var lastLostPacketSendState sendTimeState
 
 	for _, p := range lostPackets {
+		if p.IsPathMTUProbe {
+			b.OnPacketNeutered(p.PacketNumber)
+			continue
+		}
 		sendState := b.OnPacketLost(p.PacketNumber, p.BytesLost)
 		if sendState.isValid {
 			lastLostPacketSendState = sendState
@@ -662,6 +666,7 @@ func (b *bandwidthSampler) OnCongestionEvent(
 		}
 	}
 
+	eventSample.lastAckedPacketSendState = lastAckedPacketSendState
 	isNewMaxBandwidth := eventSample.sampleMaxBandwidth > maxBandwidth
 	maxBandwidth = max(maxBandwidth, eventSample.sampleMaxBandwidth)
 	if b.limitMaxAckHeightTrackerBySendRate {
@@ -674,31 +679,26 @@ func (b *bandwidthSampler) OnCongestionEvent(
 }
 
 func (b *bandwidthSampler) OnPacketLost(packetNumber congestion.PacketNumber, bytesLost congestion.ByteCount) (s sendTimeState) {
-	b.totalBytesLost += bytesLost
 	if sentPacketPointer := b.connectionStateMap.GetEntry(packetNumber); sentPacketPointer != nil {
+		b.totalBytesLost += bytesLost
 		sentPacketToSendTimeState(sentPacketPointer, &s)
+		b.connectionStateMap.Remove(packetNumber, nil)
 	}
 	return s
 }
 
-func (b *bandwidthSampler) OnPacketNeutered(packetNumber congestion.PacketNumber) {
+// OnPacketNeutered retires a sample without delivery or loss and returns its size.
+// Packets sent before this sampler was installed have no sample and return zero.
+func (b *bandwidthSampler) OnPacketNeutered(packetNumber congestion.PacketNumber) (bytes congestion.ByteCount) {
 	b.connectionStateMap.Remove(packetNumber, func(sentPacket connectionStateOnSentPacket) {
-		b.totalBytesNeutered += sentPacket.size
+		bytes = sentPacket.size
 	})
+	return bytes
 }
 
 func (b *bandwidthSampler) OnAppLimited() {
 	b.isAppLimited = true
 	b.endOfAppLimitedPhase = b.lastSentPacket
-}
-
-func (b *bandwidthSampler) RemoveObsoletePackets(leastUnacked congestion.PacketNumber) {
-	// A packet can become obsolete when it is removed from QuicUnackedPacketMap's
-	// view of inflight before it is acked or marked as lost. For example, when
-	// QuicSentPacketManager::RetransmitCryptoPackets retransmits a crypto packet,
-	// the packet is removed from QuicUnackedPacketMap's inflight, but is not
-	// marked as acked or lost in the BandwidthSampler.
-	b.connectionStateMap.RemoveUpTo(leastUnacked)
 }
 
 func (b *bandwidthSampler) TotalBytesSent() congestion.ByteCount {
@@ -711,10 +711,6 @@ func (b *bandwidthSampler) TotalBytesLost() congestion.ByteCount {
 
 func (b *bandwidthSampler) TotalBytesAcked() congestion.ByteCount {
 	return b.totalBytesAcked
-}
-
-func (b *bandwidthSampler) TotalBytesNeutered() congestion.ByteCount {
-	return b.totalBytesNeutered
 }
 
 func (b *bandwidthSampler) IsAppLimited() bool {
@@ -765,6 +761,8 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime time.Time, packetNumber 
 	if sentPacketPointer == nil {
 		return *sample
 	}
+	defer b.connectionStateMap.Remove(packetNumber, nil)
+	sentPacketToSendTimeState(sentPacketPointer, &sample.stateAtSend)
 
 	// OnPacketAcknowledgedInner
 	b.totalBytesAcked += sentPacketPointer.size
@@ -865,8 +863,10 @@ func sentPacketToSendTimeState(sentPacket *connectionStateOnSentPacket, sendTime
 // BytesFromBandwidthAndTimeDelta calculates the bytes
 // from a bandwidth(bits per second) and a time delta
 func bytesFromBandwidthAndTimeDelta(bandwidth Bandwidth, delta time.Duration) congestion.ByteCount {
-	return (congestion.ByteCount(bandwidth) * congestion.ByteCount(delta)) /
-		(congestion.ByteCount(time.Second) * 8)
+	if delta <= 0 {
+		return 0
+	}
+	return congestion.ByteCount(min(float64(math.MaxInt64/2), float64(bandwidth)/8*delta.Seconds()))
 }
 
 func timeDeltaFromBytesAndBandwidth(bytes congestion.ByteCount, bandwidth Bandwidth) time.Duration {

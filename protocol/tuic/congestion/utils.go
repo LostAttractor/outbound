@@ -7,7 +7,7 @@ import (
 )
 
 func UseBBR(conn *quic.Conn) {
-	conn.SetCongestionControl(bbr.NewBbrSender(
+	conn.SetCongestionControl(bbr.NewBBRv3Sender(
 		bbr.DefaultClock{},
 		bbr.GetInitialPacketSize(conn.RemoteAddr()),
 	))
