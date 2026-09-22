@@ -1,8 +1,10 @@
 package client
 
 import (
+	"errors"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -14,8 +16,13 @@ type tcpConn struct {
 	Orig             *utils.QStream
 	PseudoLocalAddr  net.Addr
 	PseudoRemoteAddr net.Addr
+
+	readMu           sync.Mutex // one reader owns the response header
+	mu               sync.Mutex // state and deadline updates, never blocking I/O
 	Established      bool
 	responseErr      error
+	readDeadline     time.Time
+	responseDeadline time.Time
 }
 
 // TargetDialError is a rejection of one CONNECT request, not a failed QUIC
@@ -29,9 +36,7 @@ func targetDialError(stream *utils.QStream, message string) error {
 		metadata.Resource, metadata.Stream = stream.Lease.Resource(), stream.Lease.Stream()
 	}
 	err := netproxy.WrapFailure(&TargetDialError{Message: message}, metadata)
-	if stream.Lease != nil {
-		stream.Lease.Invalidate(err)
-	}
+	stream.Abort(err)
 	return err
 }
 func (c *tcpConn) DependencyLease() *netproxy.Lease { return c.Orig.DependencyLease() }
@@ -49,37 +54,89 @@ func responseError(stream *utils.QStream, err error) error {
 		}
 		err = netproxy.WrapFailure(err, failure)
 	}
-	if failure.Scope == netproxy.ScopeStream && stream.Lease != nil {
-		stream.Lease.Invalidate(err)
-	}
+	// A failed response cannot be resumed, even when the underlying error is
+	// an operation deadline. Terminate only this logical connection.
+	stream.Abort(err)
 	return err
 }
 
 func (c *tcpConn) Read(b []byte) (n int, err error) {
-	if c.responseErr != nil {
-		return 0, c.responseErr
-	}
-	if !c.Established {
-		// Read response
-		ok, msg, err := protocol.ReadTCPResponse(c.Orig)
-		if err != nil {
-			c.responseErr = responseError(c.Orig, err)
-			return 0, c.responseErr
-		}
-		if !ok {
-			c.responseErr = targetDialError(c.Orig, msg)
-			return 0, c.responseErr
-		}
-		c.Established = true
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if err := c.readResponse(); err != nil {
+		return 0, err
 	}
 	return c.Orig.Read(b)
 }
 
+func (c *tcpConn) readResponse() error {
+	c.mu.Lock()
+	if c.responseErr != nil {
+		err := c.responseErr
+		c.mu.Unlock()
+		return err
+	}
+	if c.Established {
+		c.mu.Unlock()
+		return nil
+	}
+	c.responseDeadline = time.Now().Add(netproxy.DialTimeout)
+	err := c.applyReadDeadlineLocked()
+	c.mu.Unlock()
+
+	var ok bool
+	var msg string
+	if err == nil {
+		ok, msg, err = protocol.ReadTCPResponse(c.Orig)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		failure := netproxy.ClassifyFailure(err)
+		if failure.Reason == netproxy.ReasonDeadline && failure.Scope == netproxy.ScopeOperation {
+			now := time.Now()
+			origin := netproxy.OriginUnknown
+			if !c.readDeadline.IsZero() && !now.Before(c.readDeadline) && !c.readDeadline.After(c.responseDeadline) {
+				origin = netproxy.OriginCaller
+			} else if !now.Before(c.responseDeadline) {
+				origin = netproxy.OriginLocalProtocol
+			}
+			err = netproxy.WrapFailure(err, netproxy.Failure{Origin: origin, Phase: netproxy.OpHandshake})
+		}
+		c.responseErr = responseError(c.Orig, err)
+	} else if !ok {
+		c.responseErr = targetDialError(c.Orig, msg)
+	} else {
+		c.Established = true
+		c.responseDeadline = time.Time{}
+		if err := c.applyReadDeadlineLocked(); err != nil {
+			c.responseErr = responseError(c.Orig, err)
+		}
+	}
+	return c.responseErr
+}
+
 func (c *tcpConn) Write(b []byte) (n int, err error) {
-	return c.Orig.Write(b)
+	c.mu.Lock()
+	err = c.responseErr
+	c.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	n, err = c.Orig.Write(b)
+	if err != nil {
+		c.mu.Lock()
+		if c.responseErr != nil {
+			err = c.responseErr
+		}
+		c.mu.Unlock()
+	}
+	return n, err
 }
 
 func (c *tcpConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.Orig.Close()
 }
 
@@ -97,11 +154,22 @@ func (c *tcpConn) RemoteAddr() net.Addr {
 }
 
 func (c *tcpConn) SetDeadline(t time.Time) error {
-	return c.Orig.SetDeadline(t)
+	return errors.Join(c.SetReadDeadline(t), c.SetWriteDeadline(t))
 }
 
 func (c *tcpConn) SetReadDeadline(t time.Time) error {
-	return c.Orig.SetReadDeadline(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readDeadline = t
+	return c.applyReadDeadlineLocked()
+}
+
+func (c *tcpConn) applyReadDeadlineLocked() error {
+	deadline := c.readDeadline
+	if !c.responseDeadline.IsZero() && (deadline.IsZero() || c.responseDeadline.Before(deadline)) {
+		deadline = c.responseDeadline
+	}
+	return c.Orig.SetReadDeadline(deadline)
 }
 
 func (c *tcpConn) SetWriteDeadline(t time.Time) error {

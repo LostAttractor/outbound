@@ -30,17 +30,43 @@ func (s *QStream) WrapError(err error, op netproxy.Operation) error {
 	if s.Lease == nil {
 		return err
 	}
+	// HY2 owns this logical connection. Abort a terminal stream before the
+	// common wrapper can merely Invalidate it: the relay needs the abort signal
+	// to reset its TCP client. Never escalate a stream failure to its parent.
+	for _, failure := range netproxy.Failures(err) {
+		if failure.Scope == netproxy.ScopeStream && failure.Origin != netproxy.OriginLocalCleanup && s.Lease.Valid() {
+			failure.Resource, failure.Stream, failure.Phase = s.Lease.Resource(), s.Lease.Stream(), op
+			s.Abort(netproxy.WrapFailure(failure.Cause, failure))
+		}
+	}
 	return common.WrapQUICError(err, s.Lease.Resource(), s.Lease, op, s.Fail)
 }
 func (s *QStream) Read(p []byte) (int, error) {
+	if cause := s.Lease.AbortCause(); cause != nil {
+		return 0, cause
+	}
 	n, err := s.Stream.Read(p)
 	return n, s.WrapError(err, netproxy.OpRead)
 }
 func (s *QStream) Write(p []byte) (int, error) {
+	if cause := s.Lease.AbortCause(); cause != nil {
+		return 0, cause
+	}
 	n, err := s.Stream.Write(p)
 	return n, s.WrapError(err, netproxy.OpWrite)
 }
-func (s *QStream) CloseWrite() error { return s.WrapError(s.Stream.Close(), netproxy.OpCloseWrite) }
+func (s *QStream) CloseWrite() error {
+	if cause := s.Lease.AbortCause(); cause != nil {
+		return cause
+	}
+	return s.WrapError(s.Stream.Close(), netproxy.OpCloseWrite)
+}
+
+func (s *QStream) Abort(cause error) {
+	s.Lease.Abort(cause)
+	s.Stream.CancelRead(0)
+	s.Stream.CancelWrite(0)
+}
 
 func (s *QStream) Close() error {
 	if s.Lease != nil {

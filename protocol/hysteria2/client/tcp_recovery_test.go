@@ -93,6 +93,17 @@ func TestRecoveryFastOpenTargetFailurePreservesQUICSession(t *testing.T) {
 			if _, again := client.Read(make([]byte, 1)); again != err {
 				t.Fatalf("terminal response error changed: %v => %v", err, again)
 			}
+			if client.DependencyLease().AbortCause() == nil {
+				t.Fatal("failed response did not authorize resetting the TCP client")
+			}
+			if n, again := client.Write([]byte("must not be sent")); n != 0 || again != err {
+				t.Fatalf("write after failed response = %d, %v; want original error %v", n, again, err)
+			}
+			cause := client.DependencyLease().AbortCause()
+			_ = client.Close()
+			if client.DependencyLease().AbortCause() != cause {
+				t.Fatal("cleanup replaced the response failure")
+			}
 			if err := <-serverErr; err != nil {
 				t.Fatal(err)
 			}
