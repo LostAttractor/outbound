@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 )
 
@@ -67,9 +68,12 @@ func ResolveUDPAddrContext(ctx context.Context, resolver *net.Resolver, network,
 		return nil, &net.DNSError{Name: host, Err: "no suitable address", IsNotFound: true}
 	}
 	addr := addrs[0].Unmap()
+	// LookupNetIP enforces the requested family but drops literal IPv6 zones.
+	// DNS names have no zone; scoped literals retain exactly what was supplied.
+	literal, _ := netip.ParseAddr(host)
 	return &net.UDPAddr{
 		IP:   net.IP(addr.AsSlice()),
-		Zone: addr.Zone(),
+		Zone: literal.Zone(),
 		Port: int(port),
 	}, nil
 }
