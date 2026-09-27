@@ -1,13 +1,14 @@
 package hysteria2
 
 import (
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/hysteria2/client"
@@ -63,14 +64,26 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, err
 		config.UDPHopInterval = feature.(*Feature1).UDPHopInterval
 	}
 
-	var err error
 	if isPortHoppingPort(port) {
-		config.Addr, err = udphop.ResolveUDPHopAddr(net.JoinHostPort(host, port))
+		ports := udphop.ParsePortUnion(port)
+		if ports == nil {
+			return nil, udphop.InvalidPortError{PortStr: port}
+		}
+		portList := ports.Ports()
+		config.ResolveAddr = func(ctx context.Context) (net.Addr, error) {
+			addr, err := netproxy.ResolveUDPAddr(ctx, nextDialer, net.JoinHostPort(host, "0"))
+			if err != nil {
+				return nil, err
+			}
+			return &udphop.UDPHopAddr{IP: addr.IP, Zone: addr.Zone, Ports: portList, PortStr: port}, nil
+		}
 	} else {
-		config.Addr, err = common.ResolveUDPAddrWithResolver(common.BootstrapResolver, net.JoinHostPort(host, port))
-	}
-	if err != nil {
-		return nil, err
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return nil, udphop.InvalidPortError{PortStr: port}
+		}
+		config.ResolveAddr = func(ctx context.Context) (net.Addr, error) {
+			return netproxy.ResolveUDPAddr(ctx, nextDialer, net.JoinHostPort(host, port))
+		}
 	}
 
 	client, err := client.NewClient(config)
@@ -88,7 +101,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (*Dialer, err
 func parseServerAddrString(addrStr string) (host, port string) {
 	h, p, err := net.SplitHostPort(addrStr)
 	if err != nil {
-		return addrStr, "443"
+		return strings.TrimSuffix(strings.TrimPrefix(addrStr, "["), "]"), "443"
 	}
 	return h, p
 }

@@ -55,6 +55,10 @@ func (u Upstream) ListenPacket(ctx context.Context, address string) (net.PacketC
 	return u.data.ListenPacket(ctx, address)
 }
 
+func (u Upstream) ResolveUDPAddr(ctx context.Context, address string) (*net.UDPAddr, error) {
+	return netproxy.ResolveUDPAddr(ctx, u.data, address)
+}
+
 // BuildRuntime constructs a chain and transfers its ownership to one Runtime.
 func BuildRuntime(base netproxy.Layer, option *ExtraOption, builders ...Builder) (*netproxy.Runtime, error) {
 	if base.Data == nil {

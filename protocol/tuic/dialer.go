@@ -12,8 +12,6 @@ import (
 	"github.com/daeuniverse/outbound/protocol/tuic/common"
 	"github.com/daeuniverse/quic-go"
 	"github.com/google/uuid"
-
-	C "github.com/daeuniverse/outbound/common"
 )
 
 func init() {
@@ -84,7 +82,7 @@ func (d *Dialer) WatchState(ctx context.Context) <-chan netproxy.StateEvent {
 	return d.clientRing.WatchState(ctx)
 }
 func (d *Dialer) Connect(ctx context.Context) error {
-	proxyAddr, err := C.ResolveUDPAddrWithResolver(C.BootstrapResolver, d.proxyAddress)
+	proxyAddr, err := netproxy.ResolveUDPAddr(ctx, d.nextDialer, d.proxyAddress)
 	if err != nil {
 		return err
 	}

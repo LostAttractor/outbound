@@ -209,6 +209,13 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 func (c *Client) establish(ctx context.Context) (resource *clientResource, err error) {
+	addr := c.config.Addr
+	if c.config.ResolveAddr != nil {
+		addr, err = c.config.ResolveAddr(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	resourceCtx, resourceCancel := context.WithCancel(context.Background())
 	resource = &clientResource{ctx: resourceCtx, cancel: resourceCancel}
 	defer func(resource *clientResource) {
@@ -217,19 +224,19 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 		}
 	}(resource)
 
-	if c.config.Addr.Network() == "udphop" {
+	if addr.Network() == "udphop" {
 		// NextDialer.ListenPacket have to get a new lAddr every time.
 		// Otherwise port hopping will not work.
 		dialFunc := func(dialCtx context.Context, addr net.Addr) (net.Conn, error) {
 			return c.config.NextDialer.DialContext(dialCtx, "udp", addr.String())
 		}
-		pktConn, err := udphop.NewUDPHopPacketConn(ctx, c.config.Addr.(*udphop.UDPHopAddr), c.config.UDPHopInterval, dialFunc)
+		pktConn, err := udphop.NewUDPHopPacketConn(ctx, addr.(*udphop.UDPHopAddr), c.config.UDPHopInterval, dialFunc)
 		if err != nil {
 			return nil, err
 		}
 		resource.pktConn = pktConn
 	} else {
-		pktConn, err := c.config.NextDialer.ListenPacket(ctx, c.config.Addr.String())
+		pktConn, err := c.config.NextDialer.ListenPacket(ctx, addr.String())
 		if err != nil {
 			return nil, err
 		}
@@ -242,7 +249,7 @@ func (c *Client) establish(ctx context.Context) (resource *clientResource, err e
 		TLSClientConfig: &c.config.TLSConfig,
 		QUICConfig:      &c.config.QUICConfig,
 		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-			qc, err := quic.DialEarly(ctx, resource.pktConn, c.config.Addr, tlsCfg, cfg)
+			qc, err := quic.DialEarly(ctx, resource.pktConn, addr, tlsCfg, cfg)
 			if err != nil {
 				return nil, err
 			}

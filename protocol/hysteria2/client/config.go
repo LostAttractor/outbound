@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
@@ -20,6 +21,7 @@ const (
 
 type Config struct {
 	Addr            net.Addr
+	ResolveAddr     func(context.Context) (net.Addr, error)
 	NextDialer      netproxy.Dialer
 	Auth            string
 	TLSConfig       tls.Config

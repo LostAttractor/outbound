@@ -1,22 +1,31 @@
 package direct
 
 import (
+	"context"
+	"fmt"
 	"net"
 
-	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
 type PacketConn struct {
 	*net.UDPConn
-	resolver *net.Resolver
+	dialer *directDialer
 }
 
 func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if _, ok := addr.(*netproxy.ProxyAddr); ok {
-		addr, err = common.ResolveUDPAddrWithResolver(c.resolver, addr.String())
+		ctx, cancel := netproxy.NewDialTimeoutContextFrom(context.Background())
+		defer cancel()
+		addr, err = c.dialer.ResolveUDPAddr(ctx, addr.String())
 		if err != nil {
 			return
+		}
+	}
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		family := c.dialer.ipVersion
+		if family == "4" && udp.IP.To4() == nil || family == "6" && udp.IP.To4() != nil {
+			return 0, fmt.Errorf("address %s conflicts with entry IPv%s", addr, family)
 		}
 	}
 	return c.UDPConn.WriteTo(p, addr)

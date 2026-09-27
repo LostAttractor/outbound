@@ -21,6 +21,7 @@ func (e InvalidPortError) Error() string {
 // UDPHopAddr contains an IP address and a list of ports.
 type UDPHopAddr struct {
 	IP      net.IP
+	Zone    string
 	Ports   []uint16
 	PortStr string
 }
@@ -30,7 +31,11 @@ func (a *UDPHopAddr) Network() string {
 }
 
 func (a *UDPHopAddr) String() string {
-	return net.JoinHostPort(a.IP.String(), a.PortStr)
+	host := a.IP.String()
+	if a.Zone != "" {
+		host += "%" + a.Zone
+	}
+	return net.JoinHostPort(host, a.PortStr)
 }
 
 // addrs returns a list of net.Addr's, one for each port.
@@ -39,6 +44,7 @@ func (a *UDPHopAddr) addrs() ([]net.Addr, error) {
 	for _, port := range a.Ports {
 		addr := &net.UDPAddr{
 			IP:   a.IP,
+			Zone: a.Zone,
 			Port: int(port),
 		}
 		addrs = append(addrs, addr)
@@ -57,6 +63,7 @@ func ResolveUDPHopAddr(addr string) (*UDPHopAddr, error) {
 	}
 	result := &UDPHopAddr{
 		IP:      ip.IP,
+		Zone:    ip.Zone,
 		PortStr: portStr,
 	}
 

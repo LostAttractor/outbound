@@ -46,15 +46,31 @@ func resolveIPAddrWithResolver(resolver *net.Resolver, address string) (*net.IPA
 }
 
 func ResolveUDPAddrWithResolver(resolver *net.Resolver, address string) (*net.UDPAddr, error) {
-	addr, port, err := resolveIPAddrWithResolver(resolver, address)
+	return ResolveUDPAddrContext(context.Background(), resolver, "ip", address)
+}
+
+// ResolveUDPAddrContext resolves within one address family (ip, ip4 or ip6).
+func ResolveUDPAddrContext(ctx context.Context, resolver *net.Resolver, network, address string) (*net.UDPAddr, error) {
+	host, portString, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
-
+	port, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port: %s", portString)
+	}
+	addrs, err := resolver.LookupNetIP(ctx, network, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, &net.DNSError{Name: host, Err: "no suitable address", IsNotFound: true}
+	}
+	addr := addrs[0].Unmap()
 	return &net.UDPAddr{
-		IP:   addr.IP,
-		Zone: addr.Zone,
-		Port: port,
+		IP:   net.IP(addr.AsSlice()),
+		Zone: addr.Zone(),
+		Port: int(port),
 	}, nil
 }
 
