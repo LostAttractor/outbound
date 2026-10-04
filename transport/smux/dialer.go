@@ -195,6 +195,9 @@ func (s *Smux) establish(ctx context.Context) (*smuxResource, error) {
 		return nil, err
 	}
 	config := smux.DefaultConfig()
+	// sing-box peers disable SMUX heartbeats; receive-idle timeouts would
+	// close otherwise usable sessions between connectivity checks.
+	config.KeepAliveDisabled = true
 	monitored := &monitoredConn{
 		Conn:            conn,
 		failed:          make(chan error, 1),

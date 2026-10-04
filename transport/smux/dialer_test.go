@@ -5,9 +5,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -56,7 +59,9 @@ func acceptSmuxSessions(parent *pipeDialer, count int) <-chan *xtacismux.Session
 				accepted <- nil
 				return
 			}
-			session, err := xtacismux.Server(server, xtacismux.DefaultConfig())
+			config := xtacismux.DefaultConfig()
+			config.KeepAliveDisabled = true
+			session, err := xtacismux.Server(server, config)
 			if err != nil {
 				_ = server.Close()
 				accepted <- nil
@@ -154,6 +159,62 @@ func TestUDPPassthroughUsesParentDialer(t *testing.T) {
 	if parent.listenAddress != "0.0.0.0:0" {
 		t.Fatalf("parent ListenPacket called with %q", parent.listenAddress)
 	}
+}
+
+func TestIdleSessionRemainsUsableWithoutPeerHeartbeats(t *testing.T) {
+	// smux pools result channels globally. Run the virtual-time scenario in
+	// its own process so channels never cross a synctest bubble boundary.
+	const child = "DAE_SMUX_IDLE_TEST_CHILD"
+	if os.Getenv(child) != "1" {
+		cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestIdleSessionRemainsUsableWithoutPeerHeartbeats$", "-test.timeout=30s")
+		cmd.Env = append(os.Environ(), child+"=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("isolated idle-session test: %v\n%s", err, output)
+		}
+		return
+	}
+	synctest.Test(t, func(t *testing.T) {
+		parent := &pipeDialer{server: make(chan net.Conn)}
+		accepted := acceptSmuxSessions(parent, 1)
+		dialer := &Smux{Dialer: parent, MaxConnections: 1}
+		defer dialer.Close()
+
+		if err := dialer.Connect(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		server := waitForSmuxSessions(t, accepted, 1)[0]
+		defer server.Close()
+
+		// sing-box peers do not send SMUX heartbeats. Idle sessions must
+		// survive beyond the default timeout and accept another stream.
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		if state := dialer.Snapshot(); !state.Accepting {
+			t.Fatalf("idle session stopped accepting streams: %+v", state)
+		}
+		stream, err := dialer.pool().OpenStream(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+		peer, err := server.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer peer.Close()
+
+		const payload = "after idle"
+		if _, err := stream.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(peer, got); err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != payload {
+			t.Fatalf("stream payload = %q, want %q", got, payload)
+		}
+	})
 }
 
 func TestPoolExpandsAndDistributesConcurrentStreams(t *testing.T) {
