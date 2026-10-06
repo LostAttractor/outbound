@@ -113,6 +113,11 @@ func (c *leasedStream) failure(err error, phase netproxy.Operation) error {
 		return io.EOF
 	} else if fact.Scope == netproxy.ScopeUnknown {
 		fact.Scope = netproxy.ScopeStream
+		// Close records cleanup before unblocking I/O. A carrier failure
+		// above still takes precedence over this stream-local closure.
+		if errors.Is(err, io.ErrClosedPipe) && netproxy.ClassifyFailure(c.lease.Cause()).Origin == netproxy.OriginLocalCleanup {
+			fact.Origin = netproxy.OriginLocalCleanup
+		}
 	}
 	fact.Resource, fact.Stream, fact.Phase = c.handle.Ref(), c.lease.Stream(), phase
 	if fact.Layer == netproxy.LayerUnknown {
